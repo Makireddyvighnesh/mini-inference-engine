@@ -1,0 +1,29 @@
+schema_version: 1
+project: MiniLLM-L4
+phase: 0
+
+model:
+  id: synthetic-fixture
+  revision: fixture-v1
+  dtype: fp32
+  device: cpu
+
+workloads:
+  fixed_count: 4
+  mixed_count: 12
+  arrival_pattern: closed_loop
+  arrival_rate_per_second: null
+  seed: 17
+  vocab_size: 32000
+
+benchmark:
+  warmup_repetitions: 1
+  repetitions: 3
+  sample_interval_seconds: 0.25
+  collect_gpu: true
+  collect_system_telemetry: true
+  respect_arrival_schedule: false
+  timer_overhead_iterations: 1000
+  runner: simulated_cpu
+  simulated_prefill_ms: 0.10
+  simulated_token_ms: 0.05

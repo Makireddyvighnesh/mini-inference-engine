@@ -1,0 +1,22 @@
+# Keep planning documents local; they should not be committed or pushed.
+/MINILLM_L4_PLAN.md
+
+# Local environments and generated Python caches.
+.conda-env/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Generated benchmark artifacts stay local and are reproducible from configs.
+/results/
+
+# Model weights and profiler output must never enter this source repository.
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.gguf
+*.nsys-rep
+*.ncu-rep
+*.sqlite
