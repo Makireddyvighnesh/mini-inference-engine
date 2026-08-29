@@ -9,9 +9,10 @@ existing `adaserve/`, `llmperflab/`, `scripts/`, or root benchmark results.
 - Benchmark harness: complete.
 - Hugging Face baseline: complete.
 - Manual decode loop: complete.
+- Explicit KV-cache lifecycle and no-cache comparison: complete.
 - Model: `Qwen/Qwen3-4B-Instruct-2507-FP8`.
 - Snapshot: `8591804019c8b22094c3b5b4454e0edc05dffc98`.
-- Next work: explicit KV-cache lifecycle and accounting.
+- Next work: concurrent request lifecycle and scheduling.
 
 ## What is implemented
 
@@ -30,6 +31,11 @@ prefill, greedy selection of the first token, one-token decode forwards, and
 explicit `past_key_values` handoff. It reports the same request events and
 checks its outputs against the Hugging Face reference corpus.
 
+The KV-cache backend adds explicit contiguous-cache ownership, capacity checks,
+position tracking, reset/release, per-layer shape inspection, byte accounting,
+and a full-prefix recomputation reference path. Both paths are checked against
+the Hugging Face token corpus.
+
 ## Layout
 
 ```text
@@ -41,7 +47,11 @@ minillm_l4/
 │   └── generation/
 │       ├── __init__.py
 │       ├── huggingface.py          # trusted model.generate backend
-│       └── manual.py               # explicit prefill/decode backend
+│       ├── manual.py               # explicit prefill/decode backend
+│       └── recompute.py            # no-cache correctness reference
+│   └── kv_cache/
+│       ├── __init__.py
+│       └── contiguous.py            # owned contiguous KV lifecycle
 ├── benchmarks/
 │   ├── core/
 │   │   ├── harness.py              # shared execution and metric orchestration
@@ -53,18 +63,21 @@ minillm_l4/
 │   ├── runners/
 │   │   ├── simulated.py            # deterministic CPU fixture runner
 │   │   ├── huggingface_baseline.py # Qwen loader and HF baseline runner
-│   │   └── manual_decode.py        # manual backend benchmark runner
+│   │   ├── manual_decode.py        # manual backend benchmark runner
+│   │   └── kv_cache.py              # cache/recompute comparison runner
 │   └── commands/
 │       ├── run_harness.py          # harness command-line entry point
 │       ├── run_hf_baseline.py      # Hugging Face baseline entry point
-│       └── run_manual_decode.py    # manual decode entry point
+│       ├── run_manual_decode.py    # manual decode entry point
+│       └── run_kv_cache.py         # cache/recompute comparison entry point
 ├── configs/
 │   ├── __init__.py
 │   ├── loader.py                   # shared YAML loader and validation
 │   └── workloads/
 │       ├── minillm_l4_harness.yaml
 │       ├── qwen3_fp8_baseline.yaml
-│       └── qwen3_fp8_manual.yaml
+│       ├── qwen3_fp8_manual.yaml
+│       └── qwen3_fp8_kv_cache.yaml
 ├── data/
 │   └── synthetic/
 │       └── workloads_v1.jsonl      # deterministic prompt seeds
@@ -73,7 +86,8 @@ minillm_l4/
 │   └── phase_notes/
 │       ├── benchmark_harness.md
 │       ├── hf_baseline.md
-│       └── manual_decode.md
+│       ├── manual_decode.md
+│       └── kv_cache.md
 ├── results/
 │   ├── phase0/                  # harness fixture results
 │   ├── phase1/                  # canonical Qwen baseline results
@@ -84,7 +98,8 @@ minillm_l4/
     ├── test_benchmark_harness.py
     ├── test_configs.py
     ├── test_hf_baseline.py
-    └── test_manual_decode.py
+    ├── test_manual_decode.py
+    └── test_kv_cache.py
 ```
 
 The deterministic synthetic workload is versioned under
@@ -127,10 +142,20 @@ Run the isolated tests:
 ```
 
 See the [harness note](docs/phase_notes/benchmark_harness.md), the
-[Hugging Face baseline note](docs/phase_notes/hf_baseline.md), and the [manual
-decode note](docs/phase_notes/manual_decode.md) for definitions, measurements,
+[Hugging Face baseline note](docs/phase_notes/hf_baseline.md), the [manual
+decode note](docs/phase_notes/manual_decode.md), and the
+[KV-cache note](docs/phase_notes/kv_cache.md) for definitions, measurements,
 correctness gates, and limitations.
 
 Run the manual decoder against the Phase 1 reference corpus:
 
     .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_manual_decode --config minillm_l4/configs/workloads/qwen3_fp8_manual.yaml --output-dir minillm_l4/results/manual_decode
+
+Compare contiguous KV reuse with full-prefix recomputation:
+
+```bash
+.conda-env/bin/python -m minillm_l4.benchmarks.commands.run_kv_cache \
+  --config minillm_l4/configs/workloads/qwen3_fp8_kv_cache.yaml \
+  --workload short \
+  --output-dir minillm_l4/results/kv_cache
+```

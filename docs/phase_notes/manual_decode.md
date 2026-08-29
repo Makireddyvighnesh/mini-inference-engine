@@ -103,6 +103,6 @@ this is a correctness checkpoint rather than a formal speedup claim.
 
 ## Entry conditions for the next phase
 
-Phase 3 will make the cache lifecycle visible and testable: cache creation,
-reset, request ownership, position/capacity tracking, reuse, memory accounting,
-and a no-cache recomputation comparison.
+Phase 3 implements the cache lifecycle in
+`engine/kv_cache/contiguous.py`. The Phase 3 note records the cache/recompute
+comparison and the transition to request scheduling.

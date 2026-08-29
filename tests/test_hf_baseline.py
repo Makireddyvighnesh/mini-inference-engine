@@ -213,6 +213,51 @@ def test_reference_corpus_is_created_then_checked(tmp_path: Path) -> None:
     assert checked["reference_created"] is False
 
 
+def test_reference_check_accepts_a_measured_request_subset(tmp_path: Path) -> None:
+    model = FakeGenerateModel()
+    full_workload = WorkloadSpec(
+        name="reference",
+        seed=3,
+        requests=_requests(2),
+        model_id="fake-qwen",
+        model_revision="fake-revision",
+        dtype="fp8",
+        device="cpu",
+    )
+    config = HarnessConfig(
+        repetitions=1,
+        warmup_repetitions=0,
+        collect_gpu=False,
+        collect_system_telemetry=False,
+        timer_overhead_iterations=5,
+    )
+    full_result = BenchmarkHarness(
+        config,
+        benchmark_name="minillm_l4_hf_baseline",
+    ).run_batched(full_workload, 1, HuggingFaceGreedyBatchRunner(model, device="cpu"))
+    reference_path = tmp_path / "reference.json"
+    assert verify_or_write_reference(full_result, reference_path)["status"] == "pass"
+
+    subset_workload = WorkloadSpec(
+        name="reference",
+        seed=3,
+        requests=full_workload.requests[:1],
+        model_id="fake-qwen",
+        model_revision="fake-revision",
+        dtype="fp8",
+        device="cpu",
+    )
+    subset_result = BenchmarkHarness(
+        config,
+        benchmark_name="minillm_l4_hf_baseline",
+    ).run_batched(subset_workload, 1, HuggingFaceGreedyBatchRunner(model, device="cpu"))
+    checked = verify_or_write_reference(subset_result, reference_path)
+
+    assert checked["status"] == "pass"
+    assert checked["reference_match"] is True
+    assert checked["reference_scope"] == "measured_subset"
+
+
 def test_local_model_path_resolution_checks_required_files(tmp_path: Path) -> None:
     (tmp_path / "config.json").write_text("{}", encoding="utf-8")
     (tmp_path / "tokenizer.json").write_text("{}", encoding="utf-8")

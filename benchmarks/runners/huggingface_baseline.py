@@ -592,7 +592,29 @@ def verify_or_write_reference(
     if path.exists():
         try:
             expected = json.loads(path.read_text(encoding="utf-8"))
-            report["reference_match"] = expected == measured_outputs
+            expected_requests = expected.get("requests", {})
+            measured_requests = measured_outputs.get("requests", {})
+            identity_matches = all(
+                expected.get(field) == measured_outputs.get(field)
+                for field in (
+                    "schema_version",
+                    "model_id",
+                    "model_revision",
+                    "workload",
+                )
+            )
+            report["reference_match"] = (
+                identity_matches
+                and all(
+                    expected_requests.get(request_id) == record
+                    for request_id, record in measured_requests.items()
+                )
+            )
+            report["reference_scope"] = (
+                "exact"
+                if set(expected_requests) == set(measured_requests)
+                else "measured_subset"
+            )
             if not report["reference_match"]:
                 report["status"] = "fail"
         except (OSError, json.JSONDecodeError) as error:

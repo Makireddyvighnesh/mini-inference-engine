@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from typing import Any, Callable, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 import torch
+
+if TYPE_CHECKING:
+    from minillm_l4.engine.kv_cache import ContiguousKvCache
 
 
 PrefillCallback = Callable[[torch.Tensor], None]
@@ -174,6 +177,7 @@ def manual_greedy_generate(
     pad_token_id: int = 0,
     on_prefill_end: PrefillCallback | None = None,
     on_token: TokenCallback | None = None,
+    kv_cache: ContiguousKvCache | None = None,
 ) -> ManualGenerationResult:
     """Generate tokens with an explicit prefill and cached decode loop.
 
@@ -200,6 +204,13 @@ def manual_greedy_generate(
         "input_ids": input_ids,
         "attention_mask": full_attention_mask[:, :prompt_tokens],
     }
+    if kv_cache is not None:
+        if kv_cache.batch_size != batch_size:
+            raise ValueError(
+                "KV cache batch size must match generation input batch size"
+            )
+        kv_cache.prepare_append(prompt_tokens)
+        prompt_inputs["past_key_values"] = kv_cache.backend_cache
 
     generated: list[torch.Tensor] = []
     sequence_lengths = torch.full(
@@ -226,6 +237,8 @@ def manual_greedy_generate(
             raise RuntimeError(
                 "The model did not return past_key_values during prefill"
             )
+        if kv_cache is not None:
+            kv_cache.commit_append(prompt_tokens, past_key_values)
         next_token = _select_next_token(prefill_output)
         generated.append(next_token)
         eos_matches = _is_eos(next_token, eos_ids)
@@ -251,6 +264,8 @@ def manual_greedy_generate(
                 prompt_tokens=prompt_tokens,
                 decode_step=decode_step,
             )
+            if kv_cache is not None:
+                kv_cache.prepare_append(1)
             decode_output = model(
                 input_ids=decode_input,
                 attention_mask=decode_attention_mask,
@@ -264,6 +279,8 @@ def manual_greedy_generate(
                 raise RuntimeError(
                     "The model did not return past_key_values during decoding"
                 )
+            if kv_cache is not None:
+                kv_cache.commit_append(1, past_key_values)
             next_token = _select_next_token(decode_output)
             generated.append(next_token)
             eos_matches = _is_eos(next_token, eos_ids)
@@ -290,6 +307,9 @@ def manual_greedy_generate(
         token_ids=token_ids,
         sequence_lengths=tuple(int(value) for value in sequence_lengths.tolist()),
         requested_output_tokens=output_tokens,
+        runtime=(
+            "manual_contiguous_cache" if kv_cache is not None else "manual_eager"
+        ),
     )
 
 
