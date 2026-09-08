@@ -108,6 +108,30 @@ def test_manual_generation_supports_eos_and_tracks_true_lengths() -> None:
     assert len(model.calls) == 2
 
 
+def test_manual_generation_supports_per_row_limits_and_position_ids() -> None:
+    model = FakeForwardModel()
+    inputs = sample_inputs()
+    inputs["position_ids"] = torch.tensor(
+        [[0, 1, 2], [0, 1, 2]], dtype=torch.long
+    )
+
+    result = manual_greedy_generate(
+        model,
+        inputs,
+        output_tokens=4,
+        sequence_output_limits=(2, 4),
+    )
+
+    assert result.sequence_lengths == (2, 4)
+    assert result.row(0).tolist() == [10, 11]
+    assert result.row(1).tolist() == [10, 11, 12, 13]
+    assert [call["position_ids"][:, 0].tolist() for call in model.calls[1:]] == [
+        [3, 3],
+        [4, 4],
+        [5, 5],
+    ]
+
+
 def test_manual_runner_records_token_events_and_returns_request_outcomes() -> None:
     model = FakeForwardModel()
     runner = ManualGreedyBatchRunner(model, device="cpu")

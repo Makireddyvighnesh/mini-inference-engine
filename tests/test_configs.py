@@ -12,6 +12,7 @@ def test_project_workload_configs_are_yaml_and_validate() -> None:
         ("qwen3_fp8_baseline.yaml", 1),
         ("qwen3_fp8_manual.yaml", 2),
         ("qwen3_fp8_kv_cache.yaml", 3),
+        ("qwen3_fp8_concurrent.yaml", 4),
     )
     for filename, expected_phase in configurations:
         path = PROJECT_ROOT / "configs" / "workloads" / filename

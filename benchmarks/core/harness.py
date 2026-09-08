@@ -30,6 +30,7 @@ BatchRunner = Callable[
     [Sequence[RequestSpec], Sequence["RequestEventRecorder"]],
     Sequence[RequestOutcome | Sequence[int] | None],
 ]
+TraceRunner = BatchRunner
 
 
 class RequestEventRecorder:
@@ -208,6 +209,25 @@ class BenchmarkHarness:
             runner_for_signature=runner,
         )
 
+    def run_trace(
+        self,
+        workload: WorkloadSpec,
+        runner: TraceRunner,
+    ) -> BenchmarkResult:
+        """Give an entire arrival trace to a lifecycle-aware scheduler runner."""
+
+        if not callable(runner):
+            raise TypeError("runner must be callable")
+        if not self.configuration.respect_arrival_schedule:
+            raise ValueError("trace execution requires respect_arrival_schedule=True")
+        return self._run_with_batch_runner(
+            workload,
+            runner,
+            batch_size=len(workload.requests),
+            runner_for_signature=runner,
+            runner_manages_lifecycle=True,
+        )
+
     def _run_with_batch_runner(
         self,
         workload: WorkloadSpec,
@@ -215,6 +235,7 @@ class BenchmarkHarness:
         *,
         batch_size: int,
         runner_for_signature: Any,
+        runner_manages_lifecycle: bool = False,
     ) -> BenchmarkResult:
         warmup_durations: list[float] = []
         for warmup_index in range(self.configuration.warmup_repetitions):
@@ -224,6 +245,7 @@ class BenchmarkHarness:
                 batch_size=batch_size,
                 repetition_index=warmup_index,
                 warmup=True,
+                runner_manages_lifecycle=runner_manages_lifecycle,
             )
             warmup_durations.append(float(warmup["duration_ms"]))
 
@@ -234,6 +256,7 @@ class BenchmarkHarness:
                 batch_size=batch_size,
                 repetition_index=repetition_index,
                 warmup=False,
+                runner_manages_lifecycle=runner_manages_lifecycle,
             )
             for repetition_index in range(self.configuration.repetitions)
         )
@@ -251,6 +274,7 @@ class BenchmarkHarness:
                 ),
                 "runner_signature": _runner_signature(runner_for_signature),
                 "batch_size": batch_size,
+                "runner_manages_lifecycle": runner_manages_lifecycle,
                 "warmup_excluded_from_summary": True,
             },
             benchmark_name=self.benchmark_name,
@@ -264,6 +288,7 @@ class BenchmarkHarness:
         batch_size: int,
         repetition_index: int,
         warmup: bool,
+        runner_manages_lifecycle: bool = False,
     ) -> dict[str, Any]:
         run_started_ns = time.perf_counter_ns()
         run_started_utc = datetime.now(timezone.utc).isoformat()
@@ -291,7 +316,10 @@ class BenchmarkHarness:
                     request,
                     run_started_ns=run_started_ns,
                 )
-                if self.configuration.respect_arrival_schedule:
+                if (
+                    self.configuration.respect_arrival_schedule
+                    and not runner_manages_lifecycle
+                ):
                     _wait_until_ns(run_started_ns + arrival_ns)
                 recorder = RequestEventRecorder(
                     request.request_id,
@@ -305,8 +333,9 @@ class BenchmarkHarness:
                         "arrival_schedule_respected": self.configuration.respect_arrival_schedule,
                     },
                 )
-                recorder.record("admission")
-                recorder.record("execution_start")
+                if not runner_manages_lifecycle:
+                    recorder.record("admission")
+                    recorder.record("execution_start")
                 recorders.append(recorder)
 
             try:

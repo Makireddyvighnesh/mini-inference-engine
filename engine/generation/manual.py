@@ -178,6 +178,7 @@ def manual_greedy_generate(
     on_prefill_end: PrefillCallback | None = None,
     on_token: TokenCallback | None = None,
     kv_cache: ContiguousKvCache | None = None,
+    sequence_output_limits: Sequence[int] | None = None,
 ) -> ManualGenerationResult:
     """Generate tokens with an explicit prefill and cached decode loop.
 
@@ -192,6 +193,18 @@ def manual_greedy_generate(
         output_tokens=output_tokens,
     )
     eos_ids = _normalize_eos_ids(eos_token_id)
+    if sequence_output_limits is None:
+        output_limits = (output_tokens,) * batch_size
+    else:
+        output_limits = tuple(int(value) for value in sequence_output_limits)
+        if len(output_limits) != batch_size:
+            raise ValueError(
+                "sequence_output_limits must contain one value per batch row"
+            )
+        if any(value < 1 or value > output_tokens for value in output_limits):
+            raise ValueError(
+                "sequence output limits must be between 1 and output_tokens"
+            )
     if pad_token_id < 0:
         raise ValueError("pad_token_id must be non-negative")
     logits_to_keep = _logits_to_keep(logits_mode)
@@ -213,9 +226,8 @@ def manual_greedy_generate(
         prompt_inputs["past_key_values"] = kv_cache.backend_cache
 
     generated: list[torch.Tensor] = []
-    sequence_lengths = torch.full(
-        (batch_size,),
-        output_tokens,
+    sequence_lengths = torch.tensor(
+        output_limits,
         dtype=torch.long,
         device=input_ids.device,
     )
@@ -245,6 +257,7 @@ def manual_greedy_generate(
         if eos_ids:
             sequence_lengths[eos_matches] = 1
             finished |= eos_matches
+        finished |= sequence_lengths <= 1
         if on_prefill_end is not None:
             on_prefill_end(next_token.detach())
         if on_token is not None:
@@ -270,6 +283,15 @@ def manual_greedy_generate(
                 input_ids=decode_input,
                 attention_mask=decode_attention_mask,
                 past_key_values=past_key_values,
+                **(
+                    {
+                        "position_ids": prompt_inputs["position_ids"][:, -1:]
+                        + decode_step
+                        + 1
+                    }
+                    if "position_ids" in prompt_inputs
+                    else {}
+                ),
                 use_cache=True,
                 return_dict=True,
                 logits_to_keep=logits_to_keep,
@@ -288,6 +310,7 @@ def manual_greedy_generate(
                 newly_finished = eos_matches & ~finished
                 sequence_lengths[newly_finished] = decode_step + 2
                 finished |= eos_matches
+            finished |= sequence_lengths <= decode_step + 2
             if on_token is not None:
                 on_token(decode_step + 1, next_token.detach())
             del decode_output

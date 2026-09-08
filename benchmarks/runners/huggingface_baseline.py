@@ -93,9 +93,7 @@ class HfModelBundle:
                 "num_key_value_heads": getattr(
                     self.model_config, "num_key_value_heads", None
                 ),
-                "torch_dtype": str(
-                    getattr(self.model_config, "torch_dtype", None)
-                ),
+                "dtype": str(getattr(self.model_config, "dtype", None)),
                 "quantization_config": checkpoint_quantization_config(
                     self.model_config
                 ),
@@ -576,6 +574,8 @@ def build_reference_corpus(result: BenchmarkResult) -> dict[str, Any]:
 def verify_or_write_reference(
     result: BenchmarkResult,
     path: Path,
+    *,
+    allow_output_prefix: bool = False,
 ) -> dict[str, Any]:
     """Check a saved token corpus, or create it on the first successful run."""
 
@@ -588,6 +588,7 @@ def verify_or_write_reference(
         "reference_checked": path.exists(),
         "reference_created": False,
         "reference_match": None,
+        "comparison_mode": "output_prefix" if allow_output_prefix else "exact",
     }
     if path.exists():
         try:
@@ -603,13 +604,20 @@ def verify_or_write_reference(
                     "workload",
                 )
             )
-            report["reference_match"] = (
-                identity_matches
-                and all(
+            if allow_output_prefix:
+                records_match = all(
+                    _reference_prefix_matches(
+                        expected_requests.get(request_id),
+                        record,
+                    )
+                    for request_id, record in measured_requests.items()
+                )
+            else:
+                records_match = all(
                     expected_requests.get(request_id) == record
                     for request_id, record in measured_requests.items()
                 )
-            )
+            report["reference_match"] = identity_matches and records_match
             report["reference_scope"] = (
                 "exact"
                 if set(expected_requests) == set(measured_requests)
@@ -628,6 +636,27 @@ def verify_or_write_reference(
         )
         report["reference_created"] = True
     return report
+
+
+def _reference_prefix_matches(expected: Any, measured: Mapping[str, Any]) -> bool:
+    """Accept a shorter exact prefix from an independently saved reference."""
+
+    if not isinstance(expected, Mapping):
+        return False
+    expected_tokens = tuple(
+        int(value) for value in expected.get("generated_token_ids", ())
+    )
+    measured_tokens = tuple(
+        int(value) for value in measured.get("generated_token_ids", ())
+    )
+    measured_limit = int(measured.get("max_new_tokens", -1))
+    expected_limit = int(expected.get("max_new_tokens", -1))
+    return (
+        expected.get("prompt_sha256") == measured.get("prompt_sha256")
+        and 0 < measured_limit <= expected_limit
+        and len(measured_tokens) == measured_limit
+        and expected_tokens[:measured_limit] == measured_tokens
+    )
 
 
 def outputs_stable_across_repetitions(result: BenchmarkResult) -> bool:

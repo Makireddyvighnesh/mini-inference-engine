@@ -258,6 +258,66 @@ def test_reference_check_accepts_a_measured_request_subset(tmp_path: Path) -> No
     assert checked["reference_scope"] == "measured_subset"
 
 
+def test_reference_check_accepts_a_shorter_exact_output_prefix(
+    tmp_path: Path,
+) -> None:
+    model = FakeGenerateModel()
+    config = HarnessConfig(
+        repetitions=1,
+        warmup_repetitions=0,
+        collect_gpu=False,
+        collect_system_telemetry=False,
+        timer_overhead_iterations=5,
+    )
+    full_workload = WorkloadSpec(
+        name="reference",
+        seed=3,
+        requests=_requests(1),
+        model_id="fake-qwen",
+        model_revision="fake-revision",
+        dtype="fp8",
+        device="cpu",
+    )
+    full_result = BenchmarkHarness(
+        config,
+        benchmark_name="minillm_l4_hf_baseline",
+    ).run_batched(full_workload, 1, HuggingFaceGreedyBatchRunner(model, device="cpu"))
+    reference_path = tmp_path / "reference.json"
+    assert verify_or_write_reference(full_result, reference_path)["status"] == "pass"
+
+    short_request = RequestSpec(
+        request_id=full_workload.requests[0].request_id,
+        prompt_token_ids=full_workload.requests[0].prompt_token_ids,
+        max_new_tokens=2,
+        category=full_workload.requests[0].category,
+    )
+    short_workload = WorkloadSpec(
+        name="reference",
+        seed=3,
+        requests=(short_request,),
+        model_id="fake-qwen",
+        model_revision="fake-revision",
+        dtype="fp8",
+        device="cpu",
+    )
+    short_result = BenchmarkHarness(
+        config,
+        benchmark_name="minillm_l4_hf_baseline",
+    ).run_batched(short_workload, 1, HuggingFaceGreedyBatchRunner(model, device="cpu"))
+
+    exact = verify_or_write_reference(short_result, reference_path)
+    prefix = verify_or_write_reference(
+        short_result,
+        reference_path,
+        allow_output_prefix=True,
+    )
+
+    assert exact["status"] == "fail"
+    assert prefix["status"] == "pass"
+    assert prefix["reference_match"] is True
+    assert prefix["comparison_mode"] == "output_prefix"
+
+
 def test_local_model_path_resolution_checks_required_files(tmp_path: Path) -> None:
     (tmp_path / "config.json").write_text("{}", encoding="utf-8")
     (tmp_path / "tokenizer.json").write_text("{}", encoding="utf-8")

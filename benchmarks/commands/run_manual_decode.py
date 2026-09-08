@@ -54,6 +54,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt-lengths", type=int, nargs="+", default=None)
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=None)
     parser.add_argument("--count", type=int, default=None)
+    parser.add_argument(
+        "--output-tokens",
+        type=int,
+        default=None,
+        help="Use one fixed output length for every selected prompt length.",
+    )
     parser.add_argument("--repetitions", type=int, default=None)
     parser.add_argument("--warmup-repetitions", type=int, default=None)
     parser.add_argument("--no-gpu-sampling", action="store_true")
@@ -175,6 +181,8 @@ def main() -> None:
     count = int(workload_config["count"] if args.count is None else args.count)
     if count <= 0:
         raise ValueError("count must be positive")
+    if args.output_tokens is not None and args.output_tokens <= 1:
+        raise ValueError("output_tokens must be greater than one for TPOT")
 
     device = str(model_config["device"] if args.device is None else args.device)
     local_files_only = bool(model_config.get("local_files_only", True)) and not (
@@ -250,6 +258,7 @@ def main() -> None:
             "prompt_lengths": prompt_lengths,
             "batch_sizes": batch_sizes,
             "count": count,
+            "fixed_output_tokens": args.output_tokens,
             "repetitions": repetitions,
             "warmup_repetitions": warmups,
             "dataset": str(dataset_path),
@@ -270,8 +279,10 @@ def main() -> None:
 
     for bucket_name, prompt_tokens, default_output_tokens in selected:
         output_map = workload_config["output_tokens"]
-        output_tokens = int(
-            output_map.get(str(prompt_tokens), default_output_tokens)
+        output_tokens = (
+            int(args.output_tokens)
+            if args.output_tokens is not None
+            else int(output_map.get(str(prompt_tokens), default_output_tokens))
         )
         workload = build_hf_workload(
             bundle.tokenizer,
@@ -292,7 +303,11 @@ def main() -> None:
                 benchmark_name="minillm_l4_manual_decode",
             ).run_batched(workload, batch_size, runner)
             reference_path = reference_dir / f"{bucket_name}.json"
-            correctness = verify_or_write_reference(result, reference_path)
+            correctness = verify_or_write_reference(
+                result,
+                reference_path,
+                allow_output_prefix=args.output_tokens is not None,
+            )
             result_path = output_dir / f"manual_{bucket_name}_b{batch_size}.json"
             events_path = (
                 output_dir / f"manual_{bucket_name}_b{batch_size}_events.jsonl"
