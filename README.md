@@ -11,9 +11,15 @@ existing `adaserve/`, `llmperflab/`, `scripts/`, or root benchmark results.
 - Manual decode loop: complete.
 - Explicit KV-cache lifecycle and no-cache comparison: complete.
 - Concurrent request lifecycle and FIFO static batching: complete.
+- Iteration-level continuous batching: implemented and CPU/tiny-Qwen
+  validated; L4 benchmark pending in a CUDA-enabled runtime.
+- Paged KV allocation: complete. Fixed-size allocation, per-request block
+  tables, controlled out-of-memory behavior, physical K/V storage, dense
+  gather fallback, direct block-table attention, and an optimized-prefill /
+  fused-Triton-paged-decode path are implemented and validated on the L4.
 - Model: `Qwen/Qwen3-4B-Instruct-2507-FP8`.
 - Snapshot: `8591804019c8b22094c3b5b4454e0edc05dffc98`.
-- Next work: iteration-level continuous batching.
+- Next work: prefix caching.
 
 ## What is implemented
 
@@ -41,8 +47,25 @@ The concurrent-request backend adds the waiting/prefill/decoding/finished
 lifecycle, staggered arrivals, a deterministic FIFO queue, padded static
 batches with mixed prompt/output lengths, cancellation before execution,
 per-request completion events, padding-waste accounting, and guaranteed cache
-cleanup. Static batches still run to completion before new work can execute;
-iteration-level admission is intentionally reserved for continuous batching.
+cleanup. Static batches still run to completion before new work can execute.
+
+The continuous backend adds iteration-level admission, a token-budgeted
+prefill queue, an active decode batch rebuilt after every iteration, immediate
+finished-row removal, an optional initial batching wait, and explicit cache
+rebasing for new rows. The rebasing path is copy-based and uses Transformers
+`DynamicCache`.
+
+The paged backend adds fixed-size physical KV blocks, a deterministic free
+block pool, logical-to-physical block tables, append/release accounting,
+capacity backpressure, and three model paths. `PagedKvBatchRunner` is the
+token-correct dense-gather control. `PagedAttentionBatchRunner` runs readable
+block-wise attention during both prefill and decode. `PagedHybridBatchRunner`
+uses optimized SDPA during prefill, copies the resulting KV tensors once into
+  physical pages, and then decodes directly from block tables without a dense
+  gather. A fused Triton kernel performs page lookup, QK reduction, online
+  softmax, and weighted-value accumulation in one launch per layer. Stage
+  timings and logical page visits are included in benchmark artifacts, and
+  the readable PyTorch implementation remains available as a fallback.
 
 ## Layout
 
@@ -61,7 +84,11 @@ minillm_l4/
 │       └── recompute.py            # no-cache correctness reference
 │   └── kv_cache/
 │       ├── __init__.py
-│       └── contiguous.py            # owned contiguous KV lifecycle
+│       ├── contiguous.py             # owned contiguous KV lifecycle
+│       ├── paged.py                  # fixed blocks, tables, and cache storage
+│       ├── paged_attention.py        # Triton selection and torch fallback
+│       ├── triton_paged_attention.py # fused one-token decode kernel
+│       └── qwen3_paged.py            # Qwen3 direct-attention adapter
 ├── benchmarks/
 │   ├── core/
 │   │   ├── harness.py              # shared execution and metric orchestration
@@ -75,13 +102,17 @@ minillm_l4/
 │   │   ├── huggingface_baseline.py # Qwen loader and HF baseline runner
 │   │   ├── manual_decode.py        # manual backend benchmark runner
 │   │   ├── kv_cache.py             # cache/recompute comparison runner
-│   │   └── concurrent_requests.py  # staggered mixed-request trace runner
+│   │   ├── concurrent_requests.py   # staggered static-batch trace runner
+│   │   ├── continuous_requests.py   # iteration-level continuous runner
+│   │   └── paged_kv.py              # gather and direct paged runners
 │   ├── commands/
 │       ├── run_harness.py          # harness command-line entry point
 │       ├── run_hf_baseline.py      # Hugging Face baseline entry point
 │       ├── run_manual_decode.py    # manual decode entry point
-│       ├── run_kv_cache.py         # cache/recompute comparison entry point
-│       └── run_concurrent_requests.py # concurrent static-batch entry point
+│       ├── run_kv_cache.py          # cache/recompute comparison entry point
+│       ├── run_concurrent_requests.py # concurrent static-batch entry point
+│       ├── run_continuous_requests.py # continuous-batching entry point
+│       └── run_paged_kv.py            # contiguous versus paged sweep
 │   └── plots/
 │       ├── prefill_decode.py        # context-length metric chart
 │       └── concurrency_stress.py    # batch-size stress report
@@ -93,7 +124,9 @@ minillm_l4/
 │       ├── qwen3_fp8_baseline.yaml
 │       ├── qwen3_fp8_manual.yaml
 │       ├── qwen3_fp8_kv_cache.yaml
-│       └── qwen3_fp8_concurrent.yaml
+│       ├── qwen3_fp8_concurrent.yaml
+│       ├── qwen3_fp8_continuous.yaml
+│       └── qwen3_fp8_paged.yaml
 ├── data/
 │   └── synthetic/
 │       └── workloads_v1.jsonl      # deterministic prompt seeds
@@ -104,7 +137,9 @@ minillm_l4/
 │       ├── hf_baseline.md
 │       ├── manual_decode.md
 │       ├── kv_cache.md
-│       └── concurrent_requests.md
+│       ├── concurrent_requests.md
+│       ├── continuous_batching.md
+│       └── paged_kv.md
 ├── results/
 │   ├── phase0/                  # harness fixture results
 │   ├── phase1/                  # canonical Qwen baseline results
@@ -119,6 +154,9 @@ minillm_l4/
     ├── test_manual_decode.py
     ├── test_kv_cache.py
     ├── test_concurrent_requests.py
+    ├── test_continuous_requests.py
+    ├── test_paged_kv_cache.py
+    ├── test_paged_runner.py
     ├── test_prefill_decode_plot.py
     └── test_concurrency_stress_plot.py
 ```
@@ -164,10 +202,16 @@ Run the isolated tests:
 
 See the [harness note](docs/phase_notes/benchmark_harness.md), the
 [Hugging Face baseline note](docs/phase_notes/hf_baseline.md), the [manual
-decode note](docs/phase_notes/manual_decode.md), and the
+decode note](docs/phase_notes/manual_decode.md), the
 [KV-cache note](docs/phase_notes/kv_cache.md), and the [concurrent-request
 note](docs/phase_notes/concurrent_requests.md) for definitions, measurements,
-correctness gates, and limitations.
+correctness gates, and limitations. The [continuous-batching note]
+(docs/phase_notes/continuous_batching.md) documents the Phase 5 scheduler,
+cache rebasing, tests, and L4 reproduction command.
+
+The [paged-KV note](docs/phase_notes/paged_kv.md) documents fixed block
+ownership, fragmentation accounting, the dense gather correctness path, and
+the Phase 6 benchmark command.
 
 Run the manual decoder against the Phase 1 reference corpus:
 
@@ -190,6 +234,65 @@ Run staggered uniform and mixed request traces:
   --workload all \
   --max-batch-sizes 1 2 4 \
   --output-dir minillm_l4/results/concurrent_requests
+```
+
+Run the Phase 5 continuous-batching comparison:
+
+```bash
+.conda-env/bin/python -m minillm_l4.benchmarks.commands.run_continuous_requests \
+  --config minillm_l4/configs/workloads/qwen3_fp8_continuous.yaml \
+  --workload all \
+  --max-batch-sizes 1 2 4 \
+  --output-dir minillm_l4/results/continuous_requests
+```
+
+Run the Phase 6 contiguous-versus-paged sweep on a CUDA-enabled L4:
+
+```bash
+.conda-env/bin/python -m minillm_l4.benchmarks.commands.run_paged_kv \
+  --config minillm_l4/configs/workloads/qwen3_fp8_paged.yaml \
+  --workload all \
+  --output-dir minillm_l4/results/paged_kv
+```
+
+The paged command keeps total physical token capacity fixed while sweeping
+block sizes. It records block utilization, internal fragmentation, physical
+KV bytes, stage timings, page visits, TTFT/TPOT, and exact-token correctness.
+The default config runs optimized SDPA prefill followed by direct paged
+decode, selecting Triton on supported CUDA inputs. It also selects the
+L4-specific `sm89` FP8 projection kernel; set `model.fp8_kernel_path` to
+`auto` for the Transformers control. Use `--decode-backend
+torch` for the readable fallback, `--decode-backend triton` to require the
+kernel, `--modes paged_graph` for fixed-address CUDA Graph replay,
+`--modes paged_direct` for all-blockwise educational prefill, or
+`--modes paged_gather` for the dense-gather control.
+
+For a focused batch-1 graph comparison:
+
+```bash
+.conda-env/bin/python -m minillm_l4.benchmarks.commands.run_paged_kv \
+  --config minillm_l4/configs/workloads/qwen3_fp8_paged.yaml \
+  --workload short \
+  --modes paged_hybrid paged_graph \
+  --block-sizes 32 \
+  --batch-sizes 1 \
+  --repetitions 10 \
+  --warmup-repetitions 1 \
+  --output-dir minillm_l4/results/graph_comparison
+```
+
+For a quick correctness-focused run:
+
+```bash
+.conda-env/bin/python -m minillm_l4.benchmarks.commands.run_continuous_requests \
+  --config minillm_l4/configs/workloads/qwen3_fp8_continuous.yaml \
+  --workload mixed \
+  --max-batch-sizes 2 \
+  --count-per-bucket 1 \
+  --repetitions 1 \
+  --warmup-repetitions 0 \
+  --reference-dir minillm_l4/results/phase1/references_baseline \
+  --output-dir minillm_l4/results/continuous_smoke
 ```
 
 Plot prefill and decode latency over 128, 512, and 2,048-token prompts:

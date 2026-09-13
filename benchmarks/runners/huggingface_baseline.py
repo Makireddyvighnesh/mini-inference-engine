@@ -230,6 +230,11 @@ def load_qwen_fp8(
     # Import Transformers only after the explicit kernel strategy has been set.
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
+    if fp8_kernel_path == "sm89":
+        from minillm_l4.engine.kernels import install_sm89_fp8_dispatch
+
+        kernel_strategy["custom_kernel"] = install_sm89_fp8_dispatch()
+
     total_start = time.perf_counter()
     model_config = AutoConfig.from_pretrained(
         source,

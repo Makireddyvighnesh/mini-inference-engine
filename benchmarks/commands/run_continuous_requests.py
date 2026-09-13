@@ -1,50 +1,62 @@
-"""Run staggered uniform and mixed request traces with static batching."""
+"""Run staggered request traces with iteration-level continuous batching."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import random
-from dataclasses import replace
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
 from minillm_l4.benchmarks.core.harness import BenchmarkHarness, write_events_jsonl
-from minillm_l4.benchmarks.core.schemas import HarnessConfig, RequestSpec, WorkloadSpec
+from minillm_l4.benchmarks.core.schemas import HarnessConfig
 from minillm_l4.benchmarks.core.workloads import save_workload
 from minillm_l4.benchmarks.runners.concurrent_requests import (
-    StaticRequestTraceRunner,
     verify_concurrent_references,
-    write_concurrent_result,
+)
+from minillm_l4.benchmarks.runners.continuous_requests import (
+    ContinuousRequestTraceRunner,
+    write_continuous_result,
 )
 from minillm_l4.benchmarks.runners.huggingface_baseline import (
-    BASELINE_BUCKETS,
     MODEL_ID,
     MODEL_REVISION,
-    build_hf_workload,
     load_qwen_fp8,
 )
 from minillm_l4.configs.loader import load_yaml_config
 
+from .run_concurrent_requests import (
+    PROJECT_ROOT,
+    _display,
+    _project_path,
+    build_trace_workloads,
+)
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CONFIG = PROJECT_ROOT / "configs/workloads/qwen3_fp8_concurrent.yaml"
-DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "results/concurrent_requests"
+
+DEFAULT_CONFIG = PROJECT_ROOT / "configs/workloads/qwen3_fp8_continuous.yaml"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "results/continuous_requests"
 DEFAULT_REFERENCE_DIR = PROJECT_ROOT / "results/phase1/references_baseline"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Benchmark FIFO static batching with staggered request arrivals."
+        description="Benchmark iteration-level continuous batching."
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument(
         "--workload", choices=("uniform", "mixed", "all"), default="all"
     )
     parser.add_argument("--max-batch-sizes", type=int, nargs="+", default=None)
+    parser.add_argument("--max-prefill-tokens", type=int, default=None)
+    parser.add_argument("--max-wait-ms", type=float, default=None)
     parser.add_argument("--count-per-bucket", type=int, default=None)
     parser.add_argument("--arrival-interval-ms", type=float, default=None)
+    parser.add_argument(
+        "--arrival-pattern",
+        choices=("fixed_rate", "poisson"),
+        default=None,
+    )
+    parser.add_argument("--arrival-rate-per-second", type=float, default=None)
     parser.add_argument("--cancel-request-indices", type=int, nargs="*", default=())
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--reference-dir", type=Path, default=DEFAULT_REFERENCE_DIR)
@@ -58,194 +70,27 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _project_path(value: str | Path) -> Path:
-    path = Path(value)
-    if path.is_absolute():
-        return path
-    if path.parts and path.parts[0] == PROJECT_ROOT.name:
-        return PROJECT_ROOT.parent / path
-    return PROJECT_ROOT / path
-
-
 def load_config(path: Path) -> dict[str, Any]:
-    payload = load_yaml_config(path, expected_phase=4, label="Concurrent requests")
+    payload = load_yaml_config(path, expected_phase=5, label="Continuous batching")
     model = payload.get("model")
     if not isinstance(model, Mapping):
-        raise ValueError("Concurrent request config must contain a model object")
+        raise ValueError("Continuous batching config must contain a model object")
     if model.get("id") != MODEL_ID or model.get("revision") != MODEL_REVISION:
-        raise ValueError("Concurrent request config must use the pinned Qwen revision")
+        raise ValueError("Continuous batching config must use the pinned Qwen revision")
     scheduler = payload.get("scheduler")
     if not isinstance(scheduler, Mapping):
-        raise ValueError("Concurrent request config must contain a scheduler object")
-    if scheduler.get("policy") != "fifo_padded_static_batch":
-        raise ValueError("Phase 4 supports only fifo_padded_static_batch")
+        raise ValueError(
+            "Continuous batching config must contain a scheduler object"
+        )
+    if scheduler.get("policy") != "continuous_in_flight_batching":
+        raise ValueError(
+            "Phase 5 supports only continuous_in_flight_batching"
+        )
+    if int(scheduler.get("max_prefill_tokens", 0)) < 1:
+        raise ValueError("max_prefill_tokens must be positive")
+    if float(scheduler.get("max_wait_ms", 0.0)) < 0:
+        raise ValueError("max_wait_ms must be non-negative")
     return payload
-
-
-def _bucket_map() -> dict[str, tuple[str, int, int]]:
-    return {name: (name, prompt, output) for name, prompt, output in BASELINE_BUCKETS}
-
-
-def _materialize_bucket(
-    tokenizer: Any,
-    dataset_path: Path,
-    *,
-    bucket_name: str,
-    count: int,
-    output_tokens: int,
-    seed: int,
-    model_id: str,
-    revision: str,
-    device: str,
-) -> tuple[RequestSpec, ...]:
-    try:
-        _, prompt_tokens, _ = _bucket_map()[bucket_name]
-    except KeyError as error:
-        raise ValueError(f"Unknown workload bucket: {bucket_name}") from error
-    return build_hf_workload(
-        tokenizer,
-        dataset_path,
-        bucket_name=bucket_name,
-        prompt_tokens=prompt_tokens,
-        output_tokens=output_tokens,
-        count=count,
-        seed=seed,
-        model_id=model_id,
-        revision=revision,
-        device=device,
-    ).requests
-
-
-def build_trace_workloads(
-    tokenizer: Any,
-    dataset_path: Path,
-    config: Mapping[str, Any],
-    *,
-    seed: int,
-    model_id: str,
-    revision: str,
-    device: str,
-    count_per_bucket_override: int | None,
-    arrival_interval_ms: float,
-    arrival_pattern: str = "fixed_rate",
-    arrival_rate_per_second: float | None = None,
-) -> dict[str, WorkloadSpec]:
-    if arrival_interval_ms < 0:
-        raise ValueError("arrival_interval_ms must be non-negative")
-    if arrival_pattern not in {"fixed_rate", "poisson"}:
-        raise ValueError("arrival_pattern must be fixed_rate or poisson")
-    if arrival_pattern == "poisson":
-        if arrival_rate_per_second is None:
-            if arrival_interval_ms <= 0:
-                raise ValueError(
-                    "poisson workloads require a positive arrival rate or interval"
-                )
-            arrival_rate_per_second = 1000.0 / arrival_interval_ms
-        if arrival_rate_per_second <= 0:
-            raise ValueError("arrival_rate_per_second must be positive")
-        arrival_generator = random.Random(seed)
-    else:
-        arrival_generator = None
-    output_map = config["output_tokens"]
-    uniform_config = config["uniform"]
-    uniform_bucket = str(uniform_config["bucket"])
-    uniform_count = int(
-        uniform_config["count"]
-        if count_per_bucket_override is None
-        else count_per_bucket_override
-    )
-    if uniform_count < 1:
-        raise ValueError("uniform request count must be positive")
-    uniform_requests = _materialize_bucket(
-        tokenizer,
-        dataset_path,
-        bucket_name=uniform_bucket,
-        count=uniform_count,
-        output_tokens=int(output_map[uniform_bucket]),
-        seed=seed,
-        model_id=model_id,
-        revision=revision,
-        device=device,
-    )
-
-    mixed_config = config["mixed"]
-    mixed_buckets = tuple(str(value) for value in mixed_config["buckets"])
-    mixed_count = int(
-        mixed_config["count_per_bucket"]
-        if count_per_bucket_override is None
-        else count_per_bucket_override
-    )
-    if mixed_count < 1:
-        raise ValueError("mixed count_per_bucket must be positive")
-    by_bucket = {
-        bucket: _materialize_bucket(
-            tokenizer,
-            dataset_path,
-            bucket_name=bucket,
-            count=mixed_count,
-            output_tokens=int(output_map[bucket]),
-            seed=seed,
-            model_id=model_id,
-            revision=revision,
-            device=device,
-        )
-        for bucket in mixed_buckets
-    }
-    mixed_requests = tuple(
-        by_bucket[bucket][index]
-        for index in range(mixed_count)
-        for bucket in mixed_buckets
-    )
-
-    def make_workload(name: str, requests: Sequence[RequestSpec]) -> WorkloadSpec:
-        if arrival_pattern == "fixed_rate":
-            offsets = [index * arrival_interval_ms for index in range(len(requests))]
-        else:
-            assert arrival_generator is not None
-            assert arrival_rate_per_second is not None
-            offsets = []
-            elapsed_ms = 0.0
-            for _ in requests:
-                elapsed_ms += arrival_generator.expovariate(
-                    arrival_rate_per_second / 1000.0
-                )
-                offsets.append(elapsed_ms)
-        scheduled = tuple(
-            replace(request, scheduled_arrival_ms=offsets[index])
-            for index, request in enumerate(requests)
-        )
-        return WorkloadSpec(
-            name=name,
-            seed=seed,
-            requests=scheduled,
-            model_id=model_id,
-            model_revision=revision,
-            dtype="fp8",
-            device=device,
-            arrival_pattern=arrival_pattern,
-            metadata={
-                "arrival_interval_ms": arrival_interval_ms,
-                "arrival_pattern": arrival_pattern,
-                "arrival_rate_per_second": arrival_rate_per_second,
-                "request_shapes": [
-                    {
-                        "request_id": request.request_id,
-                        "prompt_tokens": request.prompt_tokens,
-                        "output_tokens": request.max_new_tokens,
-                    }
-                    for request in scheduled
-                ],
-            },
-        )
-
-    return {
-        "uniform": make_workload("concurrent_uniform", uniform_requests),
-        "mixed": make_workload("concurrent_mixed", mixed_requests),
-    }
-
-
-def _display(value: Any) -> str:
-    return "n/a" if value is None else f"{float(value):.3f}"
 
 
 def main() -> None:
@@ -285,6 +130,21 @@ def main() -> None:
         if args.arrival_interval_ms is None
         else args.arrival_interval_ms
     )
+    arrival_pattern = str(
+        workload_config.get("arrival_pattern", "fixed_rate")
+        if args.arrival_pattern is None
+        else args.arrival_pattern
+    )
+    configured_rate = workload_config.get("arrival_rate_per_second")
+    arrival_rate_per_second = (
+        None
+        if args.arrival_rate_per_second is None and configured_rate is None
+        else float(
+            configured_rate
+            if args.arrival_rate_per_second is None
+            else args.arrival_rate_per_second
+        )
+    )
     workloads = build_trace_workloads(
         bundle.tokenizer,
         dataset_path,
@@ -295,6 +155,8 @@ def main() -> None:
         device=device,
         count_per_bucket_override=args.count_per_bucket,
         arrival_interval_ms=arrival_interval_ms,
+        arrival_pattern=arrival_pattern,
+        arrival_rate_per_second=arrival_rate_per_second,
     )
     selected_names = (
         tuple(workloads) if args.workload == "all" else (args.workload,)
@@ -306,6 +168,20 @@ def main() -> None:
     )
     if not max_batch_sizes or any(value < 1 for value in max_batch_sizes):
         raise ValueError("max batch sizes must be positive")
+    max_prefill_tokens = int(
+        scheduler_config["max_prefill_tokens"]
+        if args.max_prefill_tokens is None
+        else args.max_prefill_tokens
+    )
+    max_wait_ms = float(
+        scheduler_config.get("max_wait_ms", 0.0)
+        if args.max_wait_ms is None
+        else args.max_wait_ms
+    )
+    if max_prefill_tokens < 1:
+        raise ValueError("max prefill tokens must be positive")
+    if max_wait_ms < 0:
+        raise ValueError("max wait ms must be non-negative")
     repetitions = int(
         benchmark_config["repetitions"]
         if args.repetitions is None
@@ -326,7 +202,7 @@ def main() -> None:
             bool(benchmark_config["collect_system_telemetry"])
             and not args.no_system_telemetry
         ),
-        runner_name="fifo_padded_static_batch",
+        runner_name="continuous_in_flight_batching",
         timing_mode="wall",
         seed=int(workload_config["seed"]),
         timer_overhead_iterations=int(benchmark_config["timer_overhead_iterations"]),
@@ -342,7 +218,7 @@ def main() -> None:
     manifest: dict[str, Any] = {
         "schema_version": 1,
         "project": "MiniLLM-L4",
-        "phase": 4,
+        "phase": 5,
         "status": "running",
         "config": str(config_path),
         "initialization": initialization,
@@ -350,7 +226,11 @@ def main() -> None:
             "workload_selection": args.workload,
             "count_per_bucket": args.count_per_bucket,
             "arrival_interval_ms": arrival_interval_ms,
+            "arrival_pattern": arrival_pattern,
+            "arrival_rate_per_second": arrival_rate_per_second,
             "max_batch_sizes": max_batch_sizes,
+            "max_prefill_tokens": max_prefill_tokens,
+            "max_wait_ms": max_wait_ms,
             "repetitions": repetitions,
             "warmup_repetitions": warmups,
             "sample_interval_seconds": harness_config.sample_interval_seconds,
@@ -361,7 +241,7 @@ def main() -> None:
         },
         "workloads": [],
     }
-    manifest_path = output_dir / "concurrent_manifest.json"
+    manifest_path = output_dir / "continuous_manifest.json"
 
     def write_manifest() -> None:
         manifest_path.write_text(
@@ -384,9 +264,11 @@ def main() -> None:
                 raise ValueError("cancel request index is outside the workload") from error
 
         for max_batch_size in max_batch_sizes:
-            runner = StaticRequestTraceRunner(
+            runner = ContinuousRequestTraceRunner(
                 bundle.model,
                 max_batch_size=max_batch_size,
+                max_prefill_tokens=max_prefill_tokens,
+                max_wait_ms=max_wait_ms,
                 device=device,
                 logits_mode=str(benchmark_config.get("logits_mode", "last")),
                 eos_token_id=eos_token_id,
@@ -395,18 +277,18 @@ def main() -> None:
             )
             result = BenchmarkHarness(
                 harness_config,
-                benchmark_name="minillm_l4_concurrent_requests",
+                benchmark_name="minillm_l4_continuous_requests",
             ).run_trace(workload, runner)
             correctness = verify_concurrent_references(
                 result,
                 reference_dir,
                 cancelled_request_ids=cancellation_ids,
             )
-            result_path = output_dir / f"static_{workload_name}_b{max_batch_size}.json"
+            result_path = output_dir / f"continuous_{workload_name}_b{max_batch_size}.json"
             events_path = output_dir / (
-                f"static_{workload_name}_b{max_batch_size}_events.jsonl"
+                f"continuous_{workload_name}_b{max_batch_size}_events.jsonl"
             )
-            write_concurrent_result(
+            write_continuous_result(
                 result,
                 result_path,
                 model_metadata=initialization,
@@ -418,6 +300,8 @@ def main() -> None:
                 {
                     "name": workload_name,
                     "max_batch_size": max_batch_size,
+                    "max_prefill_tokens": max_prefill_tokens,
+                    "max_wait_ms": max_wait_ms,
                     "cancelled_request_ids": list(cancellation_ids),
                     "result": str(result_path),
                     "events": str(events_path),
@@ -428,12 +312,14 @@ def main() -> None:
             )
             write_manifest()
             metrics = result.summary["metrics"]
+            scheduler = runner.last_summary or {}
             print(
                 f"{workload_name:7s} max_batch={max_batch_size:<2d} "
+                f"active_max={scheduler.get('maximum_active_batch_size', 'n/a')!s:<2} "
                 f"TTFT_P50={_display(metrics['ttft_ms'].get('median'))} ms "
                 f"E2E_P95={_display(metrics['e2e_latency_ms'].get('p95'))} ms "
                 f"TPS_P50={_display(result.summary['tokens_per_second'].get('median'))} "
-                f"padding={_display((runner.last_summary or {}).get('padding_waste_ratio'))} "
+                f"queue_P95={_display(metrics['queue_delay_ms'].get('p95'))} ms "
                 f"correctness={correctness['status']}"
             )
 
@@ -445,7 +331,7 @@ def main() -> None:
     write_manifest()
     print(f"Manifest: {manifest_path}")
     if manifest["status"] != "completed":
-        raise RuntimeError("Concurrent request correctness failed; see the manifest")
+        raise RuntimeError("Continuous batching correctness failed; see the manifest")
 
 
 if __name__ == "__main__":

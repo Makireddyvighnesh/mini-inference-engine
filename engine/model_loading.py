@@ -43,8 +43,8 @@ def _validate_options(
         raise ValueError(
             "fp8_fallback_dtype must be one of: auto, fp16, bfloat16"
         )
-    if fp8_kernel_path not in {"auto", "triton"}:
-        raise ValueError("fp8_kernel_path must be one of: auto, triton")
+    if fp8_kernel_path not in {"auto", "triton", "sm89"}:
+        raise ValueError("fp8_kernel_path must be one of: auto, triton, sm89")
 
 
 def configure_kernel_strategy(
@@ -60,7 +60,7 @@ def configure_kernel_strategy(
         fp8_fallback_dtype="auto",
         fp8_kernel_path=fp8_kernel_path,
     )
-    if fp8_kernel_path == "triton":
+    if fp8_kernel_path in {"triton", "sm89"}:
         os.environ["TRANSFORMERS_DISABLE_DEEPGEMM_LINEAR"] = "1"
 
     capability = (
@@ -74,8 +74,11 @@ def configure_kernel_strategy(
         "gpu_compute_capability": capability,
         "fp8_deepgemm_eligible": deepgemm_eligible,
         "fp8_triton_forced": fp8_kernel_path == "triton",
+        "fp8_sm89_custom": fp8_kernel_path == "sm89",
         "expected_kernel_path": (
-            "triton_finegrained_fp8"
+            "minillm_sm89_triton_fp8"
+            if fp8_kernel_path == "sm89"
+            else "triton_finegrained_fp8"
             if fp8_kernel_path == "triton" or not deepgemm_eligible
             else "auto_deepgemm_or_triton"
         ),

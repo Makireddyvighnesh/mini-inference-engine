@@ -9,6 +9,20 @@ from .concurrent_requests import (
     verify_concurrent_references,
     write_concurrent_result,
 )
+from .continuous_requests import (
+    ContinuousRequestTraceRunner,
+    write_continuous_result,
+)
+from .paged_cuda_graph import (
+    PagedCudaGraphBatchRunner,
+    write_paged_cuda_graph_result,
+)
+from .paged_kv import (
+    PagedAttentionBatchRunner,
+    PagedHybridBatchRunner,
+    PagedKvBatchRunner,
+    write_paged_result,
+)
 
 __all__ = [
     "HuggingFaceGreedyBatchRunner",
@@ -22,4 +36,12 @@ __all__ = [
     "StaticRequestTraceRunner",
     "write_concurrent_result",
     "verify_concurrent_references",
+    "ContinuousRequestTraceRunner",
+    "write_continuous_result",
+    "PagedCudaGraphBatchRunner",
+    "write_paged_cuda_graph_result",
+    "PagedKvBatchRunner",
+    "PagedAttentionBatchRunner",
+    "PagedHybridBatchRunner",
+    "write_paged_result",
 ]
