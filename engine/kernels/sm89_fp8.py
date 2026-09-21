@@ -77,6 +77,25 @@ if triton is not None:
 
     @triton.autotune(
         configs=[
+            # Autoregressive decode has M=1.  A 16-row tile is appropriate for
+            # prefill but wastes work and registers for one live row, even
+            # though the masked rows are never stored.  Keep a dedicated
+            # vector-matrix family for the batch-1 and small-batch regime.
+            triton.Config(
+                {"BLOCK_M": 1, "BLOCK_N": 64, "BLOCK_K": 128, "GROUP_M": 1},
+                num_warps=4,
+                num_stages=2,
+            ),
+            triton.Config(
+                {"BLOCK_M": 1, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_M": 1},
+                num_warps=4,
+                num_stages=2,
+            ),
+            triton.Config(
+                {"BLOCK_M": 1, "BLOCK_N": 256, "BLOCK_K": 128, "GROUP_M": 1},
+                num_warps=8,
+                num_stages=2,
+            ),
             triton.Config(
                 {"BLOCK_M": 16, "BLOCK_N": 64, "BLOCK_K": 128, "GROUP_M": 8},
                 num_warps=4,

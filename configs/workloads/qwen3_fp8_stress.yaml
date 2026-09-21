@@ -1,0 +1,51 @@
+schema_version: 1
+project: MiniLLM-L4
+phase: 5
+
+model:
+  id: Qwen/Qwen3-4B-Instruct-2507-FP8
+  revision: 8591804019c8b22094c3b5b4454e0edc05dffc98
+  precision: fp8
+  fp8_fallback_dtype: auto
+  fp8_kernel_path: auto
+  device: cuda:0
+  local_files_only: true
+
+workloads:
+  dataset: data/synthetic/workloads_v1.jsonl
+  seed: 17
+
+stress:
+  concurrency:
+    prompt_bucket: short
+    request_count: 16
+    output_tokens: 16
+    arrival_interval_ms: 0.0
+    max_batch_sizes: [1, 2, 4, 8, 16]
+    max_prefill_tokens: 2048
+    max_wait_ms: 0.0
+  input_budget:
+    prompt_bucket: long
+    request_count: 8
+    output_tokens: 16
+    arrival_interval_ms: 0.0
+    max_batch_size: 8
+    max_prefill_tokens: [2048, 4096, 8192, 16384]
+    max_wait_ms: 0.0
+  interleave:
+    buckets: [short, medium, long]
+    cycles: 4
+    output_tokens: 16
+    arrival_interval_ms: 5.0
+    max_batch_sizes: [4, 8]
+    max_prefill_tokens: 4096
+    max_wait_ms: 0.0
+
+benchmark:
+  warmup_repetitions: 1
+  repetitions: 2
+  sample_interval_seconds: 0.25
+  collect_gpu: true
+  collect_system_telemetry: true
+  timer_overhead_iterations: 1000
+  logits_mode: last

@@ -23,6 +23,7 @@ from .paged_kv import (
     PagedKvBatchRunner,
     write_paged_result,
 )
+from .packed_paged import PackedPagedPrefillBatchRunner
 
 __all__ = [
     "HuggingFaceGreedyBatchRunner",
@@ -44,4 +45,5 @@ __all__ = [
     "PagedAttentionBatchRunner",
     "PagedHybridBatchRunner",
     "write_paged_result",
+    "PackedPagedPrefillBatchRunner",
 ]

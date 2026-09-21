@@ -2,8 +2,9 @@
 
 Keys and values stay in physical pages, and attention consumes each request's
 logical block table without materializing a left-padded dense KV batch. CUDA
-one-token decode uses a fused Triton kernel; CPU, unsupported shapes, and
-multi-token reference prefill use the block-wise PyTorch implementation.
+one-token decode and packed varlen prefill use fused Triton kernels; CPU,
+unsupported shapes, and correctness-focused reference paths use the readable
+block-wise PyTorch implementation.
 
 The reduction is performed block by block with an online softmax.  Therefore
 we never build a ``[batch, heads, max_context]`` score tensor and never
@@ -13,11 +14,18 @@ materialize a left-padded dense KV batch.
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 from collections.abc import Sequence
 
 import torch
+import torch.nn.functional as F
 
+from .packed import PackedSequenceMetadata
 from .paged import PagedKvCache, PagedKvShapeError
+from .triton_packed_attention import (
+    can_use_triton_packed_prefill,
+    triton_packed_prefill_attention,
+)
 from .triton_paged_attention import (
     can_use_triton_paged_decode,
     triton_paged_decode_attention,
@@ -181,6 +189,10 @@ def paged_attention(
     causal: bool = True,
     block_tables: torch.Tensor | None = None,
     sequence_lengths: torch.Tensor | None = None,
+    decode_split_count: int | None = None,
+    decode_max_sequence_length: int | None = None,
+    decode_use_gqa_reuse: bool | None = None,
+    decode_block_tokens: int = 16,
     backend: str = "auto",
 ) -> torch.Tensor:
     """Compute attention directly from physical KV blocks.
@@ -198,6 +210,15 @@ def paged_attention(
         scale: Query/key scale.  Defaults to ``1 / sqrt(head_dim)``.
         num_key_value_groups: Number of query heads sharing each KV head.
         causal: Apply the causal upper bound for each query token.
+        decode_split_count: Optional fixed split count for long-context Triton
+            decode.  CUDA Graph callers provide this from their known graph
+            shape so graph capture never reads a device length on the host.
+        decode_max_sequence_length: Maximum logical KV length covered by the
+            selected graph shape.  Required when split-KV is enabled.
+        decode_use_gqa_reuse: Select the grouped-query-aware Triton kernel.
+            ``None`` enables it automatically for supported GQA group sizes;
+            ``False`` retains the per-query-head reference kernel.
+        decode_block_tokens: Number of logical tokens reduced per Triton tile.
 
     Returns:
         Tensor with shape ``[batch, query_tokens, attention_heads, head_dim]``,
@@ -260,6 +281,12 @@ def paged_attention(
             block_tables,
             sequence_lengths,
             scale=attention_scale,
+            split_count=(
+                1 if decode_split_count is None else int(decode_split_count)
+            ),
+            max_sequence_length=decode_max_sequence_length,
+            use_gqa_reuse=decode_use_gqa_reuse,
+            block_tokens=decode_block_tokens,
         )
 
     rows = [
@@ -280,4 +307,212 @@ def paged_attention(
     return torch.stack(rows, dim=0)
 
 
-__all__ = ["paged_attention"]
+def packed_paged_attention(
+    query: torch.Tensor,
+    cache: PagedKvCache,
+    metadata: PackedSequenceMetadata,
+    *,
+    layer_index: int,
+    scale: float | None = None,
+    num_key_value_groups: int = 1,
+    block_tables: torch.Tensor | None = None,
+    backend: str = "auto",
+    prefill_key_states: torch.Tensor | None = None,
+    prefill_value_states: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compute causal prefill attention for a flat ragged token batch.
+
+    ``query`` has shape ``[sum(prompt_lengths), query_heads, head_dim]``.  The
+    metadata maps every flat row to a request and a local position.  The
+    PyTorch fallback loops over requests only at the attention operation; the
+    surrounding decoder layer, projections, and MLP still process one flat
+    batch.  Supported CUDA inputs use one Triton program per flat token/head.
+    """
+
+    if backend not in {
+        "auto",
+        "torch",
+        "triton",
+        "sdpa",
+        "sdpa_math",
+    }:
+        raise ValueError(
+            "backend must be auto, torch, triton, sdpa, or sdpa_math"
+        )
+    if not isinstance(query, torch.Tensor) or query.ndim != 3:
+        raise ValueError("query must have shape [tokens, heads, head_dim]")
+    if int(query.shape[0]) != metadata.total_tokens:
+        raise ValueError("query token count must match packed metadata")
+    if query.device != cache.device:
+        raise ValueError("query and paged cache must be on the same device")
+    num_tokens, num_heads, head_dim = (int(value) for value in query.shape)
+    if head_dim != cache.head_dim:
+        raise PagedKvShapeError(
+            f"query head_dim {head_dim} does not match cache head_dim {cache.head_dim}"
+        )
+    groups = int(num_key_value_groups)
+    if groups < 1 or num_heads != cache.num_kv_heads * groups:
+        raise ValueError(
+            "num_key_value_groups must make attention heads divisible across "
+            f"{cache.num_kv_heads} KV heads; got heads={num_heads}, groups={groups}"
+        )
+    normalized_layer = cache._validate_layer_index(layer_index)
+    attention_scale = float(scale) if scale is not None else 1.0 / (head_dim**0.5)
+
+    if block_tables is None:
+        block_tables = cache.block_table_tensor(
+            metadata.sequence_ids,
+            device=query.device,
+        ).to(dtype=torch.int32)
+    if block_tables.ndim != 2 or int(block_tables.shape[0]) != metadata.batch_size:
+        raise ValueError("block_tables must have one row per packed request")
+
+    key_blocks = cache.key_blocks[normalized_layer]
+    value_blocks = cache.value_blocks[normalized_layer]
+
+    if (prefill_key_states is None) != (prefill_value_states is None):
+        raise ValueError(
+            "prefill_key_states and prefill_value_states must be supplied together"
+        )
+    if backend in {"sdpa", "sdpa_math"}:
+        if prefill_key_states is None or prefill_value_states is None:
+            raise ValueError(
+                "the SDPA packed-prefill backend requires current-layer K/V states"
+            )
+        return _sdpa_packed_prefill_attention(
+            query,
+            prefill_key_states,
+            prefill_value_states,
+            metadata,
+            scale=attention_scale,
+            num_key_value_groups=groups,
+            force_math=backend == "sdpa_math",
+        )
+    use_triton = can_use_triton_packed_prefill(
+        query,
+        key_blocks,
+        value_blocks,
+        metadata.token_to_sequence,
+        metadata.token_positions,
+        block_tables,
+    )
+    if backend == "triton" and not use_triton:
+        raise RuntimeError("Triton packed prefill was requested but is unsupported")
+    if backend != "torch" and use_triton:
+        return triton_packed_prefill_attention(
+            query.contiguous(),
+            key_blocks,
+            value_blocks,
+            metadata.token_to_sequence,
+            metadata.token_positions,
+            block_tables,
+            scale=attention_scale,
+        )
+
+    rows: list[torch.Tensor] = []
+    for request_index, sequence_id in enumerate(metadata.sequence_ids):
+        token_slice = metadata.request_slice(request_index)
+        query_row = query[token_slice].transpose(0, 1).contiguous()
+        row_output = _block_attention_for_sequence(
+            query_row,
+            cache,
+            sequence_id,
+            layer_index=normalized_layer,
+            query_start_position=0,
+            scale=attention_scale,
+            num_key_value_groups=groups,
+            causal=True,
+        )
+        rows.append(row_output)
+    output = torch.cat(rows, dim=0)
+    if int(output.shape[0]) != num_tokens:
+        raise RuntimeError("packed paged attention returned an invalid token count")
+    return output
+
+
+def _sdpa_packed_prefill_attention(
+    query: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    metadata: PackedSequenceMetadata,
+    *,
+    scale: float,
+    num_key_value_groups: int,
+    force_math: bool,
+) -> torch.Tensor:
+    """Run fused SDPA independently for each ragged request.
+
+    This is an optimized intermediate backend, not the final vLLM-style
+    ragged kernel: each request gets one fused SDPA call, so there is no
+    padding but there are multiple attention launches per decoder layer.  It
+    is useful on installations where a FlashAttention/FlashInfer Python
+    extension is unavailable, and it provides a fast correctness-preserving
+    fallback for the educational packed path.
+    """
+
+    if key_states.ndim != 4 or value_states.ndim != 4:
+        raise ValueError("prefill K/V states must have shape [1, kv_heads, tokens, dim]")
+    if key_states.shape != value_states.shape:
+        raise ValueError("prefill key and value states must have identical shapes")
+    if int(key_states.shape[0]) != 1:
+        raise ValueError("packed SDPA currently expects one flat prefill batch")
+    if int(key_states.shape[2]) != metadata.total_tokens:
+        raise ValueError("prefill K/V token count must match packed metadata")
+    if key_states.device != query.device or value_states.device != query.device:
+        raise ValueError("prefill K/V states must be on the query device")
+
+    outputs: list[torch.Tensor] = []
+    kernel_context = (
+        torch.nn.attention.sdpa_kernel([torch.nn.attention.SDPBackend.MATH])
+        if force_math
+        else nullcontext()
+    )
+    with kernel_context:
+        for request_index in range(metadata.batch_size):
+            token_slice = metadata.request_slice(request_index)
+            # Query enters as [tokens, query_heads, dim]; SDPA expects
+            # [batch, heads, tokens, dim].  The trusted Transformers path
+            # receives an all-ones attention mask during generation, which
+            # makes its SDPA adapter repeat GQA K/V heads instead of using
+            # enable_gqa.  Match that representation here so greedy logits
+            # remain bitwise-compatible.
+            query_row = query[token_slice].permute(1, 0, 2).unsqueeze(0)
+            key_row = key_states[:, :, token_slice, :]
+            value_row = value_states[:, :, token_slice, :]
+            if num_key_value_groups > 1:
+                key_row = (
+                    key_row[:, :, None, :, :]
+                    .expand(
+                        -1,
+                        -1,
+                        num_key_value_groups,
+                        -1,
+                        -1,
+                    )
+                    .reshape(1, -1, key_row.shape[2], key_row.shape[3])
+                )
+                value_row = (
+                    value_row[:, :, None, :, :]
+                    .expand(
+                        -1,
+                        -1,
+                        num_key_value_groups,
+                        -1,
+                        -1,
+                    )
+                    .reshape(1, -1, value_row.shape[2], value_row.shape[3])
+                )
+            row_output = F.scaled_dot_product_attention(
+                query_row,
+                key_row,
+                value_row,
+                dropout_p=0.0,
+                is_causal=True,
+                scale=scale,
+                enable_gqa=False,
+            )
+            outputs.append(row_output.squeeze(0).permute(1, 0, 2))
+    return torch.cat(outputs, dim=0)
+
+
+__all__ = ["paged_attention", "packed_paged_attention"]

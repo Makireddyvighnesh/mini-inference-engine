@@ -656,6 +656,161 @@ class PagedKvCache:
         )
         return table
 
+    def write_dense_batch(
+        self,
+        sequence_ids: Sequence[str],
+        layer_kv: Sequence[tuple[torch.Tensor, torch.Tensor]],
+        *,
+        start_token: int = 0,
+        block_tables: torch.Tensor | None = None,
+    ) -> tuple[PagedBlockTable, ...]:
+        """Scatter a rectangular dense prefill cache into physical pages.
+
+        ``layer_kv`` contains one ``[batch, kv_heads, tokens, head_dim]``
+        pair per model layer. The source is rectangular because it came from
+        the trusted dense model path, but the destination remains paged: one
+        indexed assignment writes every request/token row directly to its
+        physical block. This avoids the request-by-request, layer-by-layer
+        Python loop used by the original adapter.
+
+        The method does not change allocator token counts. Callers reserve the
+        full request capacity before writing, just as they do for
+        :meth:`write_layer_segment`.
+        """
+
+        normalized_ids = tuple(str(sequence_id) for sequence_id in sequence_ids)
+        if not normalized_ids:
+            raise ValueError("sequence_ids must not be empty")
+        if len(set(normalized_ids)) != len(normalized_ids):
+            raise ValueError("sequence_ids must be unique")
+
+        layers = tuple(layer_kv)
+        if len(layers) != self.num_layers:
+            raise PagedKvShapeError(
+                f"expected {self.num_layers} layer K/V pairs, received {len(layers)}"
+            )
+        if not layers:
+            raise PagedKvShapeError("layer_kv must not be empty")
+
+        batch_size = len(normalized_ids)
+        token_count: int | None = None
+        normalized_layers: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for layer_index, pair in enumerate(layers):
+            if len(pair) != 2:
+                raise PagedKvShapeError(
+                    f"layer {layer_index} must contain exactly key and value tensors"
+                )
+            keys, values = pair
+            if not isinstance(keys, torch.Tensor) or not isinstance(values, torch.Tensor):
+                raise PagedKvShapeError(
+                    f"layer {layer_index} keys and values must be tensors"
+                )
+            if keys.ndim != 4 or values.shape != keys.shape:
+                raise PagedKvShapeError(
+                    f"layer {layer_index} dense K/V must both have shape "
+                    "[batch, heads, tokens, head_dim]"
+                )
+            current_tokens = int(keys.shape[-2])
+            expected_shape = (
+                batch_size,
+                self.num_kv_heads,
+                current_tokens,
+                self.head_dim,
+            )
+            if tuple(int(value) for value in keys.shape) != expected_shape:
+                raise PagedKvShapeError(
+                    f"layer {layer_index} keys shape {tuple(keys.shape)} "
+                    f"does not match {expected_shape}"
+                )
+            if token_count is None:
+                token_count = current_tokens
+            elif token_count != current_tokens:
+                raise PagedKvShapeError(
+                    "all layers must contain the same dense token count"
+                )
+            for name, tensor in (("keys", keys), ("values", values)):
+                if tensor.dtype != self.dtype:
+                    raise PagedKvShapeError(
+                        f"layer {layer_index} {name} dtype {tensor.dtype} "
+                        f"does not match {self.dtype}"
+                    )
+                if tensor.device != self.device:
+                    raise PagedKvShapeError(
+                        f"layer {layer_index} {name} device {tensor.device} "
+                        f"does not match {self.device}"
+                    )
+            normalized_layers.append((keys, values))
+
+        assert token_count is not None
+        start = int(start_token)
+        if start < 0:
+            raise ValueError("start_token must be non-negative")
+        tables = tuple(
+            self.allocator.get_block_table(sequence_id)
+            for sequence_id in normalized_ids
+        )
+        if any(start + token_count > table.token_count for table in tables):
+            raise PagedKvStateError(
+                "dense layer segment exceeds at least one reserved sequence length"
+            )
+
+        if block_tables is None:
+            physical_tables = self.block_table_tensor(
+                normalized_ids,
+                device=self.device,
+            )
+        else:
+            if not isinstance(block_tables, torch.Tensor) or block_tables.ndim != 2:
+                raise PagedKvShapeError(
+                    "block_tables must have shape [batch, logical_blocks]"
+                )
+            if int(block_tables.shape[0]) != batch_size:
+                raise PagedKvShapeError(
+                    "block_tables row count must match sequence_ids"
+                )
+            if block_tables.device != self.device:
+                raise PagedKvShapeError(
+                    f"block_tables device {block_tables.device} does not match "
+                    f"{self.device}"
+                )
+            physical_tables = block_tables
+
+        required_blocks = max(
+            (table.allocated_block_count for table in tables),
+            default=0,
+        )
+        if int(physical_tables.shape[1]) < required_blocks:
+            raise PagedKvShapeError(
+                "block_tables does not contain every allocated logical block"
+            )
+
+        logical_positions = torch.arange(
+            start,
+            start + token_count,
+            dtype=torch.long,
+            device=self.device,
+        )
+        physical_blocks = physical_tables[:, logical_positions // self.allocator.block_size]
+        offsets = logical_positions.remainder(self.allocator.block_size)
+
+        # Advanced indexing produces a [batch, tokens, heads, dim] destination;
+        # permuting the dense source once gives it the same logical order. The
+        # request allocations are disjoint, so no indexed destinations alias.
+        for layer_index, (keys, values) in enumerate(normalized_layers):
+            self.key_blocks[layer_index][
+                physical_blocks,
+                :,
+                offsets,
+                :,
+            ] = keys.permute(0, 2, 1, 3)
+            self.value_blocks[layer_index][
+                physical_blocks,
+                :,
+                offsets,
+                :,
+            ] = values.permute(0, 2, 1, 3)
+        return tables
+
     def gather_layer(
         self,
         sequence_id: str,

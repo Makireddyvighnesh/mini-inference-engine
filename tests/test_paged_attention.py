@@ -9,6 +9,8 @@ from minillm_l4.engine.kv_cache import (
     PagedKvAllocator,
     PagedKvCache,
     paged_attention,
+    select_decode_block_tokens,
+    select_decode_split_count,
     triton_is_available,
 )
 
@@ -86,9 +88,101 @@ def test_paged_attention_reads_fragmented_pages_without_dense_batch_gather() -> 
     assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-5)
 
 
+def test_dense_prefill_batch_scatter_matches_each_physical_page() -> None:
+    torch.manual_seed(19)
+    allocator = PagedKvAllocator(num_blocks=12, block_size=2)
+    cache = PagedKvCache(
+        allocator,
+        num_layers=2,
+        num_kv_heads=2,
+        head_dim=4,
+        dtype=torch.float32,
+        device="cpu",
+    )
+    allocator.allocate("interleaving", token_count=2)
+    allocator.allocate("a", token_count=5)
+    allocator.allocate("b", token_count=5)
+    allocator.release("interleaving")
+
+    layer_kv = tuple(
+        (
+            torch.randn(2, 2, 5, 4),
+            torch.randn(2, 2, 5, 4),
+        )
+        for _ in range(2)
+    )
+    cache.write_dense_batch(
+        ("a", "b"),
+        layer_kv,
+        block_tables=cache.block_table_tensor(
+            ("a", "b"),
+            device="cpu",
+        ).to(dtype=torch.int32),
+    )
+
+    for layer_index, (expected_keys, expected_values) in enumerate(layer_kv):
+        actual_keys, actual_values = cache.gather_layer("a", layer_index)
+        assert torch.equal(actual_keys, expected_keys[0:1])
+        assert torch.equal(actual_values, expected_values[0:1])
+        actual_keys, actual_values = cache.gather_layer("b", layer_index)
+        assert torch.equal(actual_keys, expected_keys[1:2])
+        assert torch.equal(actual_values, expected_values[1:2])
+
+
+@pytest.mark.parametrize(
+    ("max_sequence_length", "expected_split_count"),
+    [(128, 1), (1024, 2), (2048, 2), (2049, 4), (4096, 4), (4097, 8)],
+)
+def test_long_context_split_count_uses_fixed_graph_buckets(
+    max_sequence_length: int,
+    expected_split_count: int,
+) -> None:
+    assert select_decode_split_count(max_sequence_length) == expected_split_count
+
+
+@pytest.mark.parametrize(
+    ("max_sequence_length", "batch_size", "expected_split_count"),
+    [
+        (2048, 1, 8),
+        (2048, 4, 4),
+        (2048, 8, 1),
+        (3072, 1, 8),
+        (3072, 8, 8),
+    ],
+)
+def test_decode_split_count_uses_profiled_batch_shape(
+    max_sequence_length: int,
+    batch_size: int,
+    expected_split_count: int,
+) -> None:
+    assert (
+        select_decode_split_count(max_sequence_length, batch_size=batch_size)
+        == expected_split_count
+    )
+
+
+@pytest.mark.parametrize(
+    ("max_sequence_length", "expected_block_tokens"),
+    [(1023, 16), (1024, 64), (4608, 64)],
+)
+def test_decode_tile_selector_uses_profiled_long_context_tile(
+    max_sequence_length: int,
+    expected_block_tokens: int,
+) -> None:
+    assert select_decode_block_tokens(max_sequence_length) == expected_block_tokens
+
+
 @pytest.mark.skipif(not triton_is_available(), reason="requires CUDA and Triton")
 @pytest.mark.parametrize("block_size", [8, 16, 32, 64])
-def test_triton_decode_matches_torch_paged_attention(block_size: int) -> None:
+@pytest.mark.parametrize("split_count", [1, 2, 4])
+@pytest.mark.parametrize("use_gqa_reuse", [False, True])
+@pytest.mark.parametrize("block_tokens", [16, 64])
+def test_triton_decode_matches_torch_paged_attention(
+    block_size: int,
+    split_count: int,
+    use_gqa_reuse: bool,
+    block_tokens: int,
+) -> None:
     torch.manual_seed(37)
     device = torch.device("cuda")
     allocator = PagedKvAllocator(num_blocks=32, block_size=block_size)
@@ -150,6 +244,10 @@ def test_triton_decode_matches_torch_paged_attention(block_size: int) -> None:
             dtype=torch.int32
         ),
         sequence_lengths=torch.tensor(lengths, dtype=torch.int32, device=device),
+        decode_split_count=split_count,
+        decode_max_sequence_length=max(lengths),
         backend="triton",
+        decode_use_gqa_reuse=use_gqa_reuse,
+        decode_block_tokens=block_tokens,
     )
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)

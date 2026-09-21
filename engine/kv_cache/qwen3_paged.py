@@ -10,8 +10,17 @@ from torch import nn
 
 from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
 
+from .packed import PackedSequenceMetadata
 from .paged import PagedKvCache
-from .paged_attention import paged_attention
+from .paged_attention import packed_paged_attention, paged_attention
+from .triton_packed_kv import (
+    can_use_triton_packed_kv_write,
+    triton_write_packed_kv,
+)
+from .triton_paged_kv import (
+    can_use_triton_decode_kv_write,
+    triton_write_decode_kv,
+)
 
 
 class PagedQwen3Attention(nn.Module):
@@ -43,7 +52,12 @@ class PagedQwen3Attention(nn.Module):
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         page_cache = kwargs.pop("paged_kv_cache", None)
+        packed_metadata = kwargs.pop("paged_packed_metadata", None)
         if page_cache is None:
+            if packed_metadata is not None:
+                raise ValueError(
+                    "paged_packed_metadata requires paged_kv_cache"
+                )
             return self.inner(
                 hidden_states=hidden_states,
                 position_embeddings=position_embeddings,
@@ -68,6 +82,116 @@ class PagedQwen3Attention(nn.Module):
         block_tables = kwargs.pop("paged_block_tables", None)
         sequence_lengths = kwargs.pop("paged_sequence_lengths", None)
         attention_backend = str(kwargs.pop("paged_attention_backend", "auto"))
+        decode_split_count = kwargs.pop("paged_decode_split_count", None)
+        decode_max_sequence_length = kwargs.pop(
+            "paged_decode_max_sequence_length", None
+        )
+        decode_block_tokens = int(kwargs.pop("paged_decode_block_tokens", 16))
+        decode_use_gqa_reuse = kwargs.pop("paged_decode_use_gqa_reuse", False)
+
+        if packed_metadata is not None:
+            if not isinstance(packed_metadata, PackedSequenceMetadata):
+                raise TypeError(
+                    "paged_packed_metadata must be PackedSequenceMetadata"
+                )
+            if hidden_states.ndim != 2:
+                raise ValueError(
+                    "packed paged prefill requires hidden_states with shape "
+                    "[total_tokens, hidden_size]"
+                )
+            if sequence_ids != packed_metadata.sequence_ids:
+                raise ValueError(
+                    "paged_sequence_ids must match packed metadata sequence_ids"
+                )
+            if int(hidden_states.shape[0]) != packed_metadata.total_tokens:
+                raise ValueError(
+                    "packed hidden-state rows must match packed metadata token count"
+                )
+
+            total_tokens = int(hidden_states.shape[0])
+            query_states = self.inner.q_norm(
+                self.inner.q_proj(hidden_states).view(
+                    total_tokens,
+                    -1,
+                    self.head_dim,
+                )
+            )
+            key_states = self.inner.k_norm(
+                self.inner.k_proj(hidden_states).view(
+                    total_tokens,
+                    -1,
+                    self.head_dim,
+                )
+            )
+            value_states = self.inner.v_proj(hidden_states).view(
+                total_tokens,
+                -1,
+                self.head_dim,
+            )
+
+            # Keep a synthetic batch dimension for the shared RoPE helper,
+            # then flatten back to [total_tokens, heads, head_dim] for the
+            # packed attention kernel.
+            query_states = query_states.permute(1, 0, 2).unsqueeze(0)
+            key_states = key_states.permute(1, 0, 2).unsqueeze(0)
+            value_states = value_states.permute(1, 0, 2).unsqueeze(0)
+            cos, sin = position_embeddings
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states,
+                key_states,
+                cos,
+                sin,
+            )
+
+            if block_tables is None:
+                block_tables = page_cache.block_table_tensor(
+                    sequence_ids,
+                    device=hidden_states.device,
+                ).to(dtype=torch.int32)
+            if can_use_triton_packed_kv_write(
+                key_states,
+                value_states,
+                packed_metadata.token_to_sequence,
+                packed_metadata.token_positions,
+                block_tables,
+                page_cache.key_blocks[self.layer_idx],
+                page_cache.value_blocks[self.layer_idx],
+            ):
+                triton_write_packed_kv(
+                    key_states,
+                    value_states,
+                    packed_metadata.token_to_sequence,
+                    packed_metadata.token_positions,
+                    block_tables,
+                    page_cache.key_blocks[self.layer_idx],
+                    page_cache.value_blocks[self.layer_idx],
+                )
+            else:
+                for request_index, sequence_id in enumerate(sequence_ids):
+                    token_slice = packed_metadata.request_slice(request_index)
+                    page_cache.write_layer_segment(
+                        sequence_id,
+                        self.layer_idx,
+                        key_states[:, :, token_slice, :],
+                        value_states[:, :, token_slice, :],
+                        start_token=0,
+                    )
+
+            attn_output = packed_paged_attention(
+                query_states.squeeze(0).permute(1, 0, 2).contiguous(),
+                page_cache,
+                packed_metadata,
+                layer_index=self.layer_idx,
+                scale=self.scaling,
+                num_key_value_groups=self.num_key_value_groups,
+                block_tables=block_tables,
+                backend=attention_backend,
+                prefill_key_states=key_states,
+                prefill_value_states=value_states,
+            )
+            attn_output = attn_output.reshape(total_tokens, -1).contiguous()
+            attn_output = self.inner.o_proj(attn_output)
+            return attn_output, None
 
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -93,31 +217,48 @@ class PagedQwen3Attention(nn.Module):
             starts: Sequence[int] | torch.Tensor | None = None
         else:
             starts = query_start_positions
-        for row, sequence_id in enumerate(sequence_ids):
-            if isinstance(starts, torch.Tensor):
-                if starts.ndim == 2 and starts.shape[-1] == 1:
-                    start = int(starts[row, 0].item())
-                else:
-                    start = int(starts[row].item())
-            elif starts is None:
-                start = None
-            else:
-                start = int(starts[row])
-            # ``None`` makes paged_attention infer the suffix position, but a
-            # layer write needs an explicit logical location.  In that case a
-            # query suffix is necessarily the final query_tokens positions.
-            if start is None:
-                start = (
-                    page_cache.allocator.get_block_table(sequence_id).token_count
-                    - int(key_states.shape[-2])
-                )
-            page_cache.write_layer_segment(
-                sequence_id,
-                self.layer_idx,
-                key_states[row : row + 1],
-                value_states[row : row + 1],
-                start_token=start,
+        if can_use_triton_decode_kv_write(
+            key_states,
+            value_states,
+            block_tables,
+            sequence_lengths,
+            page_cache.key_blocks[self.layer_idx],
+            page_cache.value_blocks[self.layer_idx],
+        ):
+            triton_write_decode_kv(
+                key_states,
+                value_states,
+                block_tables,
+                sequence_lengths,
+                page_cache.key_blocks[self.layer_idx],
+                page_cache.value_blocks[self.layer_idx],
             )
+        else:
+            for row, sequence_id in enumerate(sequence_ids):
+                if isinstance(starts, torch.Tensor):
+                    if starts.ndim == 2 and starts.shape[-1] == 1:
+                        start = int(starts[row, 0].item())
+                    else:
+                        start = int(starts[row].item())
+                elif starts is None:
+                    start = None
+                else:
+                    start = int(starts[row])
+                # ``None`` makes paged_attention infer the suffix position, but a
+                # layer write needs an explicit logical location.  In that case a
+                # query suffix is necessarily the final query_tokens positions.
+                if start is None:
+                    start = (
+                        page_cache.allocator.get_block_table(sequence_id).token_count
+                        - int(key_states.shape[-2])
+                    )
+                page_cache.write_layer_segment(
+                    sequence_id,
+                    self.layer_idx,
+                    key_states[row : row + 1],
+                    value_states[row : row + 1],
+                    start_token=start,
+                )
 
         attn_output = paged_attention(
             query_states,
@@ -130,6 +271,10 @@ class PagedQwen3Attention(nn.Module):
             causal=True,
             block_tables=block_tables,
             sequence_lengths=sequence_lengths,
+            decode_split_count=decode_split_count,
+            decode_max_sequence_length=decode_max_sequence_length,
+            decode_use_gqa_reuse=decode_use_gqa_reuse,
+            decode_block_tokens=decode_block_tokens,
             backend=attention_backend,
         )
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()

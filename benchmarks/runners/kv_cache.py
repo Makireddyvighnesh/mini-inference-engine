@@ -10,6 +10,7 @@ import torch
 
 from ..core.harness import BenchmarkResult, RequestEventRecorder
 from ..core.schemas import RequestOutcome, RequestSpec
+from ..core.tracing import ExecutionTrace
 from minillm_l4.engine.generation.manual import (
     manual_greedy_generate,
     output_token_digest,
@@ -65,6 +66,7 @@ class KvCacheBatchRunner:
         eos_token_id: int | Sequence[int] | None = None,
         pad_token_id: int = 0,
         capacity_tokens: int | None = None,
+        trace_enabled: bool = False,
     ) -> None:
         if mode not in CACHE_MODES:
             raise ValueError(f"mode must be one of {CACHE_MODES}")
@@ -79,7 +81,9 @@ class KvCacheBatchRunner:
         self.eos_token_id = eos_token_id
         self.pad_token_id = pad_token_id
         self.capacity_tokens = capacity_tokens
+        self.trace_enabled = bool(trace_enabled)
         self.last_cache_snapshot: dict[str, Any] | None = None
+        self.last_execution_trace: dict[str, Any] | None = None
 
     @property
     def runner_name(self) -> str:
@@ -117,8 +121,15 @@ class KvCacheBatchRunner:
         required_cache_tokens = prompt_tokens + output_tokens - 1
         selected_capacity = self.capacity_tokens or required_cache_tokens
         owner_ids = tuple(request.request_id for request in requests)
-        free_bytes, total_bytes = _device_memory(self.device)
-        allocated_bytes_before = _allocated_memory(self.device)
+        trace = ExecutionTrace(
+            device=self.device,
+            started_ns=recorders[0].run_started_ns,
+            enabled=self.trace_enabled,
+        )
+        self.last_execution_trace = None
+        with trace.span("memory_accounting_before_run", category="telemetry"):
+            free_bytes, total_bytes = _device_memory(self.device)
+            allocated_bytes_before = _allocated_memory(self.device)
 
         for recorder in recorders:
             recorder.record(
@@ -132,12 +143,17 @@ class KvCacheBatchRunner:
                 },
             )
 
-        input_ids = torch.tensor(
-            [request.prompt_token_ids for request in requests],
-            dtype=torch.long,
-            device=self.device,
-        )
-        attention_mask = torch.ones_like(input_ids)
+        with trace.span(
+            "input_rectangularization_and_device_transfer",
+            category="request_preparation",
+            metadata={"input_shape": [batch_size, prompt_tokens]},
+        ):
+            input_ids = torch.tensor(
+                [request.prompt_token_ids for request in requests],
+                dtype=torch.long,
+                device=self.device,
+            )
+            attention_mask = torch.ones_like(input_ids)
 
         def record_prefill_end(token_ids: torch.Tensor) -> None:
             _token_values(token_ids, batch_size=batch_size)
@@ -164,48 +180,71 @@ class KvCacheBatchRunner:
         self.last_cache_snapshot = None
         try:
             if self.mode == "contiguous":
-                model_config = getattr(self.model, "config", None)
-                if model_config is None:
-                    raise ValueError("contiguous caching requires model.config")
-                cache_state = ContiguousKvCache(
-                    model_config,
-                    owner_ids=owner_ids,
-                    capacity_tokens=selected_capacity,
-                )
-                cache_state.assert_owners(owner_ids)
-                generation = manual_greedy_generate(
-                    self.model,
-                    {"input_ids": input_ids, "attention_mask": attention_mask},
-                    output_tokens=output_tokens,
-                    logits_mode=self.logits_mode,
-                    eos_token_id=self.eos_token_id,
-                    pad_token_id=self.pad_token_id,
-                    on_prefill_end=record_prefill_end,
-                    on_token=record_token,
-                    kv_cache=cache_state,
-                )
-            else:
-                generation = recompute_greedy_generate(
-                    self.model,
-                    {"input_ids": input_ids, "attention_mask": attention_mask},
-                    output_tokens=output_tokens,
-                    logits_mode=self.logits_mode,
-                    eos_token_id=self.eos_token_id,
-                    pad_token_id=self.pad_token_id,
-                    on_prefill_end=record_prefill_end,
-                    on_token=record_token,
-                )
+                with trace.span(
+                    "kv_allocator_and_cache_allocation",
+                    category="kv_memory",
+                    metadata={"capacity_tokens": selected_capacity},
+                ):
+                    model_config = getattr(self.model, "config", None)
+                    if model_config is None:
+                        raise ValueError("contiguous caching requires model.config")
+                    cache_state = ContiguousKvCache(
+                        model_config,
+                        owner_ids=owner_ids,
+                        capacity_tokens=selected_capacity,
+                    )
+                    cache_state.assert_owners(owner_ids)
 
-            token_rows = [
-                [
-                    int(token)
-                    for token in generation.row(row_index)
-                    .detach()
-                    .to(device="cpu")
-                    .tolist()
+            with trace.span(
+                "model_forward_and_generation",
+                category="model_execution",
+                gpu=True,
+                metadata={
+                    "input_shape": [batch_size, prompt_tokens],
+                    "output_tokens": output_tokens,
+                    "cache_mode": self.mode,
+                },
+            ):
+                if self.mode == "contiguous":
+                    assert cache_state is not None
+                    generation = manual_greedy_generate(
+                        self.model,
+                        {"input_ids": input_ids, "attention_mask": attention_mask},
+                        output_tokens=output_tokens,
+                        logits_mode=self.logits_mode,
+                        eos_token_id=self.eos_token_id,
+                        pad_token_id=self.pad_token_id,
+                        on_prefill_end=record_prefill_end,
+                        on_token=record_token,
+                        kv_cache=cache_state,
+                    )
+                else:
+                    generation = recompute_greedy_generate(
+                        self.model,
+                        {"input_ids": input_ids, "attention_mask": attention_mask},
+                        output_tokens=output_tokens,
+                        logits_mode=self.logits_mode,
+                        eos_token_id=self.eos_token_id,
+                        pad_token_id=self.pad_token_id,
+                        on_prefill_end=record_prefill_end,
+                        on_token=record_token,
+                    )
+
+            with trace.span(
+                "output_materialization",
+                category="response_finalization",
+                metadata={"batch_size": batch_size},
+            ):
+                token_rows = [
+                    [
+                        int(token)
+                        for token in generation.row(row_index)
+                        .detach()
+                        .to(device="cpu")
+                        .tolist()
+                    ]
+                    for row_index in range(batch_size)
                 ]
-                for row_index in range(batch_size)
-            ]
             for recorder in recorders:
                 recorder.record("completion")
 
@@ -258,8 +297,19 @@ class KvCacheBatchRunner:
                 )
             return tuple(outcomes)
         finally:
-            if cache_state is not None:
-                cache_state.release()
+            with trace.span("kv_resource_release", category="kv_memory"):
+                if cache_state is not None:
+                    cache_state.release()
+            trace.counter("batch_size", batch_size)
+            trace.counter("prompt_tokens_per_request", prompt_tokens)
+            trace.counter("output_tokens_per_request", output_tokens)
+            trace.counter("cache_mode", self.mode)
+            self.last_execution_trace = trace.to_dict()
+            if self.last_cache_snapshot is not None:
+                self.last_cache_snapshot["execution_trace"] = dict(
+                    self.last_execution_trace
+                )
+                self.last_cache_snapshot["resources_released"] = True
 
 
 def write_kv_result(

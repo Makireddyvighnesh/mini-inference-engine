@@ -17,6 +17,18 @@ existing `adaserve/`, `llmperflab/`, `scripts/`, or root benchmark results.
   tables, controlled out-of-memory behavior, physical K/V storage, dense
   gather fallback, direct block-table attention, and an optimized-prefill /
   fused-Triton-paged-decode path are implemented and validated on the L4.
+- Packed ragged prefill: complete for the static-batch path. Prompts are
+  flattened without padding. The exact-token-safe Triton page-walking kernel
+  is the default; fused SDPA is available as an experimental benchmark path.
+- Component tracing: complete for packed eager decode and CUDA Graph decode.
+  `--trace-summary` enables synchronized diagnostic mode; normal performance
+  runs keep GPU work asynchronous so tracing does not distort the headline
+  latency. Diagnostic artifacts contain request preparation, allocator,
+  metadata, model forward, sampling, streaming, output, and cleanup spans
+  with wall and CUDA event timings.
+- Fixed-shape CUDA Graph decode: exact reusable one-graph replay is validated
+  for stable request shapes and IDs; graph capture remains an experimental
+  serving constraint rather than a general scheduler.
 - Model: `Qwen/Qwen3-4B-Instruct-2507-FP8`.
 - Snapshot: `8591804019c8b22094c3b5b4454e0edc05dffc98`.
 - Next work: prefix caching.
@@ -67,6 +79,15 @@ uses optimized SDPA during prefill, copies the resulting KV tensors once into
   timings and logical page visits are included in benchmark artifacts, and
   the readable PyTorch implementation remains available as a fallback.
 
+The packed-prefill backend drives projections and MLPs over one flat token
+buffer with `cu_seqlens`, so mixed prompt lengths do not become a rectangular
+prompt batch. Its experimental CUDA `sdpa` backend runs fused
+scaled-dot-product attention for each ragged request and writes the resulting
+K/V directly into pages. `triton` remains the exact-token-safe default for the
+project-owned page-walking attention kernel. On CUDA, packed K/V page writes
+use one project-owned scatter kernel per layer instead of Python looping over
+each request and page.
+
 ## Layout
 
 ```text
@@ -85,10 +106,17 @@ minillm_l4/
 │   └── kv_cache/
 │       ├── __init__.py
 │       ├── contiguous.py             # owned contiguous KV lifecycle
+│       ├── packed.py                 # flat-token request metadata
 │       ├── paged.py                  # fixed blocks, tables, and cache storage
-│       ├── paged_attention.py        # Triton selection and torch fallback
+│       ├── paged_attention.py        # paged and packed attention dispatch
+│       ├── qwen3_paged.py             # Qwen3 direct-attention adapter
+│       ├── triton_packed_attention.py # packed prefill kernel
+│       ├── triton_packed_kv.py        # packed K/V scatter kernel
 │       ├── triton_paged_attention.py # fused one-token decode kernel
-│       └── qwen3_paged.py            # Qwen3 direct-attention adapter
+│       ├── triton_paged_kv.py         # dynamic decode K/V writer
+│       └── ...
+│   └── model_runner/
+│       └── qwen3_packed.py            # flat-token Qwen3 prefill runner
 ├── benchmarks/
 │   ├── core/
 │   │   ├── harness.py              # shared execution and metric orchestration
@@ -96,7 +124,8 @@ minillm_l4/
 │   │   ├── workloads.py            # deterministic fixture workload builders
 │   │   ├── metrics.py              # request metrics and summaries
 │   │   ├── timing.py               # wall/CUDA timing helpers
-│   │   └── hardware.py             # environment, VRAM, and GPU telemetry
+│   │   ├── hardware.py             # environment, VRAM, and GPU telemetry
+│   │   └── tracing.py              # per-component execution spans
 │   ├── runners/
 │   │   ├── simulated.py            # deterministic CPU fixture runner
 │   │   ├── huggingface_baseline.py # Qwen loader and HF baseline runner
@@ -104,7 +133,9 @@ minillm_l4/
 │   │   ├── kv_cache.py             # cache/recompute comparison runner
 │   │   ├── concurrent_requests.py   # staggered static-batch trace runner
 │   │   ├── continuous_requests.py   # iteration-level continuous runner
-│   │   └── paged_kv.py              # gather and direct paged runners
+│   │   ├── paged_kv.py              # gather and direct paged runners
+│   │   ├── packed_paged.py          # no-padding packed prefill runner
+│   │   └── paged_cuda_graph.py      # reusable fixed-shape graph runner
 │   ├── commands/
 │       ├── run_harness.py          # harness command-line entry point
 │       ├── run_hf_baseline.py      # Hugging Face baseline entry point
@@ -258,6 +289,7 @@ Run the Phase 6 contiguous-versus-paged sweep on a CUDA-enabled L4:
 The paged command keeps total physical token capacity fixed while sweeping
 block sizes. It records block utilization, internal fragmentation, physical
 KV bytes, stage timings, page visits, TTFT/TPOT, and exact-token correctness.
+Add `--trace-summary` when a synchronized component trace is needed.
 The default config runs optimized SDPA prefill followed by direct paged
 decode, selecting Triton on supported CUDA inputs. It also selects the
 L4-specific `sm89` FP8 projection kernel; set `model.fp8_kernel_path` to
@@ -265,7 +297,39 @@ L4-specific `sm89` FP8 projection kernel; set `model.fp8_kernel_path` to
 torch` for the readable fallback, `--decode-backend triton` to require the
 kernel, `--modes paged_graph` for fixed-address CUDA Graph replay,
 `--modes paged_direct` for all-blockwise educational prefill, or
-`--modes paged_gather` for the dense-gather control.
+`--modes paged_gather` for the dense-gather control. Use
+`--modes paged_packed` for vLLM-like ragged prefill: prompts are flattened
+into one token buffer, described by `cu_seqlens`, and written directly to
+per-request KV pages without padding. `auto` selects the exact-token-safe
+Triton kernel. Use `--prefill-backend sdpa` explicitly to measure the faster
+experimental fused-SDPA path, or use `--prefill-backend triton` to require the
+project-owned packed CUDA kernel. `torch` remains the readable reference.
+CUDA Graph mode uses packed prefill by default; use
+`--graph-prefill-backend dense` for the dense-prefill control.
+
+For a packed-prefill smoke test on the L4:
+
+```bash
+.conda-env/bin/python -m minillm_l4.benchmarks.commands.run_paged_kv \
+  --config minillm_l4/configs/workloads/qwen3_fp8_paged.yaml \
+  --workload short \
+  --modes paged_packed \
+  --block-sizes 32 \
+  --batch-sizes 2 \
+  --repetitions 3 \
+  --warmup-repetitions 1 \
+  --trace-summary \
+  --output-dir minillm_l4/results/packed_prefill
+```
+
+`--trace-summary` enables synchronized diagnostic tracing and prints the most
+recent measured batch's component totals. The complete trace is stored in each
+result JSON under `runs[].runner_diagnostics[].execution_trace`. GPU spans
+report synchronized wall time and CUDA event time; their difference is
+host/synchronization cost. Because synchronization is intentional, diagnostic
+latencies must not be used as the performance headline. Run without the flag
+for the asynchronous benchmark number. The trace also reports unattributed
+time so missing instrumentation is visible.
 
 For a focused batch-1 graph comparison:
 
@@ -273,13 +337,21 @@ For a focused batch-1 graph comparison:
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_paged_kv \
   --config minillm_l4/configs/workloads/qwen3_fp8_paged.yaml \
   --workload short \
-  --modes paged_hybrid paged_graph \
+  --modes paged_packed paged_graph \
   --block-sizes 32 \
   --batch-sizes 1 \
   --repetitions 10 \
   --warmup-repetitions 1 \
+  --trace-summary \
   --output-dir minillm_l4/results/graph_comparison
 ```
+
+The graph runner uses packed prefill by default, then captures one reusable
+one-token decode graph for a fixed active batch. Before each replay it updates
+the static token, position, and sequence-length buffers; the device-side page
+writer and attention kernel then select the current KV slot. Capture time is
+reported separately and excluded from steady-state latency. The graph path
+requires equal prompt/output shapes and stable request IDs across replays.
 
 For a quick correctness-focused run:
 

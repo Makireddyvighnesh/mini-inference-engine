@@ -17,8 +17,14 @@ import torch
 
 from ..core.harness import BenchmarkResult, RequestEventRecorder
 from ..core.schemas import RequestOutcome, RequestSpec
+from ..core.tracing import ExecutionTrace
 from minillm_l4.engine.generation.manual import output_token_digest
-from minillm_l4.engine.kv_cache import PagedKvAllocator, PagedKvCache
+from minillm_l4.engine.kv_cache import (
+    PagedKvAllocator,
+    PagedKvCache,
+    select_decode_block_tokens,
+    select_decode_split_count,
+)
 from minillm_l4.engine.kv_cache.qwen3_paged import install_paged_qwen3_attention
 from minillm_l4.engine.kv_cache.triton_paged_attention import triton_is_available
 
@@ -137,6 +143,7 @@ class PagedKvBatchRunner:
         device: str | torch.device | None = None,
         logits_mode: str = "last",
         pad_token_id: int = 0,
+        trace_enabled: bool = False,
     ) -> None:
         if int(block_size) < 1:
             raise ValueError("block_size must be positive")
@@ -152,7 +159,9 @@ class PagedKvBatchRunner:
         )
         self.logits_mode = logits_mode
         self.pad_token_id = int(pad_token_id)
+        self.trace_enabled = bool(trace_enabled)
         self.last_cache_snapshot: dict[str, Any] | None = None
+        self.last_execution_trace: dict[str, Any] | None = None
 
     @property
     def runner_name(self) -> str:
@@ -178,17 +187,37 @@ class PagedKvBatchRunner:
         prompt_tokens = next(iter(prompt_lengths))
         output_tokens = next(iter(output_lengths))
         owner_ids = tuple(request.request_id for request in requests)
-        allocator = PagedKvAllocator(
-            num_blocks=self.num_blocks,
-            block_size=self.block_size,
-            max_sequence_tokens=prompt_tokens + output_tokens - 1,
-        )
-        input_ids = torch.tensor(
-            [request.prompt_token_ids for request in requests],
-            dtype=torch.long,
+        trace = ExecutionTrace(
             device=self.device,
+            started_ns=recorders[0].run_started_ns,
+            enabled=self.trace_enabled,
         )
-        attention_mask = torch.ones_like(input_ids)
+        self.last_execution_trace = None
+        with trace.span(
+            "kv_allocator_and_physical_cache_allocation",
+            category="kv_memory",
+            metadata={
+                "block_size": self.block_size,
+                "num_blocks": self.num_blocks,
+                "capacity_tokens": prompt_tokens + output_tokens - 1,
+            },
+        ):
+            allocator = PagedKvAllocator(
+                num_blocks=self.num_blocks,
+                block_size=self.block_size,
+                max_sequence_tokens=prompt_tokens + output_tokens - 1,
+            )
+        with trace.span(
+            "input_rectangularization_and_device_transfer",
+            category="request_preparation",
+            metadata={"input_shape": [batch_size, prompt_tokens]},
+        ):
+            input_ids = torch.tensor(
+                [request.prompt_token_ids for request in requests],
+                dtype=torch.long,
+                device=self.device,
+            )
+            attention_mask = torch.ones_like(input_ids)
         self.last_cache_snapshot = None
 
         for recorder in recorders:
@@ -208,76 +237,145 @@ class PagedKvBatchRunner:
         generated: list[torch.Tensor] = []
         try:
             with torch.inference_mode():
-                prefill_output = self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    use_cache=True,
-                    return_dict=True,
-                    logits_to_keep=1 if self.logits_mode == "last" else 0,
-                )
-                prefill_dense_cache = getattr(prefill_output, "past_key_values", None)
-                if prefill_dense_cache is None:
-                    raise RuntimeError("model did not return a prefill KV cache")
-                paged_cache = _make_paged_cache(
-                    prefill_dense_cache,
-                    allocator=allocator,
-                    owner_ids=owner_ids,
-                )
-                next_token = _select_next_token(prefill_output)
-                generated.append(next_token)
-                timestamp_ns = max(recorder.now_ns() for recorder in recorders)
-                values = _token_values(next_token, batch_size=batch_size)
-                for recorder in recorders:
-                    recorder.record("prefill_end", timestamp_ns=timestamp_ns)
-                for recorder, token_id in zip(recorders, values, strict=True):
-                    recorder.mark_token_ready(0, token_id=token_id, timestamp_ns=timestamp_ns)
-                    recorder.mark_token_sent(0, token_id=token_id, timestamp_ns=timestamp_ns)
-                del prefill_output
-
-                for decode_step in range(output_tokens - 1):
-                    assert paged_cache is not None
-                    dense_cache = paged_cache.as_dynamic_cache(
-                        owner_ids,
-                        model_config=self.model.config,
-                    )
-                    cached_tokens = prompt_tokens + decode_step
-                    decode_output = self.model(
-                        input_ids=next_token,
-                        attention_mask=torch.ones(
-                            (batch_size, cached_tokens + 1),
-                            dtype=torch.long,
-                            device=self.device,
-                        ),
-                        past_key_values=dense_cache,
+                with trace.span(
+                    "prefill_model_forward",
+                    category="model_execution",
+                    gpu=True,
+                    metadata={"input_shape": [batch_size, prompt_tokens]},
+                ):
+                    prefill_output = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
                         use_cache=True,
                         return_dict=True,
                         logits_to_keep=1 if self.logits_mode == "last" else 0,
                     )
-                    updated_dense_cache = getattr(decode_output, "past_key_values", None)
-                    if updated_dense_cache is None:
-                        raise RuntimeError("model did not return a decode KV cache")
-                    paged_cache.append_from_dynamic_cache(
-                        owner_ids,
-                        updated_dense_cache,
-                        previous_token_counts=(cached_tokens,) * batch_size,
-                        appended_token_counts=1,
+                prefill_dense_cache = getattr(prefill_output, "past_key_values", None)
+                if prefill_dense_cache is None:
+                    raise RuntimeError("model did not return a prefill KV cache")
+                with trace.span(
+                    "prefill_cache_materialization",
+                    category="kv_memory",
+                    gpu=True,
+                    metadata={"prompt_tokens": prompt_tokens},
+                ):
+                    paged_cache = _make_paged_cache(
+                        prefill_dense_cache,
+                        allocator=allocator,
+                        owner_ids=owner_ids,
                     )
-                    next_token = _select_next_token(decode_output)
-                    generated.append(next_token)
-                    timestamp_ns = max(recorder.now_ns() for recorder in recorders)
+                with trace.span(
+                    "first_token_selection",
+                    category="sampling",
+                    gpu=True,
+                    metadata={"algorithm": "greedy_argmax"},
+                ):
+                    next_token = _select_next_token(prefill_output)
+                generated.append(next_token)
+                with trace.span(
+                    "first_token_host_transfer_and_stream_emit",
+                    category="streaming",
+                    metadata={"token_index": 0},
+                ):
                     values = _token_values(next_token, batch_size=batch_size)
+                    timestamp_ns = max(recorder.now_ns() for recorder in recorders)
+                    for recorder in recorders:
+                        recorder.record("prefill_end", timestamp_ns=timestamp_ns)
                     for recorder, token_id in zip(recorders, values, strict=True):
-                        token_index = decode_step + 1
                         recorder.mark_token_ready(
-                            token_index,
+                            0,
                             token_id=token_id,
                             timestamp_ns=timestamp_ns,
                         )
                         recorder.mark_token_sent(
-                            token_index,
+                            0,
                             token_id=token_id,
                             timestamp_ns=timestamp_ns,
                         )
+                del prefill_output
+
+                for decode_step in range(output_tokens - 1):
+                    assert paged_cache is not None
+                    cached_tokens = prompt_tokens + decode_step
+                    with trace.span(
+                        "decode_cache_gather",
+                        category="kv_memory",
+                        metadata={
+                            "decode_step": decode_step + 1,
+                            "cached_tokens": cached_tokens,
+                        },
+                    ):
+                        dense_cache = paged_cache.as_dynamic_cache(
+                            owner_ids,
+                            model_config=self.model.config,
+                        )
+                    with trace.span(
+                        "decode_model_forward",
+                        category="model_execution",
+                        gpu=True,
+                        metadata={
+                            "decode_step": decode_step + 1,
+                            "input_shape": [batch_size, 1],
+                            "cached_tokens": cached_tokens,
+                        },
+                    ):
+                        decode_output = self.model(
+                            input_ids=next_token,
+                            attention_mask=torch.ones(
+                                (batch_size, cached_tokens + 1),
+                                dtype=torch.long,
+                                device=self.device,
+                            ),
+                            past_key_values=dense_cache,
+                            use_cache=True,
+                            return_dict=True,
+                            logits_to_keep=1 if self.logits_mode == "last" else 0,
+                        )
+                    updated_dense_cache = getattr(decode_output, "past_key_values", None)
+                    if updated_dense_cache is None:
+                        raise RuntimeError("model did not return a decode KV cache")
+                    with trace.span(
+                        "decode_cache_append",
+                        category="kv_memory",
+                        gpu=True,
+                        metadata={"decode_step": decode_step + 1},
+                    ):
+                        paged_cache.append_from_dynamic_cache(
+                            owner_ids,
+                            updated_dense_cache,
+                            previous_token_counts=(cached_tokens,) * batch_size,
+                            appended_token_counts=1,
+                        )
+                    with trace.span(
+                        "decode_token_selection",
+                        category="sampling",
+                        gpu=True,
+                        metadata={
+                            "decode_step": decode_step + 1,
+                            "algorithm": "greedy_argmax",
+                        },
+                    ):
+                        next_token = _select_next_token(decode_output)
+                    generated.append(next_token)
+                    with trace.span(
+                        "decode_host_transfer_and_stream_emit",
+                        category="streaming",
+                        metadata={"token_index": decode_step + 1},
+                    ):
+                        values = _token_values(next_token, batch_size=batch_size)
+                        timestamp_ns = max(recorder.now_ns() for recorder in recorders)
+                        for recorder, token_id in zip(recorders, values, strict=True):
+                            token_index = decode_step + 1
+                            recorder.mark_token_ready(
+                                token_index,
+                                token_id=token_id,
+                                timestamp_ns=timestamp_ns,
+                            )
+                            recorder.mark_token_sent(
+                                token_index,
+                                token_id=token_id,
+                                timestamp_ns=timestamp_ns,
+                            )
                     del decode_output
 
             assert paged_cache is not None
@@ -300,11 +398,16 @@ class PagedKvBatchRunner:
                 "gather_path": True,
                 "paged_attention_kernel": False,
             }
-            token_matrix = torch.cat(generated, dim=1).detach().to("cpu")
-            token_rows = tuple(
-                tuple(int(value) for value in token_matrix[row].tolist())
-                for row in range(batch_size)
-            )
+            with trace.span(
+                "output_materialization",
+                category="response_finalization",
+                metadata={"batch_size": batch_size},
+            ):
+                token_matrix = torch.cat(generated, dim=1).detach().to("cpu")
+                token_rows = tuple(
+                    tuple(int(value) for value in token_matrix[row].tolist())
+                    for row in range(batch_size)
+                )
             for recorder in recorders:
                 recorder.record("completion")
             return tuple(
@@ -324,15 +427,24 @@ class PagedKvBatchRunner:
                 for row in token_rows
             )
         finally:
-            if paged_cache is not None:
-                for owner_id in owner_ids:
-                    if owner_id in allocator.sequence_ids:
-                        paged_cache.release(owner_id)
-                if self.last_cache_snapshot is not None:
-                    self.last_cache_snapshot["resources_released"] = True
-                    self.last_cache_snapshot["active_sequence_count_after_release"] = (
-                        allocator.active_sequence_count
-                    )
+            with trace.span("kv_resource_release", category="kv_memory"):
+                if paged_cache is not None:
+                    for owner_id in owner_ids:
+                        if owner_id in allocator.sequence_ids:
+                            paged_cache.release(owner_id)
+            trace.counter("batch_size", batch_size)
+            trace.counter("prompt_tokens_per_request", prompt_tokens)
+            trace.counter("output_tokens_per_request", output_tokens)
+            trace.counter("cache_mode", "paged_gather")
+            self.last_execution_trace = trace.to_dict()
+            if self.last_cache_snapshot is not None:
+                self.last_cache_snapshot["execution_trace"] = dict(
+                    self.last_execution_trace
+                )
+                self.last_cache_snapshot["resources_released"] = True
+                self.last_cache_snapshot["active_sequence_count_after_release"] = (
+                    allocator.active_sequence_count
+                )
 
 
 def _paged_activation_dtype(model: Any) -> torch.dtype:
@@ -382,6 +494,7 @@ class PagedAttentionBatchRunner:
         kv_dtype: torch.dtype | None = None,
         prefill_backend: str = "paged_reference",
         decode_backend: str = "auto",
+        trace_enabled: bool = False,
     ) -> None:
         if int(block_size) < 1:
             raise ValueError("block_size must be positive")
@@ -406,7 +519,9 @@ class PagedAttentionBatchRunner:
         self.kv_dtype = kv_dtype
         self.prefill_backend = prefill_backend
         self.decode_backend = decode_backend
+        self.trace_enabled = bool(trace_enabled)
         self.last_cache_snapshot: dict[str, Any] | None = None
+        self.last_execution_trace: dict[str, Any] | None = None
         self._attention_wrappers = install_paged_qwen3_attention(model)
 
     @property
@@ -485,32 +600,57 @@ class PagedAttentionBatchRunner:
                 "direct paged static batching requires equal prompt and output lengths"
             )
 
-        batch_size = len(requests)
-        prompt_tokens = next(iter(prompt_lengths))
-        output_tokens = next(iter(output_lengths))
-        owner_ids = tuple(request.request_id for request in requests)
-        input_ids = torch.tensor(
-            [request.prompt_token_ids for request in requests],
-            dtype=torch.long,
+        trace = ExecutionTrace(
             device=self.device,
+            started_ns=recorders[0].run_started_ns,
+            enabled=self.trace_enabled,
         )
-        attention_mask = torch.ones_like(input_ids)
-        prefill_positions = torch.arange(
-            prompt_tokens,
-            dtype=torch.long,
-            device=self.device,
-        ).unsqueeze(0).expand(batch_size, -1)
+        self.last_execution_trace = None
+        with trace.span(
+            "request_validation_and_shape_setup",
+            category="request_lifecycle",
+            metadata={"batch_size": len(requests)},
+        ):
+            batch_size = len(requests)
+            prompt_tokens = next(iter(prompt_lengths))
+            output_tokens = next(iter(output_lengths))
+            owner_ids = tuple(request.request_id for request in requests)
+            decode_max_sequence_length = prompt_tokens + output_tokens - 1
+            decode_split_count = select_decode_split_count(
+                decode_max_sequence_length,
+                batch_size=batch_size,
+            )
+            decode_block_tokens = select_decode_block_tokens(
+                decode_max_sequence_length
+            )
+        with trace.span(
+            "input_rectangularization_and_device_transfer",
+            category="request_preparation",
+            metadata={"input_shape": [batch_size, prompt_tokens]},
+        ):
+            input_ids = torch.tensor(
+                [request.prompt_token_ids for request in requests],
+                dtype=torch.long,
+                device=self.device,
+            )
+            attention_mask = torch.ones_like(input_ids)
+            prefill_positions = torch.arange(
+                prompt_tokens,
+                dtype=torch.long,
+                device=self.device,
+            ).unsqueeze(0).expand(batch_size, -1)
         self.last_cache_snapshot = None
-        uses_triton_decode = bool(
-            self.decode_backend != "torch"
-            and self.device.type == "cuda"
-            and triton_is_available()
-        )
-        resolved_decode_backend = (
-            "triton_paged_decode"
-            if uses_triton_decode
-            else "torch_blockwise_reference"
-        )
+        with trace.span("backend_resolution", category="runner_control"):
+            uses_triton_decode = bool(
+                self.decode_backend != "torch"
+                and self.device.type == "cuda"
+                and triton_is_available()
+            )
+            resolved_decode_backend = (
+                "triton_paged_decode"
+                if uses_triton_decode
+                else "torch_blockwise_reference"
+            )
 
         for recorder in recorders:
             recorder.record(
@@ -534,133 +674,214 @@ class PagedAttentionBatchRunner:
         prefill_cache_materialization_ms = 0.0
         decode_model_ms = 0.0
         if self.prefill_backend == "paged_reference":
-            _synchronize(self.device)
-            cache_started = perf_counter()
-            allocator, paged_cache = self._new_cache(
-                owner_ids=owner_ids,
-                prompt_tokens=prompt_tokens,
-                output_tokens=output_tokens,
-            )
-            cache_setup_ms = _elapsed_ms(cache_started, self.device)
+            with trace.span(
+                "kv_allocator_and_physical_cache_allocation",
+                category="kv_memory",
+                metadata={
+                    "block_size": self.block_size,
+                    "num_blocks": self.num_blocks,
+                },
+            ) as measurement:
+                allocator, paged_cache = self._new_cache(
+                    owner_ids=owner_ids,
+                    prompt_tokens=prompt_tokens,
+                    output_tokens=output_tokens,
+                )
+            cache_setup_ms = measurement.wall_ms
         else:
-            allocator = self._new_allocator(
-                prompt_tokens=prompt_tokens,
-                output_tokens=output_tokens,
-            )
+            with trace.span(
+                "kv_allocator_and_physical_cache_allocation",
+                category="kv_memory",
+                metadata={
+                    "block_size": self.block_size,
+                    "num_blocks": self.num_blocks,
+                },
+            ):
+                allocator = self._new_allocator(
+                    prompt_tokens=prompt_tokens,
+                    output_tokens=output_tokens,
+                )
         generated: list[torch.Tensor] = []
         try:
             with torch.inference_mode():
-                _synchronize(self.device)
-                prefill_started = perf_counter()
-                if self.prefill_backend == "paged_reference":
-                    assert paged_cache is not None
-                    prefill_output = self.model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        position_ids=prefill_positions,
-                        use_cache=False,
-                        return_dict=True,
-                        logits_to_keep=1 if self.logits_mode == "last" else 0,
-                        paged_kv_cache=paged_cache,
-                        paged_sequence_ids=owner_ids,
-                        paged_query_start_positions=(0,) * batch_size,
-                    )
-                else:
-                    prefill_output = self.model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        position_ids=prefill_positions,
-                        use_cache=True,
-                        return_dict=True,
-                        logits_to_keep=1 if self.logits_mode == "last" else 0,
-                    )
-                prefill_model_ms = _elapsed_ms(prefill_started, self.device)
+                with trace.span(
+                    "prefill_model_forward",
+                    category="model_execution",
+                    gpu=True,
+                    metadata={
+                        "input_shape": [batch_size, prompt_tokens],
+                        "backend": self.prefill_backend,
+                    },
+                ) as measurement:
+                    if self.prefill_backend == "paged_reference":
+                        assert paged_cache is not None
+                        prefill_output = self.model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            position_ids=prefill_positions,
+                            use_cache=False,
+                            return_dict=True,
+                            logits_to_keep=1 if self.logits_mode == "last" else 0,
+                            paged_kv_cache=paged_cache,
+                            paged_sequence_ids=owner_ids,
+                            paged_query_start_positions=(0,) * batch_size,
+                        )
+                    else:
+                        prefill_output = self.model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            position_ids=prefill_positions,
+                            use_cache=True,
+                            return_dict=True,
+                            logits_to_keep=1 if self.logits_mode == "last" else 0,
+                        )
+                prefill_model_ms = measurement.wall_ms
 
                 if self.prefill_backend == "sdpa":
                     dense_cache = getattr(prefill_output, "past_key_values", None)
                     if dense_cache is None:
                         raise RuntimeError("model did not return a prefill KV cache")
-                    _synchronize(self.device)
-                    materialization_started = perf_counter()
-                    paged_cache = _make_paged_cache(
-                        dense_cache,
-                        allocator=allocator,
-                        owner_ids=owner_ids,
-                    )
-                    prefill_cache_materialization_ms = _elapsed_ms(
-                        materialization_started,
-                        self.device,
-                    )
-                next_token = _select_next_token(prefill_output)
+                    with trace.span(
+                        "prefill_cache_materialization",
+                        category="kv_memory",
+                        gpu=True,
+                        metadata={"prompt_tokens": prompt_tokens},
+                    ) as measurement:
+                        paged_cache = _make_paged_cache(
+                            dense_cache,
+                            allocator=allocator,
+                            owner_ids=owner_ids,
+                        )
+                    prefill_cache_materialization_ms = measurement.wall_ms
+                with trace.span(
+                    "first_token_selection",
+                    category="sampling",
+                    gpu=True,
+                    metadata={"algorithm": "greedy_argmax"},
+                ):
+                    next_token = _select_next_token(prefill_output)
                 generated.append(next_token)
-                timestamp_ns = max(recorder.now_ns() for recorder in recorders)
-                values = _token_values(next_token, batch_size=batch_size)
-                for recorder in recorders:
-                    recorder.record("prefill_end", timestamp_ns=timestamp_ns)
-                for recorder, token_id in zip(recorders, values, strict=True):
-                    recorder.mark_token_ready(0, token_id=token_id, timestamp_ns=timestamp_ns)
-                    recorder.mark_token_sent(0, token_id=token_id, timestamp_ns=timestamp_ns)
+                with trace.span(
+                    "first_token_host_transfer_and_stream_emit",
+                    category="streaming",
+                    metadata={"token_index": 0},
+                ):
+                    values = _token_values(next_token, batch_size=batch_size)
+                    timestamp_ns = max(recorder.now_ns() for recorder in recorders)
+                    for recorder in recorders:
+                        recorder.record("prefill_end", timestamp_ns=timestamp_ns)
+                    for recorder, token_id in zip(recorders, values, strict=True):
+                        recorder.mark_token_ready(0, token_id=token_id, timestamp_ns=timestamp_ns)
+                        recorder.mark_token_sent(0, token_id=token_id, timestamp_ns=timestamp_ns)
                 del prefill_output
 
                 for decode_step in range(output_tokens - 1):
                     assert paged_cache is not None
-                    old_lengths = tuple(
-                        allocator.get_block_table(owner_id).token_count
-                        for owner_id in owner_ids
-                    )
-                    paged_cache.reserve_append(owner_ids, 1)
-                    decode_positions = torch.tensor(
-                        old_lengths,
-                        dtype=torch.long,
-                        device=self.device,
-                    ).unsqueeze(-1)
-                    decode_block_tables = paged_cache.block_table_tensor(
-                        owner_ids,
-                        device=self.device,
-                    ).to(dtype=torch.int32)
-                    decode_sequence_lengths = torch.tensor(
-                        tuple(length + 1 for length in old_lengths),
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
-                    _synchronize(self.device)
-                    decode_started = perf_counter()
-                    decode_output = self.model(
-                        input_ids=next_token,
-                        attention_mask=torch.ones(
-                            (batch_size, 1),
+                    with trace.span(
+                        "decode_schedule_and_kv_reservation",
+                        category="scheduler_and_kv",
+                        metadata={"decode_step": decode_step + 1},
+                    ):
+                        old_lengths = tuple(
+                            allocator.get_block_table(owner_id).token_count
+                            for owner_id in owner_ids
+                        )
+                        paged_cache.reserve_append(owner_ids, 1)
+                    with trace.span(
+                        "decode_metadata_materialization",
+                        category="scheduler_and_kv",
+                        metadata={"decode_step": decode_step + 1},
+                    ):
+                        decode_positions = torch.tensor(
+                            old_lengths,
                             dtype=torch.long,
                             device=self.device,
-                        ),
-                        position_ids=decode_positions,
-                        use_cache=False,
-                        return_dict=True,
-                        logits_to_keep=1 if self.logits_mode == "last" else 0,
-                        paged_kv_cache=paged_cache,
-                        paged_sequence_ids=owner_ids,
-                        paged_query_start_positions=old_lengths,
-                        paged_block_tables=decode_block_tables,
-                        paged_sequence_lengths=decode_sequence_lengths,
-                        paged_attention_backend=self.decode_backend,
-                    )
-                    decode_model_ms += _elapsed_ms(decode_started, self.device)
-                    next_token = _select_next_token(decode_output)
+                        ).unsqueeze(-1)
+                        decode_block_tables = paged_cache.block_table_tensor(
+                            owner_ids,
+                            device=self.device,
+                        ).to(dtype=torch.int32)
+                        decode_sequence_lengths = torch.tensor(
+                            tuple(length + 1 for length in old_lengths),
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                    with trace.span(
+                        "decode_model_forward",
+                        category="model_execution",
+                        gpu=True,
+                        metadata={
+                            "decode_step": decode_step + 1,
+                            "input_shape": [batch_size, 1],
+                            "backend": resolved_decode_backend,
+                        },
+                    ) as measurement:
+                        decode_output = self.model(
+                            input_ids=next_token,
+                            attention_mask=torch.ones(
+                                (batch_size, 1),
+                                dtype=torch.long,
+                                device=self.device,
+                            ),
+                            position_ids=decode_positions,
+                            use_cache=False,
+                            return_dict=True,
+                            logits_to_keep=1 if self.logits_mode == "last" else 0,
+                            paged_kv_cache=paged_cache,
+                            paged_sequence_ids=owner_ids,
+                            paged_query_start_positions=old_lengths,
+                            paged_block_tables=decode_block_tables,
+                            paged_sequence_lengths=decode_sequence_lengths,
+                            paged_attention_backend=self.decode_backend,
+                            paged_decode_split_count=decode_split_count,
+                            paged_decode_max_sequence_length=(
+                                decode_max_sequence_length
+                            ),
+                            paged_decode_block_tokens=decode_block_tokens,
+                            paged_decode_use_gqa_reuse=False,
+                        )
+                    decode_model_ms += measurement.wall_ms
+                    with trace.span(
+                        "decode_token_selection",
+                        category="sampling",
+                        gpu=True,
+                        metadata={
+                            "decode_step": decode_step + 1,
+                            "algorithm": "greedy_argmax",
+                        },
+                    ):
+                        next_token = _select_next_token(decode_output)
                     generated.append(next_token)
-                    timestamp_ns = max(recorder.now_ns() for recorder in recorders)
-                    values = _token_values(next_token, batch_size=batch_size)
-                    for recorder, token_id in zip(recorders, values, strict=True):
-                        token_index = decode_step + 1
-                        recorder.mark_token_ready(
-                            token_index,
-                            token_id=token_id,
-                            timestamp_ns=timestamp_ns,
-                        )
-                        recorder.mark_token_sent(
-                            token_index,
-                            token_id=token_id,
-                            timestamp_ns=timestamp_ns,
-                        )
+                    with trace.span(
+                        "decode_host_transfer_and_stream_emit",
+                        category="streaming",
+                        metadata={"token_index": decode_step + 1},
+                    ):
+                        values = _token_values(next_token, batch_size=batch_size)
+                        timestamp_ns = max(recorder.now_ns() for recorder in recorders)
+                        for recorder, token_id in zip(recorders, values, strict=True):
+                            token_index = decode_step + 1
+                            recorder.mark_token_ready(
+                                token_index,
+                                token_id=token_id,
+                                timestamp_ns=timestamp_ns,
+                            )
+                            recorder.mark_token_sent(
+                                token_index,
+                                token_id=token_id,
+                                timestamp_ns=timestamp_ns,
+                            )
                     del decode_output
+
+            with trace.span(
+                "output_materialization",
+                category="response_finalization",
+            ):
+                token_matrix = torch.cat(generated, dim=1).detach().to("cpu")
+            token_rows = tuple(
+                tuple(int(value) for value in token_matrix[row].tolist())
+                for row in range(batch_size)
+            )
 
             assert paged_cache is not None
             allocator_snapshot = allocator.snapshot()
@@ -689,6 +910,10 @@ class PagedAttentionBatchRunner:
                 "direct_paged_attention": True,
                 "prefill_backend": self.prefill_backend,
                 "decode_backend": resolved_decode_backend,
+                "decode_split_count": decode_split_count,
+                "decode_block_tokens": decode_block_tokens,
+                "decode_gqa_reuse": False,
+                "decode_max_sequence_length": decode_max_sequence_length,
                 "attention_backend": (
                     f"sdpa_prefill_{resolved_decode_backend}"
                     if self.prefill_backend == "sdpa"
@@ -701,6 +926,7 @@ class PagedAttentionBatchRunner:
                     "prefill_cache_materialization": prefill_cache_materialization_ms,
                     "decode_model_total": decode_model_ms,
                 },
+                "execution_trace": trace.to_dict(),
                 "page_visits": {
                     "prefill_per_layer": prefill_page_visits_per_layer,
                     "decode_per_layer": decode_page_visits_per_layer,
@@ -712,11 +938,6 @@ class PagedAttentionBatchRunner:
                     ),
                 },
             }
-            token_matrix = torch.cat(generated, dim=1).detach().to("cpu")
-            token_rows = tuple(
-                tuple(int(value) for value in token_matrix[row].tolist())
-                for row in range(batch_size)
-            )
             for recorder in recorders:
                 recorder.record("completion")
             model_config = getattr(self.model, "config", None)
@@ -737,11 +958,21 @@ class PagedAttentionBatchRunner:
                 for row in token_rows
             )
         finally:
-            if paged_cache is not None:
-                for owner_id in owner_ids:
-                    if owner_id in allocator.sequence_ids:
-                        paged_cache.release(owner_id)
+            with trace.span("kv_resource_release", category="kv_memory"):
+                if paged_cache is not None:
+                    for owner_id in owner_ids:
+                        if owner_id in allocator.sequence_ids:
+                            paged_cache.release(owner_id)
+            trace.counter("batch_size", batch_size)
+            trace.counter("prompt_tokens_per_request", prompt_tokens)
+            trace.counter("output_tokens_per_request", output_tokens)
+            trace.counter("prefill_backend", self.prefill_backend)
+            trace.counter("resolved_decode_backend", resolved_decode_backend)
+            self.last_execution_trace = trace.to_dict()
             if self.last_cache_snapshot is not None:
+                self.last_cache_snapshot["execution_trace"] = dict(
+                    self.last_execution_trace
+                )
                 self.last_cache_snapshot["resources_released"] = True
                 self.last_cache_snapshot["active_sequence_count_after_release"] = (
                     allocator.active_sequence_count

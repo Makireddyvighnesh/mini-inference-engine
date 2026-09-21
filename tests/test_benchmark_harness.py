@@ -24,6 +24,7 @@ from minillm_l4.benchmarks.core.schemas import (
     RequestSpec,
 )
 from minillm_l4.benchmarks.core.timing import measure_timer_overhead
+from minillm_l4.benchmarks.core.tracing import ExecutionTrace
 from minillm_l4.benchmarks.core.workloads import (
     PromptBucket,
     build_fixed_workload,
@@ -71,6 +72,7 @@ def test_percentiles_use_documented_linear_interpolation() -> None:
     assert percentile([1, 2, 3, 4, 5], 95) == pytest.approx(4.8)
     distribution = summarize([1, 2, 3, 4, 5])
     assert distribution.p50 == pytest.approx(3.0)
+    assert distribution.p90 == pytest.approx(4.6)
     assert distribution.p95 == pytest.approx(4.8)
     assert distribution.p99 == pytest.approx(4.96)
 
@@ -193,3 +195,34 @@ def test_timer_overhead_has_requested_sample_count() -> None:
     assert overhead["iterations"] == 20
     assert overhead["minimum_ns"] >= 0
     assert overhead["maximum_ns"] >= overhead["minimum_ns"]
+
+
+def test_execution_trace_keeps_component_spans_and_aggregates() -> None:
+    trace = ExecutionTrace(started_ns=0)
+    with trace.span("input_setup", category="request_preparation"):
+        pass
+    with trace.span("decode_step", category="model_execution"):
+        pass
+    with trace.span("decode_step", category="model_execution"):
+        pass
+
+    payload = trace.to_dict()
+
+    assert payload["schema_version"] == 1
+    assert len(payload["spans"]) == 3
+    assert payload["components"]["decode_step"]["count"] == 2
+    assert payload["components"]["decode_step"]["wall_ms_total"] >= 0.0
+
+
+def test_disabled_execution_trace_does_not_record_or_synchronize() -> None:
+    trace = ExecutionTrace(enabled=False)
+    with trace.span("decode_step", category="model_execution", gpu=True):
+        pass
+    trace.counter("tokens", 1)
+
+    payload = trace.to_dict()
+
+    assert payload["enabled"] is False
+    assert payload["spans"] == []
+    assert payload["components"] == {}
+    assert payload["counters"] == {}

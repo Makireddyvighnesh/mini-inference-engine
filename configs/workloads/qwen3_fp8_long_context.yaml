@@ -12,39 +12,32 @@ model:
   local_files_only: true
 
 workloads:
-  dataset: data/synthetic/workloads_v1.jsonl
+  dataset: data/synthetic/long_context_workloads_v1.jsonl
   seed: 17
-  count: 4
+  count: 2
   prompt_lengths:
-    - 128
-    - 512
-    - 2048
+    - 3072
+    - 4608
   output_tokens:
-    "128": 32
-    "512": 64
-    "2048": 128
+    "3072": 64
+    "4608": 32
   batch_sizes:
-    - 1
     - 2
-    - 4
+    - 1
 
 cache:
   modes:
-    - contiguous
-    - paged_hybrid
+    - paged_graph
   block_sizes:
-    - 8
-    - 16
     - 32
-    - 64
-  capacity_token_slots: 32768
+  capacity_token_slots: 16384
   decode_backend: auto
   packed_prefill_backend: auto
-  graph_prefill_backend: packed
+  graph_prefill_backend: auto
 
 benchmark:
   warmup_repetitions: 1
-  repetitions: 3
+  repetitions: 2
   sample_interval_seconds: 0.25
   collect_gpu: true
   collect_system_telemetry: true

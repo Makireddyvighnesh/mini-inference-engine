@@ -307,6 +307,7 @@ class BenchmarkHarness:
         )
         request_records: list[dict[str, Any]] = []
         all_events: list[EventRecord] = []
+        runner_diagnostics: list[dict[str, Any]] = []
 
         for batch_start in range(0, len(workload.requests), batch_size):
             batch = workload.requests[batch_start : batch_start + batch_size]
@@ -338,6 +339,7 @@ class BenchmarkHarness:
                     recorder.record("execution_start")
                 recorders.append(recorder)
 
+            batch_call_started_ns = time.perf_counter_ns()
             try:
                 raw_outcomes = tuple(batch_runner(batch, tuple(recorders)))
                 if len(raw_outcomes) != len(batch):
@@ -356,6 +358,29 @@ class BenchmarkHarness:
                 batch_error = error
             else:
                 batch_error = None
+            batch_call_ended_ns = time.perf_counter_ns()
+            execution_trace = getattr(batch_runner, "last_execution_trace", None)
+            if callable(getattr(execution_trace, "to_dict", None)):
+                execution_trace = execution_trace.to_dict()
+            runner_diagnostics.append(
+                {
+                    "batch_index": batch_start // batch_size,
+                    "request_ids": [request.request_id for request in batch],
+                    "batch_size": len(batch),
+                    "start_ms": (batch_call_started_ns - run_started_ns) / 1_000_000.0,
+                    "end_ms": (batch_call_ended_ns - run_started_ns) / 1_000_000.0,
+                    "batch_runner_wall_ms": (
+                        batch_call_ended_ns - batch_call_started_ns
+                    )
+                    / 1_000_000.0,
+                    "execution_trace": execution_trace,
+                    "error": (
+                        None
+                        if batch_error is None
+                        else f"{type(batch_error).__name__}: {batch_error}"
+                    ),
+                }
+            )
 
             for request, recorder, raw_outcome in zip(
                 batch,
@@ -436,6 +461,7 @@ class BenchmarkHarness:
             "request_count": len(request_records),
             "requests": request_records,
             "events": [event.to_dict() for event in all_events],
+            "runner_diagnostics": runner_diagnostics,
             "gpu": {
                 "before": gpu_before,
                 "after": gpu_after,

@@ -7,10 +7,10 @@ prefilled while existing requests continue decoding, and completed rows are
 removed from the active batch immediately. The Phase 4 static runner remains
 available as the matched baseline.
 
-The implementation is validated by the repository tests and a tiny real
-`Qwen3ForCausalLM` CPU model. The full 4B L4 benchmark is intentionally not
-claimed from this workspace because the current runtime cannot initialize a
-CUDA device; the reproduction command below is ready for the L4 host.
+The implementation is validated by the repository tests, a tiny real
+`Qwen3ForCausalLM` CPU model, and a real Qwen3-4B FP8 L4 capacity sweep. The
+capacity methodology and raw-result locations are recorded in
+[`capacity_stress.md`](capacity_stress.md).
 
 ## What was built
 
@@ -90,12 +90,12 @@ The tests cover:
 Validation in the current runtime:
 
 ```text
-98 passed, 1 skipped
+63 passed, 4 skipped
 ```
 
 The tiny real-model test compared continuous outputs against independent
-single-request manual generation and matched all token IDs. GPU validation is
-still required on the NVIDIA L4 before reporting Phase 5 performance results.
+single-request manual generation and matched all token IDs. The L4 capacity
+stress cases also matched exact reference token prefixes.
 
 ## Reproduction command on the L4
 
@@ -110,9 +110,21 @@ still required on the NVIDIA L4 before reporting Phase 5 performance results.
 
 The manifest records `maximum_active_batch_size`, decode iteration batch
 sizes, prefill token budgets, queue delay, TTFT, ITL/TPOT, E2E latency, TPS,
-GPU utilization, and memory telemetry. Compare its results against the Phase 4
-manifest using the same workload, arrival interval, warm-up policy, and
-repetitions.
+GPU utilization, and memory telemetry. The dedicated capacity matrix also
+records peak active requests, total input tokens admitted in one prefill, and
+prefills admitted while decode is active.
+
+Run the capacity matrix with:
+
+```bash
+.conda-env/bin/python -m minillm_l4.benchmarks.commands.run_capacity_stress \
+  --config minillm_l4/configs/workloads/qwen3_fp8_stress.yaml \
+  --scenario all \
+  --output-dir minillm_l4/results/capacity_stress
+```
+
+Compare its results against the Phase 4 manifest using the same workload,
+arrival interval, warm-up policy, and repetitions.
 
 The command supports both deterministic fixed-rate arrivals and seeded
 Poisson-like arrivals. For the latter, keep the same request count and seed
@@ -136,8 +148,9 @@ while changing only the arrival policy, for example:
 - Prefill and decode still use the model's eager execution path.
 - Cancellation is supported before execution, not mid-decode preemption.
 - The optional wait window applies only at an idle-to-active transition.
-- No Phase 5 L4 performance table is recorded until the CUDA-enabled run is
-  completed and correctness passes against the pinned reference corpus.
+- The continuous runner still uses dense `DynamicCache` rebasing; the L4
+  capacity results therefore include temporary cache-copy overhead and are
+  not a paged-attention capacity claim.
 
 ## Entry conditions for Phase 6
 

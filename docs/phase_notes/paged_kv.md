@@ -29,12 +29,21 @@ cache path.
 - `PagedHybridBatchRunner` uses the model's optimized SDPA path for prefill,
   materializes that prefill cache into physical pages once, and then uses
   direct block-table attention for every decode token.
+- `PackedPagedPrefillBatchRunner` provides the variable-length prefill path:
+  it flattens all prompts into `[sum(prompt_lengths)]`, records request
+  boundaries with `cu_seqlens`, and writes each request's K/V directly into
+  its own physical pages. No prompt padding or per-request full-model prefill
+  is used. CUDA `auto` selects the exact-token-safe project-owned Triton
+  backend. Packed K/V page writes use one Triton scatter kernel per layer on
+  CUDA; fused SDPA remains an experimental comparison backend.
 - `triton_paged_decode_attention` fuses block-table lookup, physical K/V page
   loads, grouped-query head mapping, QK reduction, online softmax, and weighted
   value accumulation into one GPU launch per model layer.
-- The Triton kernel uses fixed 16-token compute tiles independent of physical
-  page size. This keeps numerical reduction order stable across block sizes
-  and separates compute tuning from memory-fragmentation tuning.
+- The Triton decode and packed-prefill kernels use explicit compute tiles.
+  Decode uses a fixed 16-token reduction tile while storage page size remains
+  independently configurable. Keeping those dimensions separate stabilizes
+  online-softmax reduction order and keeps greedy-token validation stable when
+  physical block sizes are swept.
 - `sm89_fp8_linear` replaces the generic Transformers projection dispatcher
   on the L4. It fuses dynamic per-block activation scaling, FP8 conversion,
   block-scaled matrix multiplication, and FP32 accumulation. Unsupported
@@ -42,6 +51,108 @@ cache path.
 - `PagedKvBatchRunner` remains as the dense-gather fallback/control path.
 - Benchmark artifacts separate prefill model time, prefill cache
   materialization, decode model time, and logical page visits.
+
+## Packed varlen prefill
+
+The regular Qwen3 model interface expects a rectangular `[batch, sequence]`
+prompt tensor. The packed runner drives the decoder layers directly with a
+flat token tensor and metadata:
+
+```text
+requests:       A=[a0 a1 a2], B=[b0 b1 b2 b3 b4], C=[c0 c1]
+flat tokens:    [a0 a1 a2 b0 b1 b2 b3 b4 c0 c1]
+cu_seqlens:     [0, 3, 8, 10]
+token request:  [A  A  A  B  B  B  B  B  C  C]
+local position: [0  1  2  0  1  2  3  4  0  1]
+last indices:   [2, 7, 9]
+```
+
+Every decoder layer still performs its projections and MLP over one flat
+batch. The packed attention operation uses the request index and local
+position to read only that request's pages up to the current token. The
+Triton path launches one program per flat token/query-head and uses online
+softmax; the PyTorch path computes the same page traversal as a readable
+fallback. After prefill, the first-token logits are gathered only at
+`last_indices`, and the existing one-token direct paged decode path continues
+with per-request sequence lengths.
+
+This is an independent implementation of the same ragged dataflow idea used
+by production serving engines. It does not use vLLM internals. `paged_hybrid`
+remains the dense SDPA comparison path, while `paged_packed` is the no-padding
+path for mixed prompt lengths. The optimized packed SDPA backend still makes
+one fused SDPA call per request per decoder layer; it is an intermediate
+optimization until a true fused varlen FlashAttention/FlashInfer-style kernel
+is integrated.
+
+The implementation was validated with 63 passing CPU tests and four expected
+CUDA-only skips. A real L4 run with two 128-token prompts completed with exact
+reference tokens after page-aligned Triton reduction. A mixed real-Qwen run
+with 128- and 512-token prompts packed 640 input tokens instead of the padded
+1,024-token rectangle, recorded `cu_seqlens=[0, 128, 640]`, and completed both
+requests through direct paged decode.
+
+## TTFT optimization
+
+The first packed implementation used one Triton program per flat token and
+query head and copied each request's K/V page segments from Python. A CUDA
+profiler trace for the 128+512-token workload attributed 87.4 ms of 181.4 ms
+prefill time to packed attention; many small copy operations also appeared in
+the trace. Removing padding did not automatically make that path faster than
+dense SDPA. The attention kernel was correct but not sufficiently tiled to
+match a production attention backend.
+
+The exact-token-safe optimization was a Triton scatter-write kernel. It maps
+each flat token to `(request, local_position)`, looks up the physical page, and
+writes both K and V directly. This removes the Python request/page copy loop
+without changing attention arithmetic.
+
+The packed runner also has an experimental `sdpa` backend. It keeps the flat
+hidden states, request boundaries, and direct page writes, but uses PyTorch's
+fused scaled-dot-product attention separately for each request. With one
+warm-up and three measured repetitions on the L4, block size 32, output length
+32, and prompts of 128 and 512 tokens:
+
+| Packed prefill backend | Prefill P50 (ms) | TTFT P50 (ms) | Aggregate TPS P50 | Correctness |
+|---|---:|---:|---:|---|
+| Project Triton kernel before fused page writes | 218.2 | 219.1 | 29.58 | pass |
+| Project Triton kernel + fused K/V page writes (`auto`) | 198.0 | 198.9 | 29.96 | pass |
+| Fused SDPA ragged path (`sdpa`, explicit) | 132.6 | 133.5 | 31.31 | pass* |
+
+The exact safe page-write optimization reduces prefill time by about 9% while
+still processing 640 real prompt tokens instead of 1,024 padded positions.
+The experimental SDPA path reduces prefill time by about 39% while still
+processing 640 real prompt tokens instead of 1,024 padded positions (384
+positions, or 37.5%, avoided). It passed the two-request mixed sample, but it does not pass
+the entire exact-token reference corpus on this checkpoint, so it is not the
+default. These numbers are for the static packed runner and should not be
+presented as vLLM parity.
+
+## What vLLM still does better
+
+vLLM uses production attention backends such as FlashAttention and FlashInfer,
+selected from its attention-backend registry. Its ragged/paged prefill kernels
+receive cumulative query offsets and paged KV metadata and process the whole
+ragged batch with tiled GPU kernels. The important differences are:
+
+- our `sdpa` path has one attention call per request per layer; vLLM uses one
+  fused varlen/paged attention operation for the batch;
+- our educational Triton kernel launches one program per token/head and walks
+  page tiles, while production kernels tile query and key blocks to reuse data
+  and use tensor-core matrix multiplication;
+- production engines use fused slot-mapping/cache-write kernels. We now have a
+  fused scatter write, but it is still a separate kernel per layer rather than
+  a production attention/cache-write fusion;
+- our packed runner is a static batch and currently requires equal output
+  limits, while vLLM's scheduler can admit, prefill, decode, and retire rows
+  continuously;
+- our CUDA Graph support is primarily a decode optimization, whereas a
+  production engine manages a small set of reusable shapes and metadata for
+  the serving workload.
+
+The next meaningful TTFT optimization is therefore a true fused varlen
+prefill backend, using the same `cu_seqlens`/page-table contract already
+implemented here, followed by integration with the continuous-batching
+scheduler.
 
 ## Architecture decisions
 
@@ -66,9 +177,9 @@ hybrid:   optimized SDPA prefill -> one-time copy to physical pages
 
 The direct path is paged attention semantically: the attention routine follows
 each request's logical-to-physical block mapping and never gathers the whole
-batch into a rectangular `DynamicCache`. Supported one-token CUDA decode uses
-the fused Triton kernel. Multi-token reference prefill, CPU execution, and
-unsupported shapes retain the readable Python/PyTorch fallback.
+batch into a rectangular `DynamicCache`. Supported one-token CUDA decode and
+packed CUDA prefill use fused Triton kernels. CPU execution and unsupported
+shapes retain the readable Python/PyTorch fallback.
 
 ## Correctness tests
 
@@ -90,6 +201,8 @@ reference across fragmented pages and compares Triton with the PyTorch
 reference on CUDA for block sizes 8, 16, 32, and 64.
 `tests/test_direct_paged_runner.py` checks the complete Qwen3 direct and hybrid
 paths against trusted manual generation.
+`tests/test_packed_prefill.py` checks packed metadata and mixed-length
+no-padding prefill against independent greedy generation.
 
 ## Benchmark configuration
 
@@ -140,12 +253,11 @@ roughly 3--5% of contiguous at this short batch-1 workload.
 
 The hybrid path also fixes pathological all-blockwise prefill cost: prefill
 model time remains about 74--77 ms and one-time page materialization is about
-3--14 ms. Unlike the Python fallback, Triton latency is nearly independent of
-physical page size because its 16-token compute tile traverses logical tokens
-inside one kernel. Physical block size therefore primarily controls allocator
-fragmentation instead of Python dispatch count. Raw final artifacts are under
-`results/paged_triton_final/`; the pre-kernel comparison is under
-`results/paged_completion_all_blocks/`.
+3--14 ms. The Triton implementation still traverses logical tokens inside one
+kernel rather than launching once per page; page size remains a trade-off
+between reduction work, indirection, and allocator fragmentation. Raw final
+artifacts are under `results/paged_triton_final/`; the pre-kernel comparison is
+under `results/paged_completion_all_blocks/`.
 
 ### L4 projection-kernel optimization
 
@@ -183,41 +295,196 @@ can be converted into lower single-request latency.
 `PagedCudaGraphBatchRunner` retains the direct paged-attention math while
 removing per-operation CPU submission from steady-state decode. It reserves a
 request's pages up front so every KV address is stable, keeps the block table
-and input/output tensors alive, and captures one graph for each logical decode
-position. Prefill remains eager. A graph includes the 36-layer one-token model
-forward, paged attention, KV writes, language-model head, and greedy argmax.
+and input/output tensors alive, and captures one reusable graph for the fixed
+active batch. Before each replay, the host updates the static input token,
+position IDs, and sequence-length buffers. The device-side K/V writer and
+attention kernel read those values to select the current logical page slot.
+Prefill is eager but uses the project-owned flat packed-token path by default,
+so it writes K/V directly into pages without a dense-to-paged copy. A dense
+Transformers prefill remains available with
+`--graph-prefill-backend dense` as an explicit fallback for comparison.
+A graph includes the 36-layer one-token model forward, paged attention, KV
+writes, language-model head, and greedy argmax.
 
-The final matched run used a 128-token prompt, 32 output tokens, batch 1, block
-size 32, one capture warm-up, ten measured repetitions, and GPU telemetry.
+The clean asynchronous validation used a 128-token prompt, 32 output tokens,
+block size 32, one capture warm-up, and three measured repetitions.
+Synchronized component tracing was disabled for these headline latency
+numbers.
 
-| Metric | Paged eager | Paged CUDA Graph | Change |
+| Metric | Packed eager direct | Reusable CUDA Graph | Change |
 |---|---:|---:|---:|
-| TTFT P50 | 63.236 ms | 59.671 ms | -5.6% |
-| ITL P50 | 59.493 ms | 22.480 ms | -62.2% |
-| ITL P95 | 60.934 ms | 23.117 ms | -62.1% |
-| TPOT P50 | 59.606 ms | 22.466 ms | -62.3% |
-| Decode TPS P50 | 17.316 | 45.936 | +165.3% |
-| E2E latency P50 | 1911.359 ms | 756.158 ms | -60.4% |
-| E2E TPS P50 | 16.742 | 42.319 | +152.8% |
-| GPU utilization P50 | 41% | 99% | +58 points |
+| TTFT P50 | 59.072 ms | 57.714 ms | -2.3% |
+| ITL P50 | 59.305 ms | 22.315 ms | -62.4% |
+| ITL P95 | 60.375 ms | 22.360 ms | -63.0% |
+| TPOT P50 | 59.350 ms | 21.701 ms | -63.4% |
+| Decode TPS P50 | 17.363 | 46.036 | +165.1% |
+| E2E latency P50 | 1902.122 ms | 752.821 ms | -60.4% |
+| E2E TPS P50 | 16.823 | 42.507 | +152.7% |
+| GPU utilization P50 | 39.5% | 86.0% | +46.5 points |
 
 | Variance statistic | Paged eager | Paged CUDA Graph |
 |---|---:|---:|
-| TPOT standard deviation | 0.264 ms | 0.177 ms |
-| TPOT coefficient of variation | 0.44% | 0.78% |
-| ITL standard deviation | 0.755 ms | 0.224 ms |
-| Decode TPS standard deviation | 0.077 | 0.353 |
-| E2E latency standard deviation | 8.323 ms | 6.172 ms |
+| TPOT standard deviation | 0.061 ms | 0.005 ms |
+| TPOT coefficient of variation | 0.10% | 0.02% |
+| ITL standard deviation | 0.519 ms | 3.383 ms* |
+| Decode TPS standard deviation | 0.018 | 0.010 |
+| E2E latency standard deviation | 2.051 ms | 0.739 ms |
 
-All ten graph repetitions were stable and matched the trusted token IDs
-exactly. Capturing 31 decode-position graphs took 1.900 seconds and is excluded
-from steady-state metrics. Raw artifacts are under `results/paged_graph_final/`;
-the matched three-path run is under `results/batch1_graph_final/`.
+All three measured repetitions were stable and matched the trusted token IDs
+exactly for batch sizes 1, 2, and 4. Capturing one reusable graph took about
+55--89 ms in the warm-up and is excluded from steady-state metrics. The clean
+batch-1 artifacts are under `results/async_vs_graph/`; the graph batch stress
+artifacts are under `results/graph_batch_stress_packed_prefill/`.
+
+The graph batch stress run measured 46.04, 44.94, and 41.31 decode tokens/s at
+batch sizes 1, 2, and 4, respectively, with exact correctness. The lower
+per-request rate at larger batches is expected because the graph executes more
+rows per iteration and the reported request-level metric includes each row's
+latency. *The graph ITL standard deviation includes the first replay interval;
+steady-state replay intervals are approximately 22--24 ms.*
+
+### Long-context prefill optimization
+
+The long-context workload used 3,072-token prompts with 64 generated tokens and
+4,608-token prompts with 32 generated tokens. The original packed Triton
+prefill path was correct but took 3.7--16.0 seconds for these cases because its
+educational page-walking attention kernel was not sufficiently tiled. A dense
+SDPA control reduced that cost to 0.7--2.4 seconds. The graph runner now accepts
+`graph_prefill_backend: auto`; because its static graph batches require equal
+prompt lengths, `auto` selects dense SDPA without padding and keeps the packed
+path available explicitly for comparison.
+
+The dense-to-paged KV materialization was then changed from a nested
+request/layer loop to one batched indexed scatter per layer. Exact greedy token
+IDs still match the saved reference corpus:
+
+| Prompt / batch | Dense control TTFT P50 | Optimized TTFT P50 | Improvement | Optimized TPOT P50 |
+|---|---:|---:|---:|---:|
+| 3,072 / 1 | 712.2 ms | 646.6 ms | 9.2% | 26.91 ms |
+| 3,072 / 2 | 1,534.7 ms | 1,393.1 ms | 9.2% | 29.70 ms |
+| 4,608 / 1 | 1,183.2 ms | 1,082.5 ms | 8.5% | 28.02 ms |
+| 4,608 / 2 | 2,433.5 ms | 2,210.2 ms | 9.2% | 33.21 ms |
+
+In the traced 3,072-token batch-1 run, page materialization fell from about
+73.4 ms to 2.1 ms; the model forward remained about 641.5 ms. The optimized
+artifacts are under `results/long_context_optimized_20260920/`. The model
+forward is already resolved to PyTorch SDPA, so closing the remaining gap to
+vLLM requires a fused varlen/paged prefill attention kernel rather than another
+cache-copy optimization.
+
+### Batch-size scaling at long context
+
+The extended corpus was expanded to eight deterministic samples per prompt
+length so batches 2, 4, and 8 could be measured. This sweep used block size 32,
+`graph_prefill_backend: auto`, a 49,152-token physical capacity, one warm-up,
+two measured repetitions, and exact correctness references. MiniLLM-L4 results
+are under `results/long_context_batch248_20260920/`; matched vLLM results are
+under `results/vllm_long_context_batch248_20260920/`.
+
+The following are request-level P50 metrics. `TPS` means decode tokens/s for
+one request; aggregate batch throughput is reported separately in each raw
+manifest because vLLM's console `TPS` label uses a different aggregate
+definition.
+
+| Prompt | Batch | Mini TTFT (ms) | vLLM TTFT (ms) | Mini TPOT (ms) | vLLM TPOT (ms) | Mini decode TPS | vLLM decode TPS | Mini E2E TPS | vLLM E2E TPS |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 3,072 | 2 | 1,435.7 | 633.8 | 30.35 | 29.09 | 33.47 | 35.35 | 19.12 | 25.94 |
+| 3,072 | 4 | 2,899.3 | 1,704.9 | 37.25 | 29.67 | 27.27 | 34.24 | 12.20 | 17.91 |
+| 3,072 | 8 | 5,805.6 | 3,361.2 | 51.85 | 37.10 | 19.59 | 27.38 | 7.05 | 11.24 |
+| 4,608 | 2 | 2,266.3 | 1,007.3 | 34.10 | 38.04 | 30.27 | 29.31 | 9.63 | 14.62 |
+| 4,608 | 4 | 4,626.8 | 2,633.3 | 46.28 | 33.25 | 22.30 | 31.05 | 5.28 | 8.73 |
+| 4,608 | 8 | 9,231.7 | 5,211.0 | 69.58 | 44.30 | 14.83 | 23.30 | 2.81 | 4.86 |
+
+All twelve cases passed exact greedy-token validation. MiniLLM-L4 peak
+allocated memory was approximately 16.1 GiB for 3,072/batch-8 and 18.7 GiB
+for 4,608/batch-8; the largest reserved value was approximately 21.4 GiB.
+Batching increases GPU utilization, but this implementation still has a
+prefill cost that scales almost linearly with total prompt tokens. vLLM's fused
+varlen prefill and production decode kernels retain lower latency at the same
+batch sizes.
+
+### Profile-guided long-context decode tuning
+
+A synchronized 3,072-token, batch-8 trace showed that model execution consumed
+more than 99% of the request window. The original paged-attention kernel used a
+16-token reduction tile and four split-KV partitions. A dedicated microbenchmark
+then swept reduction tiles 8/16/32/64, split counts 1/2/4/8, and batch sizes
+1/2/4/8. The accepted L4 configuration uses a 64-token tile for contexts of at
+least 1,024 tokens and a batch-aware split policy. Contexts above 2,048 tokens
+use eight splits. The graph records the selected tile and split count in every
+result artifact.
+
+The GQA-reuse hypothesis was also implemented and tested. It computes all four
+Qwen query heads sharing one KV head in one Triton program, but the larger live
+state reduced occupancy. At 3,072 tokens and batch 8, it increased TPOT from
+about 51.9 ms to 58.5 ms. It remains available to the kernel microbenchmark as
+an experimental comparison, while the production graph path explicitly uses
+the faster per-query-head implementation.
+
+| Prompt / batch | Before TPOT P50 | Tuned TPOT P50 | Improvement | vLLM TPOT P50 |
+|---|---:|---:|---:|---:|
+| 3,072 / 8 | 51.85 ms | 39.48 ms | 23.9% | 37.10 ms |
+| 4,608 / 8 | 69.58 ms | 47.87 ms | 31.2% | 44.30 ms |
+
+Both end-to-end runs passed exact greedy-token validation. At 3,072/batch-8,
+CUDA Graph replay fell from about 3.25 seconds to 2.47 seconds for 63 decode
+steps. At 4,608/batch-8, it fell to 1.48 seconds for 31 decode steps. The tuned
+artifacts are under `results/tuned_attention_20260920/`, and the reusable sweep
+command is `benchmarks.commands.benchmark_paged_attention`.
+
+TTFT did not improve: prefill remained about 5.8 seconds and 9.2 seconds in the
+two batch-8 cases. A clean 3,072/batch-8 experiment rejected multi-output FP8
+gate/up and K/V fusion for prefill because it increased prefill from 5,809 ms
+to 6,473 ms. The extra accumulator state helps some decode shapes but hurts
+large-prefill occupancy. Therefore the fusion was not integrated into this
+engine. The next TTFT optimization needs a separately tuned prefill kernel or
+compiled fused model path rather than reusing a decode-oriented kernel.
+
+## Component latency trace
+
+The paged benchmark accepts `--trace-summary` and writes the complete trace to
+the result JSON:
+
+```bash
+.conda-env/bin/python -m minillm_l4.benchmarks.commands.run_paged_kv \
+  --config minillm_l4/configs/workloads/qwen3_fp8_paged.yaml \
+  --workload short \
+  --modes paged_packed \
+  --block-sizes 32 \
+  --batch-sizes 1 \
+  --repetitions 3 \
+  --warmup-repetitions 1 \
+  --trace-summary \
+  --output-dir minillm_l4/results/diagnostics_packed
+```
+
+For the measured eager packed run, the trace window was 1,871.7 ms. Decode
+model forward accounted for 1,797.0 ms, or 96.2% of recorded component time;
+metadata materialization was 4.5 ms, token selection 3.0 ms, streaming 2.3
+ms, and scheduler/KV reservation 0.6 ms. This establishes that the 16--18
+decode-TPS result is not caused by Python queueing or allocator overhead.
+
+For the current packed-prefill graph trace, graph replay accounted for 689.7 ms
+of a 756.5 ms trace window, or 91.6%, with 22.4 ms diagnostic TPOT. Packed
+prefill accounted for 59.6 ms, or 7.9%; input updates were 1.0 ms, replayed
+token transfer/streaming was 1.9 ms, and sampling plus output materialization
+was below 0.2 ms. GPU utilization was materially higher because graph replay
+submits the many small one-token operations as a single captured execution
+schedule. Diagnostic tracing synchronizes around these stages, so its latency
+is intentionally separate from the clean asynchronous table above. The trace
+artifact is under `results/trace_graph_packed/`.
 
 ## Known limitations
 
 - Unsupported devices, dtypes, and multi-token direct-attention shapes fall
   back to the readable PyTorch path.
+- The packed `sdpa` backend avoids prompt padding but launches one fused
+  attention call per request per layer; it is not yet a single fused ragged
+  FlashAttention/FlashInfer kernel and is experimental because accumulation
+  order can change close greedy-token decisions.
+- The packed runner currently requires equal output limits inside one static
+  batch; prompt lengths may differ. Variable output limits belong in the
+  lifecycle scheduler, where completed rows can leave the active batch.
 - The hybrid path performs a one-time dense-to-paged copy after prefill.
 - The focused completion sweep covers every configured block size at batch 1;
   larger prompt and batch stress sweeps remain available through the same
@@ -226,10 +493,10 @@ the matched three-path run is under `results/batch1_graph_final/`.
   runner retains its cache and captured addresses across repetitions.
 - The SM89 projection kernel is intentionally specific to the L4 and this
   checkpoint's 128x128 FP8 scaling layout. Other devices and layouts fall back.
-- The first graph implementation captures one graph per decode position. This
-  preserves exact fixed KV writes but scales capture count and graph memory
-  with configured output length; production engines use a smaller shape set
-  plus dynamic slot mappings.
+- The reusable graph path captures one graph per fixed active shape, but it
+  still requires stable request IDs and pre-reserved page addresses. A general
+  continuous scheduler needs a small graph-shape pool plus dynamic slot
+  mappings.
 - The graph path reserves all request blocks up front and currently requires
   equal request shapes and stable request IDs across replays.
 

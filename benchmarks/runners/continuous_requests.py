@@ -259,6 +259,13 @@ class ContinuousRequestTraceRunner:
         *,
         batch_index: int,
     ) -> Any | None:
+        active_batch_size_before = len(active)
+        active_prompt_tokens_before = sum(
+            state.request.prompt_tokens for state in active
+        )
+        active_cached_tokens_before = sum(
+            state.cached_token_count for state in active
+        )
         inputs, max_prompt_tokens = _padded_inputs(
             tuple(state.request for state in states),
             device=self.device,
@@ -316,11 +323,21 @@ class ContinuousRequestTraceRunner:
                 "batch_index": batch_index,
                 "request_ids": [state.request.request_id for state in states],
                 "batch_size": len(states),
+                "active_batch_size_before": active_batch_size_before,
+                "active_prompt_tokens_before": active_prompt_tokens_before,
+                "active_cached_tokens_before": active_cached_tokens_before,
                 "max_prompt_tokens": max_prompt_tokens,
                 "prompt_tokens": sum(state.request.prompt_tokens for state in states),
                 "prompt_padding_slots": prompt_padding,
+                "prefill_while_decoding": active_batch_size_before > 0,
                 "cache_rebased": cache is not None and incoming_cache is not None,
                 "active_batch_size_after": len(active),
+                "active_prompt_tokens_after": sum(
+                    state.request.prompt_tokens for state in active
+                ),
+                "active_cached_tokens_after": sum(
+                    state.cached_token_count for state in active
+                ),
             }
         )
         del output
@@ -336,6 +353,12 @@ class ContinuousRequestTraceRunner:
         iteration_index: int,
     ) -> Any | None:
         cache_length = int(cache.get_seq_length())
+        active_prompt_tokens_before = sum(
+            state.request.prompt_tokens for state in active
+        )
+        active_cached_tokens_before = sum(
+            state.cached_token_count for state in active
+        )
         input_ids = torch.cat(
             tuple(state.next_token for state in active if state.next_token is not None),
             dim=0,
@@ -392,25 +415,57 @@ class ContinuousRequestTraceRunner:
             if self._is_eos(token_id) or state.generated_count >= state.request.max_new_tokens:
                 self._finish(state, outcomes, timestamp_ns=timestamp_ns)
                 finished_indices.append(row)
+        finished_set = set(finished_indices)
+        keep_indices = [
+            index for index in range(len(active)) if index not in finished_set
+        ]
+        remaining_states = [active[index] for index in keep_indices]
+        del output
+        if not keep_indices:
+            batch_records.append(
+                {
+                    "kind": "decode",
+                    "iteration_index": iteration_index,
+                    "request_ids": [state.request.request_id for state in active],
+                    "batch_size": len(active),
+                    "active_prompt_tokens_before": active_prompt_tokens_before,
+                    "active_cached_tokens_before": active_cached_tokens_before,
+                    "cache_length_before": cache_length,
+                    "cache_length_after": int(updated_cache.get_seq_length()),
+                    "finished_request_ids": [
+                        active[index].request.request_id
+                        for index in finished_indices
+                    ],
+                    "active_batch_size_after": 0,
+                    "active_prompt_tokens_after": 0,
+                    "active_cached_tokens_after": 0,
+                }
+            )
+            active.clear()
+            return None
         batch_records.append(
             {
                 "kind": "decode",
                 "iteration_index": iteration_index,
                 "request_ids": [state.request.request_id for state in active],
                 "batch_size": len(active),
+                "active_prompt_tokens_before": active_prompt_tokens_before,
+                "active_cached_tokens_before": active_cached_tokens_before,
                 "cache_length_before": cache_length,
                 "cache_length_after": int(updated_cache.get_seq_length()),
-                "finished_request_ids": [active[index].request.request_id for index in finished_indices],
+                "finished_request_ids": [
+                    active[index].request.request_id
+                    for index in finished_indices
+                ],
+                "active_batch_size_after": len(remaining_states),
+                "active_prompt_tokens_after": sum(
+                    state.request.prompt_tokens for state in remaining_states
+                ),
+                "active_cached_tokens_after": sum(
+                    state.cached_token_count for state in remaining_states
+                ),
             }
         )
-        finished_set = set(finished_indices)
-        keep_indices = [
-            index for index in range(len(active)) if index not in finished_set
-        ]
-        del output
-        if not keep_indices:
-            active.clear()
-            return None
         active[:] = [active[index] for index in keep_indices]
         updated_cache.batch_select_indices(
             torch.tensor(keep_indices, dtype=torch.long, device=self.device)
@@ -539,6 +594,22 @@ class ContinuousRequestTraceRunner:
             for record in batch_records
             if record["kind"] == "prefill"
         ] + decode_batch_sizes
+        prefill_records = [
+            record for record in batch_records if record["kind"] == "prefill"
+        ]
+        active_prompt_token_counts = [
+            int(record.get("active_prompt_tokens_after", 0))
+            for record in batch_records
+        ]
+        active_cached_token_counts = [
+            int(record.get("active_cached_tokens_after", 0))
+            for record in batch_records
+        ]
+        prefill_while_decoding = [
+            record
+            for record in prefill_records
+            if bool(record.get("prefill_while_decoding", False))
+        ]
         self.last_summary = {
             "policy": "continuous_in_flight_batching",
             "max_batch_size": self.max_batch_size,
@@ -549,8 +620,34 @@ class ContinuousRequestTraceRunner:
             "iteration_batch_sizes": decode_batch_sizes,
             "prefill_batch_sizes": prefill_batch_sizes,
             "maximum_prefill_batch_size": max(prefill_batch_sizes, default=0),
+            "maximum_prefill_input_tokens": max(
+                (int(record["prompt_tokens"]) for record in prefill_records),
+                default=0,
+            ),
+            "maximum_prefill_compute_slots": max(
+                (
+                    int(record["batch_size"]) * int(record["max_prompt_tokens"])
+                    for record in prefill_records
+                ),
+                default=0,
+            ),
+            "maximum_prefill_padding_slots": max(
+                (int(record["prompt_padding_slots"]) for record in prefill_records),
+                default=0,
+            ),
+            "maximum_active_prompt_tokens": max(
+                active_prompt_token_counts, default=0
+            ),
+            "maximum_active_cached_tokens": max(
+                active_cached_token_counts, default=0
+            ),
             "maximum_active_batch_size": max(active_batch_sizes, default=0),
+            "maximum_concurrent_requests": max(active_batch_sizes, default=0),
             "maximum_queue_depth": scheduler.maximum_queue_depth,
+            "prefill_batches_while_decoding": len(prefill_while_decoding),
+            "requests_prefilled_while_decoding": sum(
+                int(record["batch_size"]) for record in prefill_while_decoding
+            ),
             "prompt_slots": prompt_slots,
             "prompt_padding_slots": prompt_padding_slots,
             "output_padding_slots": 0,

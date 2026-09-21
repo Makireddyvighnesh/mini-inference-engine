@@ -134,6 +134,10 @@ def test_continuous_runner_admits_new_request_while_decode_is_in_flight() -> Non
     assert result.summary["completed_requests"] == 3
     assert runner.last_summary is not None
     assert runner.last_summary["maximum_active_batch_size"] == 2
+    assert runner.last_summary["maximum_concurrent_requests"] == 2
+    assert runner.last_summary["maximum_prefill_input_tokens"] == 5
+    assert runner.last_summary["prefill_batches_while_decoding"] >= 1
+    assert runner.last_summary["requests_prefilled_while_decoding"] >= 1
     assert runner.last_summary["prefill_batch_count"] == 2
     assert runner.last_summary["decode_iteration_count"] >= 3
     assert any(

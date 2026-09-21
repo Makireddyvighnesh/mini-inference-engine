@@ -40,6 +40,7 @@ class DistributionSummary:
     mean: float
     median: float
     p50: float
+    p90: float
     p95: float
     p99: float
     minimum: float
@@ -52,6 +53,7 @@ class DistributionSummary:
             "mean": self.mean,
             "median": self.median,
             "p50": self.p50,
+            "p90": self.p90,
             "p95": self.p95,
             "p99": self.p99,
             "minimum": self.minimum,
@@ -72,6 +74,7 @@ def summarize(values: Iterable[float]) -> DistributionSummary:
         mean=statistics.fmean(normalized),
         median=statistics.median(normalized),
         p50=percentile(ordered, 50),
+        p90=percentile(ordered, 90),
         p95=percentile(ordered, 95),
         p99=percentile(ordered, 99),
         minimum=ordered[0],

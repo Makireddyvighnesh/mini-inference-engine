@@ -15,6 +15,10 @@ def test_project_workload_configs_are_yaml_and_validate() -> None:
         ("qwen3_fp8_concurrent.yaml", 4),
         ("qwen3_fp8_continuous.yaml", 5),
         ("qwen3_fp8_paged.yaml", 6),
+        ("qwen3_fp8_stress.yaml", 5),
+        ("qwen3_fp8_capacity_limit.yaml", 5),
+        ("qwen3_fp8_capacity_limit_128.yaml", 5),
+        ("qwen3_fp8_long_context.yaml", 6),
     )
     for filename, expected_phase in configurations:
         path = PROJECT_ROOT / "configs" / "workloads" / filename
@@ -44,6 +48,25 @@ def test_continuous_config_selects_iteration_scheduler() -> None:
     assert payload["scheduler"]["max_wait_ms"] == 2.0
 
 
+def test_stress_configs_define_capacity_matrices() -> None:
+    payload = load_yaml_config(
+        PROJECT_ROOT / "configs/workloads/qwen3_fp8_stress.yaml",
+        expected_phase=5,
+    )
+    assert payload["stress"]["concurrency"]["max_batch_sizes"] == [1, 2, 4, 8, 16]
+    assert payload["stress"]["input_budget"]["max_prefill_tokens"] == [
+        2048,
+        4096,
+        8192,
+        16384,
+    ]
+    assert payload["stress"]["interleave"]["buckets"] == [
+        "short",
+        "medium",
+        "long",
+    ]
+
+
 def test_paged_config_selects_fixed_block_storage() -> None:
     payload = load_yaml_config(
         PROJECT_ROOT / "configs/workloads/qwen3_fp8_paged.yaml",
@@ -54,4 +77,17 @@ def test_paged_config_selects_fixed_block_storage() -> None:
     assert payload["cache"]["block_sizes"] == [8, 16, 32, 64]
     assert payload["cache"]["capacity_token_slots"] == 32768
     assert payload["cache"]["decode_backend"] == "auto"
+    assert payload["cache"]["graph_prefill_backend"] == "packed"
     assert payload["model"]["fp8_kernel_path"] == "sm89"
+
+
+def test_long_context_paged_config_covers_both_extended_prompt_buckets() -> None:
+    payload = load_yaml_config(
+        PROJECT_ROOT / "configs/workloads/qwen3_fp8_long_context.yaml",
+        expected_phase=6,
+    )
+
+    assert payload["workloads"]["prompt_lengths"] == [3072, 4608]
+    assert payload["workloads"]["batch_sizes"] == [2, 1]
+    assert payload["cache"]["modes"] == ["paged_graph"]
+    assert payload["cache"]["graph_prefill_backend"] == "auto"

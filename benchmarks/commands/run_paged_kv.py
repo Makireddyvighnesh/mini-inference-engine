@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+from dataclasses import replace
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Mapping
@@ -28,6 +29,9 @@ from minillm_l4.benchmarks.runners.paged_kv import (
     PagedKvBatchRunner,
     write_paged_result,
 )
+from minillm_l4.benchmarks.runners.packed_paged import (
+    PackedPagedPrefillBatchRunner,
+)
 from minillm_l4.configs.loader import load_yaml_config
 
 
@@ -36,6 +40,15 @@ DEFAULT_CONFIG = PROJECT_ROOT / "configs/workloads/qwen3_fp8_paged.yaml"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "results/paged_kv"
 DEFAULT_REFERENCE_DIR = PROJECT_ROOT / "results/phase1/references_baseline"
 
+# The regular Phase 6 matrix stops at 2,048 prompt tokens.  Keep these
+# additional shapes local to the paged benchmark so the original Phase 1–5
+# workload definitions and their reports remain unchanged.
+LONG_CONTEXT_BUCKETS: tuple[tuple[str, int, int], ...] = (
+    ("xlong", 3072, 64),
+    ("xxlong", 4608, 32),
+)
+PAGED_CONTEXT_BUCKETS = BASELINE_BUCKETS + LONG_CONTEXT_BUCKETS
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -43,7 +56,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument(
-        "--workload", choices=("short", "medium", "long", "all"), default="all"
+        "--workload",
+        choices=tuple(bucket[0] for bucket in PAGED_CONTEXT_BUCKETS) + ("all",),
+        default="all",
     )
     parser.add_argument(
         "--modes",
@@ -55,6 +70,7 @@ def parse_args() -> argparse.Namespace:
             "paged_gather",
             "paged_direct",
             "paged_hybrid",
+            "paged_packed",
         ),
         default=None,
     )
@@ -67,6 +83,31 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Paged decode implementation; auto selects Triton on supported CUDA inputs.",
     )
+    parser.add_argument(
+        "--prefill-backend",
+        choices=(
+            "auto",
+            "torch",
+            "triton",
+            "sdpa",
+            "sdpa_math",
+        ),
+        default=None,
+        help=(
+            "Packed-prefill implementation; auto selects fused SDPA on CUDA, "
+            "while triton keeps the educational page-walking kernel available."
+        ),
+    )
+    parser.add_argument(
+        "--graph-prefill-backend",
+        choices=("auto", "packed", "dense"),
+        default=None,
+        help=(
+            "CUDA-Graph prefill path; auto selects dense SDPA for the fixed-shape "
+            "graph runner, packed is the educational flat-token path, and dense "
+            "is the explicit control."
+        ),
+    )
     parser.add_argument("--count", type=int, default=None)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--reference-dir", type=Path, default=DEFAULT_REFERENCE_DIR)
@@ -77,6 +118,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-repetitions", type=int, default=None)
     parser.add_argument("--no-gpu-sampling", action="store_true")
     parser.add_argument("--no-system-telemetry", action="store_true")
+    parser.add_argument(
+        "--trace-summary",
+        action="store_true",
+        help=(
+            "Enable synchronized component tracing and print the measured "
+            "runner timeline and aggregates; diagnostic mode adds overhead."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -113,12 +162,13 @@ def load_config(path: Path) -> dict[str, Any]:
             "paged_gather",
             "paged_direct",
             "paged_hybrid",
+            "paged_packed",
         }
         for mode in modes
     ):
         raise ValueError(
             "cache.modes values must be contiguous, paged_graph, paged, paged_gather, "
-            "paged_direct, or paged_hybrid"
+            "paged_direct, paged_hybrid, or paged_packed"
         )
     block_sizes = cache.get("block_sizes")
     if not isinstance(block_sizes, list) or not block_sizes:
@@ -131,7 +181,7 @@ def load_config(path: Path) -> dict[str, Any]:
 
 
 def _selected_buckets(selection: str, configured_lengths: list[int]) -> list[tuple[str, int, int]]:
-    by_length = {bucket[1]: bucket for bucket in BASELINE_BUCKETS}
+    by_length = {bucket[1]: bucket for bucket in PAGED_CONTEXT_BUCKETS}
     unknown = [value for value in configured_lengths if value not in by_length]
     if unknown:
         raise ValueError(f"unsupported prompt lengths: {unknown}")
@@ -143,6 +193,79 @@ def _selected_buckets(selection: str, configured_lengths: list[int]) -> list[tup
 
 def _display(value: Any) -> str:
     return "n/a" if value is None else f"{float(value):.3f}"
+
+
+def _print_trace_summary(result: Any) -> None:
+    """Print the last measured batch trace without dumping every span."""
+
+    traces: list[Mapping[str, Any]] = []
+    diagnostics: list[Mapping[str, Any]] = []
+    for run in getattr(result, "runs", ()):
+        for batch in run.get("runner_diagnostics", ()):
+            if isinstance(batch, Mapping):
+                diagnostics.append(batch)
+            trace = batch.get("execution_trace")
+            if isinstance(trace, Mapping):
+                traces.append(trace)
+    if not traces:
+        print("  trace: unavailable for this runner")
+        return
+    trace = traces[-1]
+    totals = trace.get("timing_totals", {})
+    if diagnostics:
+        diagnostic = diagnostics[-1]
+        batch_start = float(diagnostic.get("start_ms", 0.0))
+        batch_end = float(diagnostic.get("end_ms", batch_start))
+        spans = trace.get("spans", ())
+        span_starts = [
+            float(span.get("start_ms", 0.0))
+            for span in spans
+            if isinstance(span, Mapping)
+        ]
+        span_ends = [
+            float(span.get("end_ms", 0.0))
+            for span in spans
+            if isinstance(span, Mapping)
+        ]
+        trace_start = min(span_starts, default=batch_start)
+        trace_end = max(span_ends, default=batch_start)
+        covered_start = max(batch_start, trace_start)
+        covered_end = min(batch_end, trace_end)
+        covered_ms = max(0.0, covered_end - covered_start)
+        outside_ms = max(0.0, (batch_end - batch_start) - covered_ms)
+        print(
+            "  runner invocation="
+            f"{_display(diagnostic.get('batch_runner_wall_ms'))} ms "
+            "trace-covered="
+            f"{_display(covered_ms)} ms "
+            "outside-trace="
+            f"{_display(outside_ms)} ms"
+        )
+    print(
+        "  trace window="
+        f"{_display(totals.get('trace_window_ms'))} ms "
+        "unattributed="
+        f"{_display(totals.get('unattributed_wall_ms'))} ms"
+    )
+    components = trace.get("components", {})
+    if not isinstance(components, Mapping):
+        return
+    for name, component in sorted(
+        components.items(),
+        key=lambda item: float(item[1].get("wall_ms_total", 0.0))
+        if isinstance(item[1], Mapping)
+        else 0.0,
+        reverse=True,
+    ):
+        if not isinstance(component, Mapping):
+            continue
+        print(
+            f"    {name:44s} "
+            f"wall={_display(component.get('wall_ms_total'))} ms "
+            f"device={_display(component.get('device_ms_total'))} ms "
+            f"host_gap={_display(component.get('host_overhead_ms_total'))} ms "
+            f"share={_display(component.get('share_of_recorded_span_wall_percent'))}%"
+        )
 
 
 def _harness_config(
@@ -206,6 +329,7 @@ def main() -> None:
             "paged_gather",
             "paged_direct",
             "paged_hybrid",
+            "paged_packed",
         }
     )
     if paged_modes and not block_sizes:
@@ -231,6 +355,29 @@ def main() -> None:
     )
     if decode_backend not in {"auto", "torch", "triton"}:
         raise ValueError("cache.decode_backend must be auto, torch, or triton")
+    prefill_backend = str(
+        cache_config.get("packed_prefill_backend", "auto")
+        if args.prefill_backend is None
+        else args.prefill_backend
+    )
+    if prefill_backend not in {
+        "auto",
+        "torch",
+        "triton",
+        "sdpa",
+        "sdpa_math",
+    }:
+        raise ValueError(
+            "cache.packed_prefill_backend must be auto, torch, triton, "
+            "sdpa, or sdpa_math"
+        )
+    graph_prefill_backend = str(
+        cache_config.get("graph_prefill_backend", "packed")
+        if args.graph_prefill_backend is None
+        else args.graph_prefill_backend
+    )
+    if graph_prefill_backend not in {"auto", "packed", "dense"}:
+        raise ValueError("cache.graph_prefill_backend must be auto, packed, or dense")
 
     output_dir = _project_path(args.output_dir)
     reference_dir = _project_path(args.reference_dir)
@@ -282,6 +429,8 @@ def main() -> None:
             "block_sizes": block_sizes,
             "capacity_token_slots": capacity_token_slots,
             "decode_backend": decode_backend,
+            "packed_prefill_backend": prefill_backend,
+            "graph_prefill_backend": graph_prefill_backend,
             "batch_sizes": batch_sizes,
             "count": count,
             "repetitions": repetitions,
@@ -320,6 +469,7 @@ def main() -> None:
                     device=device,
                     logits_mode=str(benchmark_config.get("logits_mode", "last")),
                     pad_token_id=0,
+                    trace_enabled=bool(args.trace_summary),
                 )
                 result = BenchmarkHarness(
                     _harness_config(
@@ -364,9 +514,14 @@ def main() -> None:
                 print(
                     f"contiguous {bucket_name:6s} batch={batch_size:<2d} "
                     f"TTFT_P50={_display(result.summary['metrics']['ttft_ms'].get('median'))} ms "
+                    f"ITL_P50={_display(result.summary['metrics']['itl_ms'].get('median'))} ms "
                     f"TPOT_P50={_display(result.summary['metrics']['tpot_ms'].get('median'))} ms "
+                    f"TPS_P50={_display(result.summary['metrics']['tokens_per_second'].get('median'))} "
+                    f"E2E_TPS_P50={_display(result.summary['metrics']['e2e_tokens_per_second'].get('median'))} "
                     f"correctness={correctness['status']}"
                 )
+                if args.trace_summary:
+                    _print_trace_summary(result)
 
             for paged_mode in paged_modes:
                 for block_size in block_sizes:
@@ -374,9 +529,12 @@ def main() -> None:
                     is_direct = paged_mode == "paged_direct"
                     is_hybrid = paged_mode == "paged_hybrid"
                     is_graph = paged_mode == "paged_graph"
+                    is_packed = paged_mode == "paged_packed"
                     runner_class = (
                         PagedCudaGraphBatchRunner
                         if is_graph
+                        else PackedPagedPrefillBatchRunner
+                        if is_packed
                         else PagedAttentionBatchRunner
                         if is_direct
                         else PagedHybridBatchRunner
@@ -390,11 +548,26 @@ def main() -> None:
                         "logits_mode": str(
                             benchmark_config.get("logits_mode", "last")
                         ),
+                        "trace_enabled": bool(args.trace_summary),
                     }
-                    if is_direct or is_hybrid or is_graph:
+                    if is_direct or is_hybrid or is_graph or is_packed:
                         runner_kwargs["decode_backend"] = decode_backend
+                    if is_packed:
+                        runner_kwargs["prefill_backend"] = prefill_backend
+                    if is_graph:
+                        runner_kwargs["prefill_backend"] = graph_prefill_backend
                     runner = runner_class(bundle.model, **runner_kwargs)
                     runner_name = runner.runner_name
+                    benchmark_workload = workload
+                    if is_graph and len(workload.requests) != batch_size:
+                        # A captured graph owns the request-specific page-table
+                        # addresses.  Keep one stable group for every measured
+                        # repetition instead of sending later harness batches
+                        # with different request IDs to the same graph.
+                        benchmark_workload = replace(
+                            workload,
+                            requests=workload.requests[:batch_size],
+                        )
                     result = BenchmarkHarness(
                         _harness_config(
                             benchmark_config,
@@ -405,7 +578,7 @@ def main() -> None:
                             args=args,
                         ),
                         benchmark_name="minillm_l4_paged_comparison",
-                    ).run_batched(workload, batch_size, runner)
+                    ).run_batched(benchmark_workload, batch_size, runner)
                     correctness = verify_or_write_reference(
                         result,
                         reference_dir / f"{bucket_name}.json",
@@ -415,6 +588,8 @@ def main() -> None:
                         if is_direct
                         else "paged_graph"
                         if is_graph
+                        else "paged_packed"
+                        if is_packed
                         else "paged_hybrid"
                         if is_hybrid
                         else "paged"
@@ -447,6 +622,7 @@ def main() -> None:
                             "prompt_tokens": prompt_tokens,
                             "output_tokens": output_tokens,
                             "batch_size": batch_size,
+                            "request_count_measured": len(benchmark_workload.requests),
                             "result": str(result_path),
                             "events": str(events_path),
                             "reference": str(reference_dir / f"{bucket_name}.json"),
@@ -460,6 +636,8 @@ def main() -> None:
                         if is_direct
                         else "paged-graph"
                         if is_graph
+                        else "paged-packed"
+                        if is_packed
                         else "paged-hybrid"
                         if is_hybrid
                         else "paged-gather"
@@ -468,10 +646,15 @@ def main() -> None:
                         f"{display_mode:12s} {bucket_name:6s} block={block_size:<3d} "
                         f"batch={batch_size:<2d} "
                         f"TTFT_P50={_display(result.summary['metrics']['ttft_ms'].get('median'))} ms "
+                        f"ITL_P50={_display(result.summary['metrics']['itl_ms'].get('median'))} ms "
                         f"TPOT_P50={_display(result.summary['metrics']['tpot_ms'].get('median'))} ms "
+                        f"TPS_P50={_display(result.summary['metrics']['tokens_per_second'].get('median'))} "
+                        f"E2E_TPS_P50={_display(result.summary['metrics']['e2e_tokens_per_second'].get('median'))} "
                         f"waste={float(snapshot.get('internal_fragmentation', 0.0)):.3f} "
                         f"correctness={correctness['status']}"
                     )
+                    if args.trace_summary:
+                        _print_trace_summary(result)
 
     manifest["status"] = (
         "completed"

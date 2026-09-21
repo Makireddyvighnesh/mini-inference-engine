@@ -8,6 +8,7 @@ from .harness import (
     write_events_jsonl,
     write_result,
 )
+from .tracing import ExecutionTrace, SpanMeasurement
 from .schemas import EventRecord, RequestOutcome, RequestSpec, WorkloadSpec
 from .workloads import (
     DEFAULT_BUCKETS,
@@ -24,11 +25,13 @@ __all__ = [
     "BenchmarkResult",
     "DEFAULT_BUCKETS",
     "EventRecord",
+    "ExecutionTrace",
     "HarnessConfig",
     "PromptBucket",
     "RequestEventRecorder",
     "RequestOutcome",
     "RequestSpec",
+    "SpanMeasurement",
     "WorkloadSpec",
     "build_fixed_workload",
     "build_fixture_workloads",

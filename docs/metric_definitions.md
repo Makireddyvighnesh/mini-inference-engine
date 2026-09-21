@@ -40,6 +40,24 @@ records so summaries can be independently recomputed.
 
 The harness uses synchronized wall-clock boundaries for user-visible request
 metrics. GPU model runners may additionally use CUDA events for device-only
-timings through `benchmarks.core.timing.measure_call`; CUDA event time and wall time
-must be reported separately. Model loading, CUDA graph capture, compilation,
-and warm-up are not part of steady-state request distributions.
+timings through `benchmarks.core.timing.measure_call`; CUDA event time and wall
+time must be reported separately. Model loading, CUDA graph capture,
+compilation, and warm-up are not part of steady-state request distributions.
+
+## Component trace diagnostics
+
+Instrumented runners store an `execution_trace` inside each batch diagnostic
+when diagnostic tracing is enabled with `--trace-summary`. Each component has:
+
+- `wall_ms_total`: elapsed host-visible time across its spans;
+- `device_ms_total`: CUDA event time for GPU spans, or `null` for CPU spans;
+- `host_overhead_ms_total`: wall time not covered by the CUDA event;
+- `share_of_recorded_span_wall_percent`: share of measured component spans;
+- `count`, mean, minimum, maximum, and the raw individual spans.
+
+`trace_window_ms` is the first-to-last recorded span window. A nonzero
+`unattributed_wall_ms` indicates time between spans that the runner has not
+assigned to a component. `runner_diagnostics[].batch_runner_wall_ms` includes
+the complete callable invocation, including any uninstrumented runner work.
+Synchronized tracing intentionally adds overhead, so trace runs are for
+diagnosis; the untraced asynchronous run is the performance headline.
