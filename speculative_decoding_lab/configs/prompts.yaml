@@ -1,0 +1,17 @@
+prompts:
+  - id: code
+    category: coding
+    text: >-
+      Write a Python function that merges two sorted integer lists into one
+      sorted list. Explain its time complexity briefly.
+  - id: arithmetic
+    category: math
+    text: >-
+      A shop sells notebooks for $3 each and pens for $2 each. If I buy 7
+      notebooks and 5 pens and pay with $40, how much change should I receive?
+      Show the calculation.
+  - id: explanation
+    category: general
+    text: >-
+      Explain why speculative decoding can reduce the latency of autoregressive
+      language-model generation, and name one case where it may not help.
