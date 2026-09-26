@@ -296,8 +296,10 @@ class ContinuousRequestTraceRunner:
         active_new: list[_Sequence] = []
         active_indices: list[int] = []
         prompt_padding = 0
+        # One device-to-host copy for the whole batch instead of one per row.
+        token_values = [int(value) for value in next_tokens[:, 0].tolist()]
         for row, state in enumerate(states):
-            token_id = int(next_tokens[row, 0].detach().to(device="cpu").item())
+            token_id = token_values[row]
             state.generated_token_ids.append(token_id)
             state.next_token = next_tokens[row : row + 1].detach()
             state.recorder.record("prefill_end", timestamp_ns=timestamp_ns)
@@ -363,14 +365,13 @@ class ContinuousRequestTraceRunner:
             tuple(state.next_token for state in active if state.next_token is not None),
             dim=0,
         ).to(self.device)
+        # Build the per-row metadata on the host and move it once; writing it
+        # row by row into device tensors launches two tiny kernels per row.
         attention_mask = torch.zeros(
             (len(active), cache_length + 1),
             dtype=torch.long,
-            device=self.device,
         )
-        position_ids = torch.zeros(
-            (len(active), 1), dtype=torch.long, device=self.device
-        )
+        position_ids = torch.zeros((len(active), 1), dtype=torch.long)
         for row, state in enumerate(active):
             cached_tokens = state.cached_token_count
             if cached_tokens > cache_length:
@@ -380,6 +381,8 @@ class ContinuousRequestTraceRunner:
                 )
             attention_mask[row, cache_length - cached_tokens :] = 1
             position_ids[row, 0] = cached_tokens
+        attention_mask = attention_mask.to(self.device)
+        position_ids = position_ids.to(self.device)
         with torch.inference_mode():
             output = self.model(
                 input_ids=input_ids,
@@ -396,8 +399,9 @@ class ContinuousRequestTraceRunner:
         next_tokens = _select_next_token(output)
         timestamp_ns = max(state.recorder.now_ns() for state in active)
         finished_indices: list[int] = []
+        token_values = [int(value) for value in next_tokens[:, 0].tolist()]
         for row, state in enumerate(active):
-            token_id = int(next_tokens[row, 0].detach().to(device="cpu").item())
+            token_id = token_values[row]
             token_index = state.generated_count
             state.generated_token_ids.append(token_id)
             state.next_token = next_tokens[row : row + 1].detach()

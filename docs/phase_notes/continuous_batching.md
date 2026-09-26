@@ -140,6 +140,49 @@ while changing only the arrival policy, for example:
   --output-dir minillm_l4/results/continuous_poisson
 ```
 
+## 2026-09-26 L4 benchmark and host-sync cleanup
+
+**Change.** The prefill and decode loops copied each row's next token to the
+host with its own `.item()` (one device sync per row per step), and the decode
+attention mask and position IDs were written into device tensors row by row
+(two tiny kernel launches per row per step). Tokens are now copied with one
+`.tolist()` per step, and the metadata is built on the host and moved once.
+The outputs are unchanged.
+
+**Measurement.** The reproduction command above was run on the L4 for HEAD
+(`ef0013b`, clean worktree, `results/continuous_20260926_base`) and for the
+modified runner (`results/continuous_20260926_mod`; mixed batch 4 re-run with
+the final code in `results/continuous_20260926_final`). Each point uses one
+warm-up and three measured traces; every point passed the exact-token gate.
+
+| Trace | Max batch | TTFT P50 (ms) HEAD → new | TPOT P50 (ms) HEAD → new | E2E P95 (ms) HEAD → new | TPS P50 HEAD → new |
+|---|---:|---:|---:|---:|---:|
+| uniform | 1 | 3,465.1 → 3,391.9 | 71.27 → 69.97 | 9,047 → 8,890 | 14.06 → 14.28 |
+| uniform | 2 | 1,351.9 → 1,313.9 | 78.11 → 75.81 | 5,006 → 4,845 | 25.21 → 26.01 |
+| uniform | 4 | 155.9 → 149.3 | 76.59 → 73.90 | 2,568 → 2,477 | 49.31 → 51.08 |
+| mixed | 1 | 11,740.4 → 11,593.7 | 71.42 → 70.68 | 32,730 → 32,510 | 13.66 → 13.73 |
+| mixed | 2 | 4,064.8 → 4,164.7 | 78.87 → 81.50 | 22,568 → 23,222 | 19.74 → 19.20 |
+| mixed | 4 | 983.1 → 971.3 | 107.30 → 107.00 | 15,817 → 15,871 | 28.10 → 28.01 |
+
+The uniform trace improves 1.6–3.6% in TPS at every batch size; the mixed
+trace moves within ±3%, which is the run-to-run noise seen when re-running
+Phases 1–3. The change is kept because it removes host work from a host-bound
+loop at no correctness risk, not because of a demonstrated speedup.
+
+Relative to Phase 4 static batching, continuous admission is what matters on
+the uniform trace: at batch 4, TTFT P50 is 149 ms and TPS 51.1, because new
+requests join the running batch instead of waiting for it to drain.
+
+**Tried and not adopted: trimming stale left padding.** Rows are left-aligned
+to the longest sequence ever merged, so after that sequence finishes the
+remaining rows keep attending over masked padding columns. A trim that drops
+columns which are padding for every remaining row was implemented, passed the
+tiny-Qwen reference test and the L4 exact-token gate, but fired once in all
+the mixed traces (31 columns): in this workload the long-prompt requests also
+generate the most tokens, so the longest row almost always finishes last. It
+was removed to keep a numerically sensitive path out of the runner; it may pay
+off for traffic where long prompts have short outputs.
+
 ## Known limitations
 
 - Cache rebasing is copy-based and can add overhead when new rows join.
