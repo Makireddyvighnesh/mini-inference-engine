@@ -163,6 +163,65 @@ numerical path. It was rejected as the correctness default. This is why the
 current Phase 3 backend owns a contiguous growable cache and logical capacity;
 fixed physical blocks belong in a separately measured optimization.
 
+## 2026-09-26 full matrix and preallocation experiment
+
+The real-model result above used one measured repetition. The contiguous path
+was re-run over all 9 matrix points, and the recompute control over the 128-
+and 512-token points, with one warm-up and three measured repetitions each
+(commit `7967cdf`; worktree dirty only with unrelated Phase 5 runner edits):
+
+```bash
+.conda-env/bin/python -m minillm_l4.benchmarks.commands.run_kv_cache \
+  --config minillm_l4/configs/workloads/qwen3_fp8_kv_cache.yaml \
+  --workload all --modes contiguous \
+  --output-dir minillm_l4/results/kv_cache_20260926
+.conda-env/bin/python -m minillm_l4.benchmarks.commands.run_kv_cache \
+  --config minillm_l4/configs/workloads/qwen3_fp8_kv_cache.yaml \
+  --workload all --prompt-lengths 128 512 --modes recompute \
+  --output-dir minillm_l4/results/kv_cache_20260926
+```
+
+All 15 points passed the exact-token gate against
+`results/phase1/references_baseline`. The 2,048/128 recompute points were
+skipped: each would take roughly 15 minutes and the trend is already clear.
+
+| Prompt / output | Batch | Cached TPOT P50 (ms) | Recompute TPOT P50 (ms) | Recompute / cached | Cached TPS P50 | Recompute TPS P50 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 128 / 32 | 1 | 72.43 | 71.27 | 0.98× | 13.78 | 14.02 |
+| 128 / 32 | 2 | 71.35 | 82.15 | 1.15× | 27.98 | 24.47 |
+| 128 / 32 | 4 | 71.38 | 119.41 | 1.67× | 55.43 | 33.68 |
+| 512 / 64 | 1 | 72.26 | 117.78 | 1.63× | 13.77 | 8.52 |
+| 512 / 64 | 2 | 72.29 | 221.11 | 3.06× | 27.06 | 9.06 |
+| 512 / 64 | 4 | 72.73 | 451.08 | 6.20× | 51.50 | 8.88 |
+
+Cached TPOT for 2,048/128 was 72.24, 72.60, and 72.63 ms at batch 1, 2, and 4
+(13.39, 25.26, and 45.69 TPS).
+
+The cached step stays at ~72 ms everywhere because it is host-bound (see the
+Phase 1 re-measurement). Recomputation only costs time once the re-processed
+prefix gives the GPU more work than it can hide under that host overhead: at
+128 tokens and batch 1 it is free, and at 512 tokens and batch 4 it is 6.2×
+slower.
+
+**Preallocated in-place cache (tried, not adopted).** `DynamicCache` grows each
+layer with `torch.cat`, so every decode step re-copies the whole K/V history
+in all 36 layers (about 320 MB per sequence at 2,176 tokens). A layer that
+writes into one capacity-sized buffer and returns a view of exactly the valid
+prefix was implemented and produced identical tokens, but a decode-step
+microbenchmark on the L4 showed no gain:
+
+| Shape | `DynamicCache` step P50 | Preallocated step P50 |
+|---|---:|---:|
+| 128 / 32, batch 1 | 70.35 ms | 70.79 ms |
+| 2,048 / 128, batch 1 | 70.60 ms | 71.05 ms |
+| 2,048 / 128, batch 4 | 70.47 ms | 71.15 ms |
+
+The extra copy traffic fits in idle GPU time while the step is host-bound,
+and the Python-level layer adds a little overhead, so the change was
+reverted. It becomes worth revisiting once host overhead is removed (for
+example, with CUDA Graph decode), when KV copy traffic will be on the
+critical path.
+
 ## Known limitations
 
 - The backing tensor growth is still performed by Transformers `DynamicCache`.
@@ -170,8 +229,6 @@ fixed physical blocks belong in a separately measured optimization.
 - A static batch still requires equal prompt and output lengths.
 - No concurrent scheduler, continuous batching, paged blocks, prefix sharing,
   CUDA Graphs, or custom kernels exist yet.
-- The focused real-model result uses one measured repetition; it is a
-  validation checkpoint, not a full production benchmark matrix.
 
 ## Entry conditions for the next phase
 
