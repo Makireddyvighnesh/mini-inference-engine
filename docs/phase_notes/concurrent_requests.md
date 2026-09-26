@@ -123,6 +123,39 @@ Padding differs because arrivals are staggered and dispatch is immediate.
 Only requests available at a scheduling boundary are grouped; arrivals during
 an active batch wait for the next boundary.
 
+### 2026-09-26 correction: the batch-2/4 grouping above was a timing artifact
+
+The table above was produced while the harness took a blocking ~25 ms
+`nvidia-smi` snapshot after starting the run clock (fixed in Phase 0 on
+2026-09-26). Event timestamps from that run show the runner could not
+dispatch until 27 ms, by which time the short (0 ms) and medium (25 ms)
+requests had both arrived and were batched together. The short request's
+217 ms TTFT included those 27 ms of telemetry.
+
+With the fix the runner dispatches at 1.5 ms with only the short request;
+medium and long arrive during that batch and then run together as one padded
+batch. Same command, new output directory (`results/concurrent_repeated_20260926`,
+commit `e77cbcf`, worktree dirty only with unrelated Phase 5 runner edits):
+
+| Max batch | TTFT P50 | TTFT P95 | TPOT P50 | E2E P95 | TPS | Requests/s | Padding | Peak reserved VRAM | GPU P50 | Correctness |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 1 | 2,319.4 ms | 7,105.7 ms | 70.02 ms | 16,004.3 ms | 13.96 | 0.187 | 0.0% | 5.29 GiB | 37% | pass |
+| 2 | 3,265.8 ms | 3,294.1 ms | 73.60 ms | 12,627.1 ms | 17.68 | 0.237 | 35.5% | 5.29 GiB | 67% | pass |
+| 4 | 3,301.1 ms | 3,332.2 ms | 74.11 ms | 12,717.5 ms | 17.54 | 0.235 | 35.5% | 5.29 GiB | 67% | pass |
+
+Corrected interpretation: static batching still raises aggregate throughput
+(+27% TPS and +26% requests/s at batch 2 versus batch 1) and cuts E2E P95 by
+21%, but it does **not** reduce median TTFT on this trace; it raises it from
+2.3 s to 3.3 s. The short request is served alone, and the medium request then
+waits behind it and is padded to the long request's 2,048-token prompt. Batch
+2 and 4 behave identically because at most two requests are ever waiting at a
+scheduling boundary. This head-of-line and padding cost is what continuous
+batching (Phase 5) targets.
+
+The high-utilization stress run below was not re-run: all 12 of its requests
+arrive at t=0, so the snapshot could not change batch grouping and only added
+about 25 ms to TTFTs of 4.7–15 s.
+
 ## High-utilization batch stress run
 
 The larger stress run used the same pinned Qwen3-4B FP8 model and a mixed trace
