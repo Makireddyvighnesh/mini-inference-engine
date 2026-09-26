@@ -25,6 +25,10 @@ from minillm_l4.configs.loader import load_yaml_config
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = PROJECT_ROOT / "configs/workloads/qwen3_fp8_baseline.yaml"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "results/phase1"
+# The canonical token corpus every later phase checks against. Defaulting to a
+# directory under --output-dir let a fresh output directory create its own
+# reference and report a pass without comparing against anything.
+DEFAULT_REFERENCE_DIR = PROJECT_ROOT / "results/phase1/references_baseline"
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-repetitions", type=int, default=None)
     parser.add_argument("--no-gpu-sampling", action="store_true")
     parser.add_argument("--no-system-telemetry", action="store_true")
-    parser.add_argument("--reference-dir", type=Path, default=None)
+    parser.add_argument("--reference-dir", type=Path, default=DEFAULT_REFERENCE_DIR)
     return parser.parse_args()
 
 
@@ -163,11 +167,7 @@ def main() -> None:
             f"No configured prompt lengths match --workload {args.workload!r}"
         )
     output_dir = _project_path(args.output_dir)
-    reference_dir = (
-        _project_path(args.reference_dir)
-        if args.reference_dir is not None
-        else output_dir / "references"
-    )
+    reference_dir = _project_path(args.reference_dir)
     dataset_path = _project_path(str(workload_config["dataset"]))
     count = int(workload_config["count"] if args.count is None else args.count)
     if count <= 0:

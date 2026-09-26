@@ -142,6 +142,52 @@ recorded `cuda_available: true` in its result environment metadata.
 | Correctness | Harness event/metric tests | Exact model output token-ID corpus |
 | GPU evidence | Best-effort/unavailable in sandbox | L4 allocator, utilization, and VRAM measurements |
 
+## 2026-09-26 re-measurement and reference fix
+
+**Reference default.** `run_hf_baseline` defaulted `--reference-dir` to
+`<output-dir>/references`, and `verify_or_write_reference` creates a reference
+when none exists. A run into a fresh output directory therefore wrote its own
+corpus and reported `pass` without comparing against anything. Every later
+phase already checks `results/phase1/references_baseline`; Phase 1 now
+defaults to that canonical corpus too. Pass an empty `--reference-dir`
+explicitly to create a new corpus on purpose. (`results/phase1/references`
+is an older corpus with `phase1-*` request IDs and the same token IDs.)
+
+**Re-run.** The full matrix was re-run on the L4 after the Phase 0 harness
+timing fix, with Git provenance recorded (commit `251b6a2`; worktree dirty
+only with this reference-default change):
+
+```bash
+.conda-env/bin/python -m minillm_l4.benchmarks.commands.run_hf_baseline \
+  --config minillm_l4/configs/workloads/qwen3_fp8_baseline.yaml \
+  --output-dir minillm_l4/results/phase1_20260926
+```
+
+All 9 matrix points passed; 108/108 request outputs (4 requests × 3 measured
+repetitions × 9 points) exactly matched `references_baseline`.
+
+| Prompt / output | Batch | TTFT P50 (ms) orig → new | TPOT P50 (ms) orig → new | E2E P50 (ms) orig → new | Aggregate TPS P50 orig → new | GPU util P50 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 128 / 32 | 1 | 74.0 → 72.9 | 71.76 → 71.47 | 2,299 → 2,290 | 13.87 → 14.00 | 34% |
+| 128 / 32 | 2 | 73.2 → 74.5 | 70.73 → 71.86 | 2,267 → 2,303 | 27.91 → 27.81 | 34% |
+| 128 / 32 | 4 | 94.6 → 96.7 | 70.51 → 72.20 | 2,281 → 2,336 | 54.89 → 54.77 | 34% |
+| 512 / 64 | 1 | 95.7 → 97.2 | 70.38 → 71.24 | 4,530 → 4,585 | 14.09 → 13.97 | 34% |
+| 512 / 64 | 2 | 180.0 → 181.9 | 71.27 → 72.06 | 4,671 → 4,723 | 27.28 → 27.10 | 35% |
+| 512 / 64 | 4 | 387.6 → 391.4 | 71.75 → 71.83 | 4,910 → 4,918 | 51.61 → 52.04 | 38% |
+| 2,048 / 128 | 1 | 406.9 → 406.2 | 71.47 → 70.12 | 9,484 → 9,312 | 13.47 → 13.74 | 38% |
+| 2,048 / 128 | 2 | 920.5 → 918.2 | 72.42 → 70.03 | 10,118 → 9,814 | 25.24 → 26.08 | 43% |
+| 2,048 / 128 | 4 | 1,966.0 → 1,965.2 | 72.49 → 71.71 | 11,180 → 11,074 | 45.59 → 46.23 | 49% |
+
+"orig" is `results/phase1/baseline_*.json`. Every metric is within ±3%; the
+harness timing fix does not move these multi-second runs measurably.
+
+**Interpretation.** TPOT stays at 70–72 ms from batch 1 to 4 and from 128 to
+2,048 context tokens while the GPU is busy only 34–49% of the time. Decode in
+this path is therefore bound by host-side work (Python, Transformers dispatch,
+and kernel launches), not by GPU compute or KV memory traffic. Extra GPU work
+per step is hidden in idle GPU time until that host overhead is removed. This
+is the intended naive baseline and is left unchanged.
+
 ## Known limitations
 
 - The baseline is not a serving scheduler. A static batch runs to completion,
