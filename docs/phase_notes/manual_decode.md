@@ -86,6 +86,41 @@ this is a correctness checkpoint rather than a formal speedup claim.
 | Hugging Face baseline | 4 | 73.970 | 71.759 | 13.871 |
 | Manual decode | 4 | 73.712 | 71.576 | 13.885 |
 
+## 2026-09-26 full matched matrix
+
+The checkpoint above was one cell with one measured repetition. The full
+Phase 1 matrix was run through the manual backend on the L4 with one warm-up
+and three measured repetitions per point, and compared with the same-day
+Phase 1 re-run (`results/phase1_20260926`):
+
+```bash
+.conda-env/bin/python -m minillm_l4.benchmarks.commands.run_manual_decode \
+  --config minillm_l4/configs/workloads/qwen3_fp8_manual.yaml \
+  --output-dir minillm_l4/results/manual_decode_20260926
+```
+
+All 9 points passed; 108/108 outputs exactly matched
+`results/phase1/references_baseline`. Provenance: commit `07fe935`; the
+worktree was dirty only with uncommitted Phase 5 runner edits that the manual
+path does not import.
+
+| Prompt / output | Batch | HF TTFT P50 (ms) | Manual TTFT P50 (ms) | HF TPOT P50 (ms) | Manual TPOT P50 (ms) | HF TPS P50 | Manual TPS P50 | Manual vs HF TPS |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 128 / 32 | 1 | 72.9 | 73.2 | 71.47 | 71.51 | 14.00 | 13.96 | -0.3% |
+| 128 / 32 | 2 | 74.5 | 74.4 | 71.86 | 72.09 | 27.81 | 27.70 | -0.4% |
+| 128 / 32 | 4 | 96.7 | 94.4 | 72.20 | 70.44 | 54.77 | 56.17 | +2.6% |
+| 512 / 64 | 1 | 97.2 | 95.4 | 71.24 | 71.16 | 13.97 | 13.98 | +0.1% |
+| 512 / 64 | 2 | 181.9 | 179.6 | 72.06 | 71.16 | 27.10 | 27.41 | +1.1% |
+| 512 / 64 | 4 | 391.4 | 386.3 | 71.83 | 71.51 | 52.04 | 52.32 | +0.5% |
+| 2,048 / 128 | 1 | 406.2 | 403.3 | 70.12 | 71.52 | 13.74 | 13.49 | -1.8% |
+| 2,048 / 128 | 2 | 918.2 | 898.6 | 70.03 | 72.36 | 26.08 | 25.37 | -2.7% |
+| 2,048 / 128 | 4 | 1,965.2 | 1,933.5 | 71.71 | 72.19 | 46.23 | 46.11 | -0.3% |
+
+The manual loop is at parity with `model.generate()` (every TPS difference
+within ±2.7%, no consistent sign). Both paths spend each step on the same
+Transformers forward, so removing `generate()`'s bookkeeping does not change
+the host-bound ~71 ms step; speedups have to come from the forward itself.
+
 ## Artifacts
 
 - Result: minillm_l4/results/manual_decode/manual_short_b1.json
