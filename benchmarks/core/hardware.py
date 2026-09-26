@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 
@@ -88,6 +89,7 @@ def collect_environment_metadata() -> dict[str, Any]:
         "machine": platform.machine(),
         "git_commit_sha": None,
         "git_commit_status": "unavailable",
+        "git_worktree_dirty": None,
         "torch": {
             "installed": False,
             "version": None,
@@ -117,8 +119,9 @@ def collect_environment_metadata() -> dict[str, Any]:
             metadata["packages"][package_name] = None
 
     try:
+        project_repo = Path(__file__).resolve().parents[2]
         git_result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+            ["git", "-C", str(project_repo), "rev-parse", "HEAD"],
             capture_output=True,
             text=True,
             check=False,
@@ -128,6 +131,14 @@ def collect_environment_metadata() -> dict[str, Any]:
     if git_result is not None and git_result.returncode == 0 and git_result.stdout.strip():
         metadata["git_commit_sha"] = git_result.stdout.strip()
         metadata["git_commit_status"] = "available"
+        status_result = subprocess.run(
+            ["git", "-C", str(project_repo), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if status_result.returncode == 0:
+            metadata["git_worktree_dirty"] = bool(status_result.stdout.strip())
     else:
         metadata["git_commit_status"] = "git metadata unavailable"
     return metadata

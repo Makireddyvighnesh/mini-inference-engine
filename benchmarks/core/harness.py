@@ -290,8 +290,6 @@ class BenchmarkHarness:
         warmup: bool,
         runner_manages_lifecycle: bool = False,
     ) -> dict[str, Any]:
-        run_started_ns = time.perf_counter_ns()
-        run_started_utc = datetime.now(timezone.utc).isoformat()
         sampler = GpuSampler(
             device=workload.device,
             interval_seconds=self.configuration.sample_interval_seconds,
@@ -299,12 +297,16 @@ class BenchmarkHarness:
             include_system_telemetry=self.configuration.collect_system_telemetry,
         )
         sampler.reset_peak_memory()
-        sampler.start(started_ns=run_started_ns)
+        # The before/after snapshots block on nvidia-smi (~25 ms on the L4), so
+        # they stay outside the timed window that arrivals and throughput use.
         gpu_before = (
             sampler.snapshot("before", include_system_telemetry=True)
             if self.configuration.collect_gpu
             else None
         )
+        run_started_ns = time.perf_counter_ns()
+        run_started_utc = datetime.now(timezone.utc).isoformat()
+        sampler.start(started_ns=run_started_ns)
         request_records: list[dict[str, Any]] = []
         all_events: list[EventRecord] = []
         runner_diagnostics: list[dict[str, Any]] = []
@@ -441,13 +443,13 @@ class BenchmarkHarness:
                     }
                 )
 
+        duration_ms = (time.perf_counter_ns() - run_started_ns) / 1_000_000.0
         gpu_after = (
             sampler.snapshot("after", include_system_telemetry=True)
             if self.configuration.collect_gpu
             else None
         )
         gpu_samples = sampler.stop()
-        duration_ms = (time.perf_counter_ns() - run_started_ns) / 1_000_000.0
         request_metrics = [
             _request_metrics_from_record(record["metrics"])
             for record in request_records

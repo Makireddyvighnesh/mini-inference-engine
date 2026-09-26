@@ -226,3 +226,58 @@ def test_disabled_execution_trace_does_not_record_or_synchronize() -> None:
     assert payload["spans"] == []
     assert payload["components"] == {}
     assert payload["counters"] == {}
+def test_environment_records_project_git_revision_when_available() -> None:
+    from pathlib import Path
+
+    from minillm_l4.benchmarks.core.hardware import collect_environment_metadata
+
+    repo = Path(__file__).resolve().parents[1]
+    metadata = collect_environment_metadata()
+    if (repo / ".git").exists():
+        assert isinstance(metadata["git_commit_sha"], str)
+        assert len(metadata["git_commit_sha"]) == 40
+        assert isinstance(metadata["git_worktree_dirty"], bool)
+
+
+def test_blocking_gpu_snapshots_are_outside_the_timed_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import time
+
+    from minillm_l4.benchmarks.core import harness as harness_module
+
+    snapshot_ms = 60.0
+
+    class SlowSnapshotSampler(harness_module.GpuSampler):
+        def snapshot(self, label, *, include_system_telemetry=None):
+            time.sleep(snapshot_ms / 1000.0)
+            return {"label": label}
+
+        def start(self, *, started_ns=None) -> None:
+            self._started_ns = started_ns
+
+        def stop(self):
+            return list(self.samples)
+
+    monkeypatch.setattr(harness_module, "GpuSampler", SlowSnapshotSampler)
+    workload = build_fixed_workload(
+        PromptBucket("tiny", prompt_tokens=2, output_tokens=2),
+        count=1,
+        seed=7,
+    )
+    result = BenchmarkHarness(
+        HarnessConfig(
+            repetitions=1,
+            warmup_repetitions=0,
+            respect_arrival_schedule=True,
+            collect_gpu=True,
+            collect_system_telemetry=False,
+            timer_overhead_iterations=5,
+        )
+    ).run(workload, make_simulated_runner(prefill_ms=0.01, token_ms=0.01))
+
+    run = result.runs[0]
+    assert run["gpu"]["before"] == {"label": "before"}
+    assert run["gpu"]["after"] == {"label": "after"}
+    assert run["duration_ms"] < snapshot_ms
+    assert result.summary["metrics"]["ttft_ms"]["maximum"] < snapshot_ms

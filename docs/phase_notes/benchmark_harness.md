@@ -104,15 +104,56 @@ unavailable rather than reported as zero. `nvidia-smi` is queried on a
 best-effort basis, and the same command will populate hardware fields when the
 runner has a working CUDA/NVML namespace.
 
+## 2026-09-26 corrections
+
+Two harness defects were fixed after Phase 0 was first closed.
+
+**Telemetry inside the timed window.** `run_started_ns` was taken before the
+synchronous `before` GPU snapshot, and the run duration was taken after the
+`after` snapshot and the sampler join. Each snapshot shells out to
+`nvidia-smi`, which costs about 25 ms on the L4 (median of 20 calls). The
+original Phase 0 run could not see the GPU, so the cost was hidden then; on the
+L4 it added about 50 ms to every run. Because scheduled arrivals are offsets
+from `run_started_ns`, arrival-scheduled runs (Phase 4 concurrent, Phase 5
+continuous, and capacity stress) also charged the `before` snapshot to the
+queue delay, TTFT, and E2E latency of the first requests. Both snapshots now
+sit outside the timed window. `test_blocking_gpu_snapshots_are_outside_the_timed_run`
+reproduces the defect with a 60 ms snapshot (120.7 ms run duration before the
+fix).
+
+**Git provenance.** `git rev-parse HEAD` ran in the caller's working
+directory. Commands run from the LLMPerfLab root, which is not a repository,
+so every result recorded `git_commit_sha: null`. The lookup now targets the
+`minillm_l4` repository and also records `git_worktree_dirty`.
+
+The background sampler itself is not a measurable source of error: a
+launch-bound 252-kernel GPU loop had the same P50 and P95 step latency with the
+250 ms sampler on and off (differences below 0.5%, within noise).
+
+Fixture rerun on the L4 (`results/phase0_20260926` before the timing fix,
+`results/phase0_20260926_fixed` after; one warm-up, three repetitions each):
+
+| Workload | TTFT P50 before → after (ms) | TPOT P50 before → after (ms) | Run duration P50 before → after (ms) | Aggregate TPS P50 before → after |
+|---|---:|---:|---:|---:|
+| short | 0.365 → 0.345 | 0.137 → 0.129 | 67.5 → 18.7 | 1,895 → 6,834 |
+| medium | 0.381 → 0.344 | 0.142 → 0.134 | 85.5 → 36.9 | 2,993 → 6,942 |
+| long | 0.334 → 0.340 | 0.144 → 0.134 | 123.9 → 71.1 | 4,133 → 7,197 |
+| mixed | 0.338 → 0.329 | 0.139 → 0.133 | 187.2 → 131.7 | 5,127 → 7,291 |
+
+Per-token latencies are unchanged; run-level throughput was under-reported by
+1.4–3.6× on this millisecond-scale fixture. For multi-second model runs the
+same ~50 ms is a 0.2–2% throughput error, but the TTFT effect on
+arrival-scheduled runs is up to ~25 ms per early request. Results produced
+before this date by Phases 1–5 are re-measured in their own notes.
+
 ## Known limitations
 
 - The Phase 0 fixture runner is not a model benchmark.
 - The harness currently executes requests sequentially; concurrency and
   continuous batching belong to later phases.
-- GPU utilization is coarse `nvidia-smi` telemetry, not a profiler trace.
-- The current workspace has no valid Git repository metadata, so result files
-  record the commit SHA as unavailable. Phase 1 results should be run from a
-  tracked checkout or include an explicit source revision.
+- GPU utilization is `nvidia-smi`'s sampled "kernel active" percentage, not a
+  profiler trace or SM occupancy. It cannot distinguish a busy GPU from one
+  running many tiny launch-bound kernels.
 
 ## Entry conditions for Phase 1
 
