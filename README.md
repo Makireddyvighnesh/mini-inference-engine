@@ -4,34 +4,28 @@ MiniLLM-L4 is the isolated inference-engineering project for one NVIDIA L4.
 It is intentionally kept under this directory so it does not change the
 existing `adaserve/`, `llmperflab/`, `scripts/`, or root benchmark results.
 
-## Current status
+## Phases
 
-- Benchmark harness: complete.
-- Hugging Face baseline: complete.
-- Manual decode loop: complete.
-- Explicit KV-cache lifecycle and no-cache comparison: complete.
-- Concurrent request lifecycle and FIFO static batching: complete.
-- Iteration-level continuous batching: implemented and CPU/tiny-Qwen
-  validated; L4 benchmark pending in a CUDA-enabled runtime.
-- Paged KV allocation: complete. Fixed-size allocation, per-request block
-  tables, controlled out-of-memory behavior, physical K/V storage, dense
-  gather fallback, direct block-table attention, and an optimized-prefill /
-  fused-Triton-paged-decode path are implemented and validated on the L4.
-- Packed ragged prefill: complete for the static-batch path. Prompts are
-  flattened without padding. The exact-token-safe Triton page-walking kernel
-  is the default; fused SDPA is available as an experimental benchmark path.
-- Component tracing: complete for packed eager decode and CUDA Graph decode.
-  `--trace-summary` enables synchronized diagnostic mode; normal performance
-  runs keep GPU work asynchronous so tracing does not distort the headline
-  latency. Diagnostic artifacts contain request preparation, allocator,
-  metadata, model forward, sampling, streaming, output, and cleanup spans
-  with wall and CUDA event timings.
-- Fixed-shape CUDA Graph decode: exact reusable one-graph replay is validated
-  for stable request shapes and IDs; graph capture remains an experimental
-  serving constraint rather than a general scheduler.
+Each phase is benchmarked on the L4 against the same request/event schema and
+must reproduce the Hugging Face reference token IDs exactly before its
+performance numbers count.
+
+| Phase | Topic | Notes |
+|---:|---|---|
+| 0 | Benchmark harness: workloads, request events, timing, percentiles, telemetry | [benchmark harness](docs/phase_notes/benchmark_harness.md) |
+| 1 | Hugging Face `model.generate()` baseline and reference token corpus | [HF baseline](docs/phase_notes/hf_baseline.md) |
+| 2 | Manual prefill/decode loop | [manual decode](docs/phase_notes/manual_decode.md) |
+| 3 | Explicit contiguous KV cache vs full-prefix recomputation | [KV cache](docs/phase_notes/kv_cache.md) |
+| 4 | Request lifecycle and FIFO static batching | [concurrent requests](docs/phase_notes/concurrent_requests.md) |
+| 5 | Iteration-level continuous batching | [continuous batching](docs/phase_notes/continuous_batching.md), [capacity stress](docs/phase_notes/capacity_stress.md) |
+| 6 | Paged KV blocks, direct paged attention, packed ragged prefill, Triton kernels, fixed-shape CUDA Graph decode | [paged KV](docs/phase_notes/paged_kv.md) |
+
+Metric definitions (TTFT, ITL, TPOT, E2E, throughput) are in
+[docs/metric_definitions.md](docs/metric_definitions.md).
+
 - Model: `Qwen/Qwen3-4B-Instruct-2507-FP8`.
 - Snapshot: `8591804019c8b22094c3b5b4454e0edc05dffc98`.
-- Next work: prefix caching.
+- Hardware: one NVIDIA L4 (SM89, 24 GB).
 
 ## What is implemented
 
