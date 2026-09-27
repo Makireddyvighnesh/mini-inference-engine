@@ -20,6 +20,10 @@ performance numbers count.
 | 5 | Iteration-level continuous batching | [continuous batching](docs/phase_notes/continuous_batching.md), [capacity stress](docs/phase_notes/capacity_stress.md) |
 | 6 | Paged KV blocks, direct paged attention, packed ragged prefill, Triton kernels, fixed-shape CUDA Graph decode | [paged KV](docs/phase_notes/paged_kv.md) |
 
+The [decode-step profile](docs/phase_notes/decode_profile.md) shows why
+Transformers decode is host-bound on the L4 and how that shapes the later
+phases.
+
 Metric definitions (TTFT, ITL, TPOT, E2E, throughput) are in
 [docs/metric_definitions.md](docs/metric_definitions.md).
 
