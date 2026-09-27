@@ -1,10 +1,15 @@
 """Profile where one greedy decode step spends its time on the L4.
 
-For each prompt/batch shape this command times plain decode steps without the
-profiler, then records a few steps with ``torch.profiler`` and reports, per
-step: wall time, GPU-busy time (the union of kernel and memcpy intervals), the
-number of GPU operations, and the weight-bandwidth floor. It also writes the
-top CPU operators, the top GPU kernels, and a Chrome/Perfetto trace per shape.
+For each prompt/batch shape this command first times plain decode steps for
+every shape, then records a few steps per shape with ``torch.profiler``. It
+reports, per shape: the unprofiled step time, GPU-busy time per step (the
+union of kernel and memcpy intervals), the number of GPU operations per step,
+and the weight-bandwidth floor. It also writes the top CPU operators, the top
+GPU kernels, and a Chrome/Perfetto trace per shape.
+
+All timing happens before the first profiler session because a finished
+session leaves CUPTI attached and slows every later step (see
+``measure_shapes``).
 
 The decode loop mirrors the manual backend: an explicit attention mask, a
 ``DynamicCache`` carried between steps, and one host read of the next token
@@ -18,7 +23,7 @@ import json
 import statistics
 import time
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from ..core.hardware import collect_environment_metadata
 
@@ -145,27 +150,26 @@ def _kineto_windows(profiler: Any) -> tuple[list[tuple[int, int]], list[tuple[in
     return sorted(steps), gpu
 
 
-def profile_shape(
+def _start_decode(
     model: Any,
     *,
     prompt_tokens: int,
     batch_size: int,
-    args: argparse.Namespace,
-    output_dir: Path,
-) -> dict[str, Any]:
-    import torch
-    from torch.profiler import ProfilerActivity, profile, record_function
+    decode_steps: int,
+    device: str,
+    seed: int,
+) -> Callable[[], None]:
+    """Prefill a random prompt and return a function that runs one decode step."""
 
-    device = torch.device(args.device)
-    generator = torch.Generator(device="cpu").manual_seed(args.seed)
+    import torch
+
+    generator = torch.Generator(device="cpu").manual_seed(seed)
     input_ids = torch.randint(
         100, 20_000, (batch_size, prompt_tokens), generator=generator
     ).to(device)
-    total_steps = args.warmup_steps + args.timed_steps + args.profiled_steps
     attention_mask = torch.ones(
-        (batch_size, prompt_tokens + total_steps + 1), dtype=torch.long, device=device
+        (batch_size, prompt_tokens + decode_steps + 1), dtype=torch.long, device=device
     )
-
     with torch.inference_mode():
         output = model(
             input_ids=input_ids,
@@ -175,10 +179,11 @@ def profile_shape(
         )
         cache = output.past_key_values
         next_token = output.logits[:, -1:].argmax(dim=-1)
-        position = prompt_tokens
+    position = prompt_tokens
 
-        def step() -> None:
-            nonlocal next_token, position
+    def step() -> None:
+        nonlocal next_token, position
+        with torch.inference_mode():
             result = model(
                 input_ids=next_token,
                 attention_mask=attention_mask[:, : position + 1],
@@ -187,23 +192,65 @@ def profile_shape(
                 logits_to_keep=1,
             )
             next_token = result.logits[:, -1:].argmax(dim=-1)
-            position += 1
-            next_token.tolist()  # the runners read each step's tokens on the host
+        position += 1
+        next_token.tolist()  # the runners read each step's tokens on the host
 
-        for _ in range(args.warmup_steps):
-            step()
-        timed_ms: list[float] = []
-        for _ in range(args.timed_steps):
-            started = time.perf_counter()
-            step()
-            timed_ms.append((time.perf_counter() - started) * 1e3)
+    return step
 
-        with profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]
-        ) as profiler:
-            for index in range(args.profiled_steps):
-                with record_function(f"{STEP_MARKER}{index}"):
-                    step()
+
+def time_shape(
+    model: Any,
+    *,
+    prompt_tokens: int,
+    batch_size: int,
+    args: argparse.Namespace,
+) -> list[float]:
+    """Return unprofiled decode-step wall times in milliseconds."""
+
+    step = _start_decode(
+        model,
+        prompt_tokens=prompt_tokens,
+        batch_size=batch_size,
+        decode_steps=args.warmup_steps + args.timed_steps,
+        device=args.device,
+        seed=args.seed,
+    )
+    for _ in range(args.warmup_steps):
+        step()
+    samples: list[float] = []
+    for _ in range(args.timed_steps):
+        started = time.perf_counter()
+        step()
+        samples.append((time.perf_counter() - started) * 1e3)
+    return samples
+
+
+def profile_shape(
+    model: Any,
+    *,
+    prompt_tokens: int,
+    batch_size: int,
+    args: argparse.Namespace,
+    output_dir: Path,
+) -> list[dict[str, float]]:
+    """Profile decode steps, write the trace and tables, return per-step GPU work."""
+
+    from torch.profiler import ProfilerActivity, profile, record_function
+
+    step = _start_decode(
+        model,
+        prompt_tokens=prompt_tokens,
+        batch_size=batch_size,
+        decode_steps=args.warmup_steps + args.profiled_steps,
+        device=args.device,
+        seed=args.seed,
+    )
+    for _ in range(args.warmup_steps):
+        step()
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as profiler:
+        for index in range(args.profiled_steps):
+            with record_function(f"{STEP_MARKER}{index}"):
+                step()
 
     tag = f"p{prompt_tokens}_b{batch_size}"
     profiler.export_chrome_trace(str(output_dir / f"trace_{tag}.json"))
@@ -214,24 +261,55 @@ def profile_shape(
     (output_dir / f"gpu_kernels_{tag}.txt").write_text(
         averages.table(sort_by="self_device_time_total", row_limit=20), encoding="utf-8"
     )
-
     steps, gpu_intervals = _kineto_windows(profiler)
-    per_step = attribute_gpu_work(steps, gpu_intervals)[1:]  # drop profiler warm-up
+    return attribute_gpu_work(steps, gpu_intervals)[1:]  # drop profiler warm-up
+
+
+def summarize_shape(
+    prompt_tokens: int,
+    batch_size: int,
+    timed_ms: Sequence[float],
+    profiled_steps: Sequence[dict[str, float]],
+) -> dict[str, Any]:
     step_ms = statistics.median(timed_ms)
-    gpu_busy_ms = statistics.median(row["gpu_busy_ms"] for row in per_step)
+    gpu_busy_ms = statistics.median(row["gpu_busy_ms"] for row in profiled_steps)
     return {
         "prompt_tokens": prompt_tokens,
         "batch_size": batch_size,
         "step_ms_p50": step_ms,
-        "step_ms_samples": timed_ms,
-        "profiled_step_ms_p50": statistics.median(row["wall_ms"] for row in per_step),
+        "step_ms_samples": list(timed_ms),
+        "profiled_step_ms_p50": statistics.median(
+            row["wall_ms"] for row in profiled_steps
+        ),
         "gpu_busy_ms_p50": gpu_busy_ms,
         "gpu_busy_fraction": gpu_busy_ms / step_ms,
         "gpu_operations_per_step": statistics.median(
-            row["gpu_operations"] for row in per_step
+            row["gpu_operations"] for row in profiled_steps
         ),
-        "profiled_steps": per_step,
+        "profiled_steps": list(profiled_steps),
     }
+
+
+def measure_shapes(
+    shapes: Sequence[tuple[int, int]],
+    *,
+    time_fn: Callable[[int, int], Sequence[float]],
+    profile_fn: Callable[[int, int], Sequence[dict[str, float]]],
+) -> list[dict[str, Any]]:
+    """Time every shape before profiling any of them.
+
+    In this PyTorch build a finished ``torch.profiler`` session leaves CUPTI
+    attached (Kineto only tears it down when ``TEARDOWN_CUPTI=1``), which adds
+    about 10 ms to every later decode step in the process. Timing all shapes
+    first keeps the unprofiled step times independent of profiler state.
+    """
+
+    timed = [time_fn(prompt, batch) for prompt, batch in shapes]
+    profiled = [profile_fn(prompt, batch) for prompt, batch in shapes]
+    return [
+        summarize_shape(prompt, batch, timed_ms, steps)
+        for (prompt, batch), timed_ms, steps in zip(shapes, timed, profiled, strict=True)
+    ]
 
 
 def main() -> None:
@@ -255,25 +333,34 @@ def main() -> None:
         flush=True,
     )
 
-    shapes: list[dict[str, Any]] = []
-    for prompt_tokens, batch_size in args.shapes:
-        row = profile_shape(
+    def timed(prompt_tokens: int, batch_size: int) -> list[float]:
+        samples = time_shape(
+            bundle.model, prompt_tokens=prompt_tokens, batch_size=batch_size, args=args
+        )
+        torch.cuda.empty_cache()
+        return samples
+
+    def profiled(prompt_tokens: int, batch_size: int) -> list[dict[str, float]]:
+        steps = profile_shape(
             bundle.model,
             prompt_tokens=prompt_tokens,
             batch_size=batch_size,
             args=args,
             output_dir=output_dir,
         )
-        shapes.append(row)
+        torch.cuda.empty_cache()
+        return steps
+
+    shapes = measure_shapes(args.shapes, time_fn=timed, profile_fn=profiled)
+    for row in shapes:
         print(
-            f"prompt={prompt_tokens:<5} batch={batch_size:<2} "
+            f"prompt={row['prompt_tokens']:<5} batch={row['batch_size']:<2} "
             f"step_P50={row['step_ms_p50']:.2f} ms "
             f"gpu_busy_P50={row['gpu_busy_ms_p50']:.2f} ms "
             f"({100 * row['gpu_busy_fraction']:.0f}%) "
             f"gpu_ops/step={row['gpu_operations_per_step']:.0f}",
             flush=True,
         )
-        torch.cuda.empty_cache()
 
     summary = {
         "schema_version": 1,
@@ -286,6 +373,7 @@ def main() -> None:
             "profiled_steps": args.profiled_steps,
             "fp8_kernel_path": args.fp8_kernel_path,
             "seed": args.seed,
+            "timing_before_profiling": True,
             "prompt_source": "uniform random token IDs in [100, 20000)",
         },
         "weight_bytes": weight_bytes,
