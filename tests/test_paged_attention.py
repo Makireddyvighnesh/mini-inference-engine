@@ -147,7 +147,10 @@ def test_long_context_split_count_uses_fixed_graph_buckets(
         (2048, 4, 4),
         (2048, 8, 1),
         (3072, 1, 8),
-        (3072, 8, 8),
+        (3072, 4, 8),
+        (3072, 8, 1),
+        (4096, 8, 1),
+        (4097, 8, 8),
     ],
 )
 def test_decode_split_count_uses_profiled_batch_shape(
@@ -251,3 +254,43 @@ def test_triton_decode_matches_torch_paged_attention(
         decode_block_tokens=block_tokens,
     )
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not triton_is_available(), reason="requires CUDA and Triton")
+@pytest.mark.parametrize("split_count", [1, 4])
+def test_triton_decode_is_at_least_as_accurate_as_torch_with_large_keys(split_count: int) -> None:
+    """Qwen3 layer-0 keys reach ~290; BF16 Q*K products lost precision there."""
+
+    torch.manual_seed(11)
+    device = torch.device("cuda")
+    tokens = 129
+    allocator = PagedKvAllocator(num_blocks=16, block_size=16)
+    cache = PagedKvCache(
+        allocator, num_layers=1, num_kv_heads=2, head_dim=128,
+        dtype=torch.bfloat16, device=device,
+    )
+    allocator.allocate("a", token_count=tokens)
+    keys = torch.randn((1, 2, tokens, 128), device=device) * 4
+    keys[..., 7] = 280.0 * torch.sign(torch.randn((1, 2, tokens), device=device))
+    keys = keys.to(torch.bfloat16)
+    values = torch.randn_like(keys)
+    cache.write_layer_segment("a", 0, keys, values, start_token=0)
+    query = (torch.randn((1, 4, 1, 128), device=device) * 0.6).to(torch.bfloat16)
+
+    exact = torch.nn.functional.scaled_dot_product_attention(
+        query.double(), keys.double(), values.double(), enable_gqa=True
+    )
+    common = dict(
+        layer_index=0, query_start_positions=(tokens - 1,), num_key_value_groups=2
+    )
+    reference = paged_attention(query, cache, ("a",), backend="torch", **common)
+    triton_output = paged_attention(
+        query, cache, ("a",), backend="triton",
+        block_tables=cache.block_table_tensor(("a",), device=device).to(torch.int32),
+        sequence_lengths=torch.tensor((tokens,), dtype=torch.int32, device=device),
+        decode_split_count=split_count, decode_max_sequence_length=tokens,
+        **common,
+    )
+    reference_error = (reference.double() - exact).abs().max().item()
+    triton_error = (triton_output.double() - exact).abs().max().item()
+    assert triton_error <= reference_error + 1e-3

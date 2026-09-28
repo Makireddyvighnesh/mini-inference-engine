@@ -40,10 +40,10 @@ cache path.
   loads, grouped-query head mapping, QK reduction, online softmax, and weighted
   value accumulation into one GPU launch per model layer.
 - The Triton decode and packed-prefill kernels use explicit compute tiles.
-  Decode uses a fixed 16-token reduction tile while storage page size remains
-  independently configurable. Keeping those dimensions separate stabilizes
-  online-softmax reduction order and keeps greedy-token validation stable when
-  physical block sizes are swept.
+  Decode selects a 16-token reduction tile below 1,024 context tokens and a
+  64-token tile at or above 1,024, independently of physical KV page size.
+  Keeping those dimensions separate stabilizes online-softmax reduction order
+  and keeps greedy-token validation stable when physical block sizes are swept.
 - `sm89_fp8_linear` replaces the generic Transformers projection dispatcher
   on the L4. It fuses dynamic per-block activation scaling, FP8 conversion,
   block-scaled matrix multiplication, and FP32 accumulation. Unsupported
@@ -410,9 +410,10 @@ more than 99% of the request window. The original paged-attention kernel used a
 16-token reduction tile and four split-KV partitions. A dedicated microbenchmark
 then swept reduction tiles 8/16/32/64, split counts 1/2/4/8, and batch sizes
 1/2/4/8. The accepted L4 configuration uses a 64-token tile for contexts of at
-least 1,024 tokens and a batch-aware split policy. Contexts above 2,048 tokens
-use eight splits. The graph records the selected tile and split count in every
-result artifact.
+least 1,024 tokens and a batch-aware split policy. In the 2,049–4,096-token
+range, batch 8 uses one split while smaller tested batches use eight; contexts
+above 4,096 use eight splits. The graph records the selected tile and split
+count in every result artifact.
 
 The GQA-reuse hypothesis was also implemented and tested. It computes all four
 Qwen query heads sharing one KV head in one Triton program, but the larger live
@@ -431,6 +432,15 @@ CUDA Graph replay fell from about 3.25 seconds to 2.47 seconds for 63 decode
 steps. At 4,608/batch-8, it fell to 1.48 seconds for 31 decode steps. The tuned
 artifacts are under `results/tuned_attention_20260920/`, and the reusable sweep
 command is `benchmarks.commands.benchmark_paged_attention`.
+
+A matched follow-up isolated split count at 3,072 prompt tokens, 64 output
+tokens, batch 8, with one warm-up and two measured repetitions. Reducing the
+decode split count from eight to one lowered TPOT P50 from 39.46 ms to 38.80 ms
+(1.7%) and raised decode TPS P50 from 25.74 to 26.18 (1.7%). TTFT stayed about
+5.8 s because this decode-only change does not accelerate prefill. Both runs
+passed exact greedy-token checks. Results are in
+`results/decode_tune_batch8_eight_split/` and
+`results/decode_tune_batch8_one_split/`.
 
 TTFT did not improve: prefill remained about 5.8 seconds and 9.2 seconds in the
 two batch-8 cases. A clean 3,072/batch-8 experiment rejected multi-output FP8
@@ -473,6 +483,185 @@ submits the many small one-token operations as a single captured execution
 schedule. Diagnostic tracing synchronizes around these stages, so its latency
 is intentionally separate from the clean asynchronous table above. The trace
 artifact is under `results/trace_graph_packed/`.
+
+## 2026-09-28 correctness investigation and memory quantification
+
+### Definition of done
+
+| Criterion | Evidence | Status |
+|---|---|---|
+| Randomized allocation/free tests pass | `tests/test_paged_kv_cache.py` (randomized allocate/append/release, no duplicate block IDs) | Done |
+| Blocks never leak or alias incorrectly | same tests; every sweep run releases all blocks | Done |
+| Out-of-memory behavior is controlled | OOM rejection without partial allocation (tests); admission guard in the capacity experiment | Done |
+| Generation remains correct | After the Triton precision fix: all 9 contiguous points, 24/36 paged hybrid points (every 512- and 2,048-token point), and 9/9 packed points pass exact-token. The 12 failing points are all 128/32 hybrid, on one request and one token; see the open case below | Open (one case) |
+| Memory-utilization effect is quantified | full L4 sweep below plus the allocator capacity experiment | Done |
+
+### The prefix-002 mismatch is an exact tie, not a paged bug
+
+The Phase 7 continuous trace reported that paged decode differs from dense
+manual decoding for request `prefix-002` (528-token prompt, 0% reuse) at its
+fourth generated token, even with one active request and the PyTorch paged
+backend. It was reproduced with Phase 6 code only (dense SDPA prefill, pages
+built by `_make_paged_cache`, direct paged decode; `sm89` projections as in the
+trace) and each path's step-3 logits were compared for the two competing
+tokens:
+
+| Path | Logit " photos" (7249) | Logit " creating" (6825) | Continuation |
+|---|---:|---:|---|
+| Dense bf16 SDPA (the reference path) | 9.5000 | 9.5000 | " the process of creating a new version of" |
+| Paged, PyTorch backend | 9.5000 | 9.3125 | " the process of photosynthesis works in plants" |
+| Paged, Triton backend | 9.3125 | 9.3750 | " the process of creating a new version of" |
+| Dense with fp64 attention | 9.8750 | 9.4375 | " the process of photosynthesis works in plants" |
+
+In the reference path the two logits are exactly equal in BF16, so its choice
+is made by `argmax` tie-breaking (the lower token ID wins). The paged paths
+move those logits by at most 0.19, less than two BF16 steps at this magnitude,
+and either choice is a fluent continuation of "Explain how". The most precise
+computation (attention in FP64) prefers " photos" by 0.44, as the PyTorch
+paged path does. Once the tokens are the same, the paths agree again: teacher-
+forced with identical inputs, every path continues " photos" with
+"ynthesis".
+
+Two measurement mistakes were made and corrected while establishing this. A
+first script printed each path's chosen token from `topk`, which orders an
+exact tie arbitrarily, while the model was fed the `argmax` token; this made a
+dense run that had been fed " creating" look as if it had been fed " photos"
+and produced a spurious "33-logit" divergence at the next step. The analysis
+above uses the `argmax` token throughout. Per-layer comparisons (dense vs paged
+hidden states, flash vs fp64 attention on captured inputs, six repeated runs,
+and the autotuned FP8 kernel's chosen configurations across four processes)
+found no kernel error and no run-to-run nondeterminism.
+
+### Triton decode precision fix
+
+The 128/32 batch-2 hybrid point failed exact-token on `baseline-short-000`
+(output token 25: " two" instead of " three"), while batch 1 and 4 passed. With
+identical inputs, the Triton decode kernel raised the " two" logit by about 7
+relative to the PyTorch paged path. A kernel-level comparison against FP64
+attention on real Qwen3 q/k/v from all 36 layers showed the Triton kernel was
+2–5× less accurate than the PyTorch paged reference (worst error 0.69 vs 0.15),
+identically at batch 1 and 2, so this was precision, not batch indexing.
+
+The kernels computed `tl.sum(keys * query)` with both operands in BF16, so every
+Q·K product was rounded to BF16 before the sum; Qwen3's layer-0 keys reach
+about 290. All four decode kernels (plain, split-KV, and their GQA variants)
+and the packed-prefill kernel now upcast Q and K to FP32 before multiplying.
+
+| Kernel | Worst error vs FP64 over 36 real layers |
+|---|---:|
+| Triton decode, BF16 products (before) | 0.690 |
+| **Triton decode, FP32 products (after)** | **0.059** |
+| PyTorch paged reference (scores rounded to BF16 by design) | 0.148 |
+
+`test_triton_decode_is_at_least_as_accurate_as_torch_with_large_keys` fails
+on the previous kernel and passes on the fixed one. The change costs nothing
+measurable: hybrid TPOT is unchanged within noise, and packed-prefill TTFT
+moved 59 → 61 ms, 226 → 232 ms, and 2,546 → 2,585 ms (128/512/2,048 tokens,
+batch 1). It also fixes a packed-path failure: on the previous kernel the
+128/32 batch-1 packed point failed exact-token; after the fix all nine packed
+points pass.
+
+### Full L4 sweep after the fix
+
+```bash
+.conda-env/bin/python -m minillm_l4.benchmarks.commands.run_paged_kv \
+  --config minillm_l4/configs/workloads/qwen3_fp8_paged.yaml \
+  --workload all --output-dir minillm_l4/results/paged_kv_20260928_fp32qk
+.conda-env/bin/python -m minillm_l4.benchmarks.commands.run_paged_kv \
+  --config minillm_l4/configs/workloads/qwen3_fp8_paged.yaml \
+  --workload all --modes paged_packed --block-sizes 16 \
+  --output-dir minillm_l4/results/paged_packed_20260928_fp32qk
+```
+
+One warm-up and three measured repetitions per point, `sm89` projections,
+32,768 physical token slots. Provenance: commit `86d5855` with this change and
+unrelated uncommitted Phase 7 prefix-sharing bookkeeping in the worktree
+(allocator reference counts and write guards that are inactive without shared
+blocks).
+
+| Shape | Batch | Contiguous TPOT | Paged TPOT (b8–b64) | Contiguous TTFT | Paged TTFT b8 / b64 | Paged exact-token |
+|---|---:|---:|---:|---:|---:|---|
+| 128/32 | 1 | 55.1 ms | 58.4–59.2 ms | 56 ms | 68 / 57 ms | fail (4/4) |
+| 128/32 | 2 | 55.9 ms | 58.3–58.5 ms | 59 ms | 81 / 60 ms | fail (4/4) |
+| 128/32 | 4 | 56.2 ms | 58.4–58.8 ms | 88 ms | 127 / 91 ms | fail (4/4) |
+| 512/64 | 1 | 56.1 ms | 58.1–59.1 ms | 88 ms | 128 / 92 ms | pass |
+| 512/64 | 2 | 56.2 ms | 58.7–59.6 ms | 182 ms | 268 / 188 ms | pass |
+| 512/64 | 4 | 56.7 ms | 59.2–60.0 ms | 392 ms | 576 / 406 ms | pass |
+| 2,048/128 | 1 | 55.5 ms | 60.9–61.0 ms | 408 ms | 592 / 417 ms | pass |
+| 2,048/128 | 2 | 56.1 ms | 60.4–61.0 ms | 899 ms | 1,293 / 938 ms | pass |
+| 2,048/128 | 4 | 55.9 ms | 61.4–62.3 ms | 1,884 ms | 2,683 / 1,983 ms | pass |
+
+Paged decode is 4–11% slower than contiguous per token (decode is host-bound,
+and the paged path adds per-layer host work). Paged TTFT includes copying the
+prompt KV into pages; small blocks cost the most (up to +45% at block 8),
+while block 64 is within 2–5% of contiguous. Internal fragmentation is
+0.05–0.62% at blocks 8–32 and 17.2% only for 159-token sequences at block 64.
+The paged pool is preallocated (32,768 slots × 144 KiB per token = 4.5 GiB),
+so peak VRAM is not compared across modes; contiguous KV holds exactly the
+live tokens (for example 8,700 tokens ≈ 1.2 GiB at 2,048/128 batch 4).
+
+### Open case: `baseline-short-003`, output token 16
+
+After the fix, every hybrid 128/32 point fails on the same request and token
+at every batch and block size: the reference emits " two" and the paged path
+emits " explicit". Unlike prefix-002 this is not a reference tie:
+
+| Path (teacher-forced to step 16) | " two" | " explicit" | Picks |
+|---|---:|---:|---|
+| Dense BF16 (reference) | 22.13 | 20.25 | two (by 1.9) |
+| Dense with FP64 attention | 21.75 | 18.63 | two (by 3.1) |
+| Paged, PyTorch backend | 21.88 | 21.50 | two (by 0.4) |
+| Paged, Triton backend | 21.88 | 22.00 | explicit (by 0.1) |
+
+Both paged backends raise " explicit" by 1.3–1.8 logits relative to dense decode
+at this step, while the higher-precision reference agrees with the BF16
+reference. The packed path, which prefills with the project's Triton kernel
+instead of BF16 flash SDPA, passes this request. The root cause is not yet
+identified, so the "generation remains correct" criterion is recorded as open
+for this case rather than waived.
+
+### Allocator capacity under a fixed budget
+
+`run_kv_capacity` is a CPU-only experiment on the real `PagedKvAllocator`
+with the Phase 6 request shapes (128/32, 512/64, 2,048/128; final lengths 159,
+575, and 2,175 KV positions) and a 32,768-slot budget:
+
+```bash
+.conda-env/bin/python -m minillm_l4.benchmarks.commands.run_kv_capacity \
+  --output minillm_l4/results/kv_capacity_20260927/kv_capacity.json
+```
+
+Static capacity, admitting a seeded mix of requests at their final length
+until the first one does not fit:
+
+| Policy | Requests admitted | Internal waste | Budget holding real tokens |
+|---|---:|---:|---:|
+| Contiguous, reserve each request's final length | 25 | 0% | 94.8% |
+| Contiguous, reserve the longest length (2,175) for every request | 15 | 44.3% | 55.4% |
+| Paged, block 8 / 16 / 32 | 25 | 0.08% | 94.8% |
+| Paged, block 64 | 25 | 0.69% | 94.8% |
+
+Churn, 600 requests in FIFO order, each growing one token per decode step and
+releasing on completion. Paged admission holds only tokens that exist but
+admits a request only if every active request can still grow to its final
+length, so nothing is preempted. Contiguous admission must place each request's
+full reservation in one first-fit region:
+
+| Policy | Decode steps | Mean active requests | Budget holding real tokens | Steps head-of-line blocked by external fragmentation |
+|---|---:|---:|---:|---:|
+| Contiguous, longest-length reservation | 3,040 | 14.74 | 62.2% | 0 |
+| Contiguous, final-length reservation, first fit | 2,176 | 20.59 | 86.9% | 1,280 (59%) |
+| Paged, any block size 8–64 | 2,080 | 21.54 | 90.9% | 0 |
+
+Paging fits 1.67× more requests than reserving the longest length per request
+and finishes the churn backlog 1.46× faster. Against contiguous reservation of
+exact final lengths, paging's advantage is removing external fragmentation:
+the contiguous allocator had enough total free space but no single large
+enough hole in 59% of steps, which cost 4.4% in completion time. Larger blocks
+only change reserved (not used) space: 91.1% of the budget at block 8 versus
+93.1% at block 64. The gain over exact contiguous reservation is modest here
+because admission guarantees completion; engines that overcommit and preempt
+(as vLLM does) recover more.
 
 ## Known limitations
 

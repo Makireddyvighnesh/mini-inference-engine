@@ -105,7 +105,9 @@ if triton is not None:
                 mask=token_mask[:, None] & dim_mask[None, :],
                 other=0.0,
             )
-            scores = tl.sum(keys * query[None, :], axis=1) * scale
+            # Multiply in FP32: BF16 products lose precision when key
+            # magnitudes reach the hundreds, as Qwen3 layer-0 keys do.
+            scores = tl.sum(keys.to(tl.float32) * query[None, :].to(tl.float32), axis=1) * scale
             scores = tl.where(token_mask, scores, -float("inf"))
 
             tile_max = tl.max(scores, axis=0)

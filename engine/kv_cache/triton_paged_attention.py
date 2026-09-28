@@ -112,8 +112,10 @@ if triton is not None:
                 mask=token_mask[:, None] & dim_mask[None, :],
                 other=0.0,
             )
+            # Multiply in FP32: BF16 products lose precision when key
+            # magnitudes reach the hundreds, as Qwen3 layer-0 keys do.
             scores = tl.sum(
-                query[:, None, :] * keys[None, :, :],
+                query[:, None, :].to(tl.float32) * keys[None, :, :].to(tl.float32),
                 axis=2,
             ) * scale
             scores = tl.where(token_mask[None, :], scores, -float("inf"))
@@ -237,7 +239,11 @@ if triton is not None:
                 mask=token_mask[:, None] & dim_mask[None, :],
                 other=0.0,
             )
-            scores = tl.sum(keys * query[None, :], axis=1) * scale
+            # Multiply in FP32: BF16 products lose precision when key
+            # magnitudes reach the hundreds, as Qwen3 layer-0 keys do.
+            scores = tl.sum(
+                keys.to(tl.float32) * query[None, :].to(tl.float32), axis=1
+            ) * scale
             scores = tl.where(token_mask, scores, -float("inf"))
 
             block_max = tl.max(scores, axis=0)
@@ -375,8 +381,10 @@ if triton is not None:
                 mask=token_mask[:, None] & dim_mask[None, :],
                 other=0.0,
             )
+            # Multiply in FP32: BF16 products lose precision when key
+            # magnitudes reach the hundreds, as Qwen3 layer-0 keys do.
             scores = tl.sum(
-                query[:, None, :] * keys[None, :, :],
+                query[:, None, :].to(tl.float32) * keys[None, :, :].to(tl.float32),
                 axis=2,
             ) * scale
             scores = tl.where(token_mask[None, :], scores, -float("inf"))
@@ -534,7 +542,11 @@ if triton is not None:
                 mask=token_mask[:, None] & dim_mask[None, :],
                 other=0.0,
             )
-            scores = tl.sum(keys * query[None, :], axis=1) * scale
+            # Multiply in FP32: BF16 products lose precision when key
+            # magnitudes reach the hundreds, as Qwen3 layer-0 keys do.
+            scores = tl.sum(
+                keys.to(tl.float32) * query[None, :].to(tl.float32), axis=1
+            ) * scale
             scores = tl.where(token_mask, scores, -float("inf"))
 
             block_max = tl.max(scores, axis=0)
@@ -699,29 +711,32 @@ def select_decode_split_count(
 ) -> int:
     """Choose the measured L4 split-KV shape for a fixed decode graph.
 
-    Small batches need more sequence splits to expose enough parallel work;
-    batch eight already supplies enough independent heads at medium context.
-    Long contexts benefit from eight splits at every tested batch size.
+    Small batches need more sequence splits to expose enough parallel work.
+    At batch eight, the independent request/head rows are sufficient through
+    4,096 tokens, and split/reduction overhead outweighs the extra parallelism.
+    Longer contexts use eight splits at every tested batch size.
     ``batch_size=None`` preserves the conservative legacy buckets for callers
     that do not know their final graph shape.
     """
 
     length = int(max_sequence_length)
+    batch = None if batch_size is None else int(batch_size)
+    if batch is not None and batch < 1:
+        raise ValueError("batch_size must be positive")
     if length < 1024:
         return 1
     if length <= 2048:
-        if batch_size is not None:
-            batch = int(batch_size)
-            if batch < 1:
-                raise ValueError("batch_size must be positive")
+        if batch is not None:
             if batch <= 2:
                 return 8
             if batch <= 4:
                 return 4
             return 1
         return 2
-    if length <= 4096 and batch_size is None:
-        return 4
+    if length <= 4096:
+        if batch is None:
+            return 4
+        return 1 if batch >= 8 else 8
     return 8
 
 
