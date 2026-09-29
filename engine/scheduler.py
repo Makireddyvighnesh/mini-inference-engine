@@ -145,6 +145,18 @@ class ContinuousBatchScheduler:
         self._ready = [item for item in self._ready if item.request_id not in request_ids]
         return cancelled
 
+    def defer_front(self, items: Iterable[ScheduledRequest]) -> None:
+        """Put capacity-blocked work back ahead of later arrivals, preserving FIFO."""
+
+        deferred = list(items)
+        if len({item.request_id for item in deferred}) != len(deferred):
+            raise ValueError("deferred request IDs must be unique")
+        existing = {item.request_id for item in self._ready}
+        if any(item.request_id in existing for item in deferred):
+            raise ValueError("a deferred request is already ready")
+        self._ready[:0] = deferred
+        self.maximum_queue_depth = max(self.maximum_queue_depth, len(self._ready))
+
     def should_wait_for_batch(self, now_ms: float, *, active_count: int) -> bool:
         """Return whether an initial batching window should remain open.
 

@@ -19,6 +19,7 @@ performance numbers count.
 | 4 | Request lifecycle and FIFO static batching | [concurrent requests](docs/phase_notes/concurrent_requests.md) |
 | 5 | Iteration-level continuous batching | [continuous batching](docs/phase_notes/continuous_batching.md), [capacity stress](docs/phase_notes/capacity_stress.md) |
 | 6 | Paged KV blocks, direct paged attention, packed ragged prefill, Triton kernels, fixed-shape CUDA Graph decode | [paged KV](docs/phase_notes/paged_kv.md) |
+| 7 | Exact-token prefix caching: shared immutable blocks, reference counts, LRU eviction, continuous admission | [prefix cache](docs/phase_notes/prefix_cache.md) |
 
 The [decode-step profile](docs/phase_notes/decode_profile.md) shows why
 Transformers decode is host-bound on the L4 and how that shapes the later
@@ -241,6 +242,9 @@ cache rebasing, tests, and L4 reproduction command.
 The [paged-KV note](docs/phase_notes/paged_kv.md) documents fixed block
 ownership, fragmentation accounting, the dense gather correctness path, and
 the Phase 6 benchmark command.
+The [prefix-cache note](docs/phase_notes/prefix_cache.md) documents both
+the batch-1 reference and continuous integration, exact-token gates, L4
+baseline results, and current limits.
 
 Run the manual decoder against the Phase 1 reference corpus:
 

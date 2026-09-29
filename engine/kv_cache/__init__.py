@@ -13,6 +13,7 @@ from .paged import (
     PagedKvStateError,
 )
 from .paged_attention import packed_paged_attention, paged_attention
+from .prefix import PagedPrefixCache
 from .qwen3_paged import PagedQwen3Attention, install_paged_qwen3_attention
 from .triton_packed_attention import (
     can_use_triton_packed_prefill,
@@ -39,6 +40,7 @@ __all__ = [
     "PagedKvOutOfMemoryError",
     "PagedKvShapeError",
     "PagedKvStateError",
+    "PagedPrefixCache",
     "PagedQwen3Attention",
     "install_paged_qwen3_attention",
     "paged_attention",

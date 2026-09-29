@@ -129,6 +129,8 @@ class PagedKvAllocator:
         )
         self._free_blocks = list(range(self._num_blocks))
         heapq.heapify(self._free_blocks)
+        self._block_refcounts = [0] * self._num_blocks
+        self._shared_block_count = 0
         self._allocations: dict[str, _MutableAllocation] = {}
 
     @property
@@ -166,6 +168,16 @@ class PagedKvAllocator:
     @property
     def free_block_ids(self) -> tuple[int, ...]:
         return tuple(sorted(self._free_blocks))
+
+    def block_refcount(self, block_id: int) -> int:
+        index = int(block_id)
+        if index < 0 or index >= self._num_blocks:
+            raise IndexError(f"block_id {index} is outside the block pool")
+        return self._block_refcounts[index]
+
+    @property
+    def shared_block_count(self) -> int:
+        return self._shared_block_count
 
     def _normalize_sequence_id(self, sequence_id: str) -> str:
         normalized = str(sequence_id)
@@ -207,7 +219,22 @@ class PagedKvAllocator:
                 f"need {count} additional KV blocks but only "
                 f"{self.free_block_count} are free"
             )
-        return [heapq.heappop(self._free_blocks) for _ in range(count)]
+        blocks = [heapq.heappop(self._free_blocks) for _ in range(count)]
+        for block_id in blocks:
+            assert self._block_refcounts[block_id] == 0
+            self._block_refcounts[block_id] = 1
+        return blocks
+
+    def _drop_blocks(self, block_ids: Sequence[int]) -> None:
+        for block_id in block_ids:
+            count = self._block_refcounts[block_id]
+            if count < 1:
+                raise PagedKvStateError(f"block {block_id} is already free")
+            self._block_refcounts[block_id] = count - 1
+            if count == 2:
+                self._shared_block_count -= 1
+            if count == 1:
+                heapq.heappush(self._free_blocks, block_id)
 
     def _view(self, allocation: _MutableAllocation) -> PagedBlockTable:
         return PagedBlockTable(
@@ -229,6 +256,37 @@ class PagedKvAllocator:
         )
         block_ids = self._take_blocks(self._required_blocks(normalized_tokens))
         allocation = _MutableAllocation(normalized, block_ids, normalized_tokens)
+        self._allocations[normalized] = allocation
+        return self._view(allocation)
+
+    def share_prefix(
+        self,
+        source_sequence_id: str,
+        sequence_id: str,
+        token_count: int,
+    ) -> PagedBlockTable:
+        """Create a sequence that references complete, immutable source blocks.
+
+        The caller must have finished writing every shared block. Appending to
+        the new sequence starts at a fresh block boundary; in-place writes to
+        shared blocks are rejected by the cache's checked write methods.
+        """
+
+        source = self._require_sequence(source_sequence_id)
+        normalized = self._normalize_sequence_id(sequence_id)
+        if normalized in self._allocations:
+            raise PagedKvStateError(f"sequence {normalized!r} is already allocated")
+        count = self._validate_token_count(token_count, name="token_count")
+        if count < 1 or count % self._block_size:
+            raise ValueError("shared prefix must contain complete KV blocks")
+        if count > source.token_count:
+            raise ValueError("shared prefix exceeds source sequence length")
+        block_ids = list(source.block_ids[: count // self._block_size])
+        for block_id in block_ids:
+            if self._block_refcounts[block_id] == 1:
+                self._shared_block_count += 1
+            self._block_refcounts[block_id] += 1
+        allocation = _MutableAllocation(normalized, block_ids, count)
         self._allocations[normalized] = allocation
         return self._view(allocation)
 
@@ -324,8 +382,7 @@ class PagedKvAllocator:
         released = allocation.block_ids[required_blocks:]
         allocation.block_ids = allocation.block_ids[:required_blocks]
         allocation.token_count = normalized_tokens
-        for block_id in released:
-            heapq.heappush(self._free_blocks, block_id)
+        self._drop_blocks(released)
         return self._view(allocation)
 
     def release(self, sequence_id: str) -> PagedBlockTable:
@@ -339,8 +396,7 @@ class PagedKvAllocator:
                 f"sequence {normalized!r} has no active block table"
             ) from error
         table = self._view(allocation)
-        for block_id in allocation.block_ids:
-            heapq.heappush(self._free_blocks, block_id)
+        self._drop_blocks(allocation.block_ids)
         return table
 
     def get_block_table(self, sequence_id: str) -> PagedBlockTable:
@@ -352,6 +408,21 @@ class PagedKvAllocator:
         logical_token_index: int,
     ) -> tuple[int, int]:
         return self.get_block_table(sequence_id).physical_location(logical_token_index)
+
+    def assert_writable_range(
+        self, sequence_id: str, start_token: int, token_count: int
+    ) -> None:
+        table = self.get_block_table(sequence_id)
+        start = int(start_token)
+        count = int(token_count)
+        if start < 0 or count < 0 or start + count > table.token_count:
+            raise PagedKvStateError("KV write exceeds reserved sequence length")
+        if count == 0:
+            return
+        first = start // self._block_size
+        last = (start + count - 1) // self._block_size
+        if any(self._block_refcounts[table.block_ids[index]] > 1 for index in range(first, last + 1)):
+            raise PagedKvStateError("cannot overwrite a shared prefix block")
 
     def can_allocate(self, token_count: int) -> bool:
         normalized_tokens = self._validate_token_count(
@@ -377,9 +448,17 @@ class PagedKvAllocator:
         """Return JSON-safe capacity, utilization, and block-table metrics."""
 
         tables = [self.get_block_table(sequence_id) for sequence_id in self.sequence_ids]
-        used_tokens = sum(table.token_count for table in tables)
-        reserved_slots = sum(table.reserved_token_slots for table in tables)
-        wasted_slots = sum(table.wasted_token_slots for table in tables)
+        # Count physical blocks once even when prefix sharing gives them several
+        # owners; a block's used slots are the most any owner has filled.
+        filled: dict[int, int] = {}
+        for table in tables:
+            for index, block_id in enumerate(table.block_ids):
+                in_block = min(self._block_size, table.token_count - index * self._block_size)
+                filled[block_id] = max(filled.get(block_id, 0), in_block)
+        used_tokens = sum(filled.values())
+        reserved_slots = len(filled) * self._block_size
+        wasted_slots = reserved_slots - used_tokens
+        logical_tokens = sum(table.token_count for table in tables)
         capacity_slots = self.capacity_tokens
         return {
             "layout": "paged_fixed_blocks",
@@ -400,6 +479,9 @@ class PagedKvAllocator:
                 wasted_slots / reserved_slots if reserved_slots else 0.0
             ),
             "active_sequence_count": self.active_sequence_count,
+            "logical_token_slots": logical_tokens,
+            "shared_blocks": self.shared_block_count,
+            "block_references": sum(self._block_refcounts),
             "sequences": [table.to_dict() for table in tables],
         }
 
@@ -510,6 +592,7 @@ class PagedKvCache:
         start_token: int,
     ) -> None:
         token_count = int(keys.shape[-2])
+        self.allocator.assert_writable_range(sequence_id, start_token, token_count)
         consumed = 0
         while consumed < token_count:
             logical_index = start_token + consumed
@@ -753,6 +836,8 @@ class PagedKvCache:
             raise PagedKvStateError(
                 "dense layer segment exceeds at least one reserved sequence length"
             )
+        for sequence_id in normalized_ids:
+            self.allocator.assert_writable_range(sequence_id, start, token_count)
 
         if block_tables is None:
             physical_tables = self.block_table_tensor(
@@ -783,6 +868,17 @@ class PagedKvCache:
             raise PagedKvShapeError(
                 "block_tables does not contain every allocated logical block"
             )
+        if self.allocator.shared_block_count:
+            expected_tables = self.block_table_tensor(
+                normalized_ids, device=self.device
+            ).to(dtype=physical_tables.dtype)
+            if not torch.equal(
+                physical_tables[:, :required_blocks],
+                expected_tables[:, :required_blocks],
+            ):
+                raise PagedKvStateError(
+                    "dense write block_tables differ from current ownership"
+                )
 
         logical_positions = torch.arange(
             start,
@@ -1086,9 +1182,13 @@ class PagedKvCache:
         """Release a request and clear its physical blocks before reuse."""
 
         table = self.allocator.get_block_table(sequence_id)
-        if table.block_ids:
+        freeable_blocks = tuple(
+            block_id for block_id in table.block_ids
+            if self.allocator.block_refcount(block_id) == 1
+        )
+        if freeable_blocks:
             block_indices = torch.tensor(
-                table.block_ids,
+                freeable_blocks,
                 dtype=torch.long,
                 device=self.device,
             )

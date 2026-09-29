@@ -217,6 +217,23 @@ class PagedQwen3Attention(nn.Module):
             starts: Sequence[int] | torch.Tensor | None = None
         else:
             starts = query_start_positions
+        # Every layer writes the same logical positions through the same block
+        # tables, so checking shared-block ownership once per forward (layer 0)
+        # is sufficient and keeps the per-step host cost off the other layers.
+        if self.layer_idx == 0 and page_cache.allocator.shared_block_count:
+            for row, sequence_id in enumerate(sequence_ids):
+                if isinstance(starts, torch.Tensor):
+                    start = int(starts.reshape(-1)[row].item())
+                elif starts is None:
+                    start = (
+                        page_cache.allocator.get_block_table(sequence_id).token_count
+                        - int(key_states.shape[-2])
+                    )
+                else:
+                    start = int(starts[row])
+                page_cache.allocator.assert_writable_range(
+                    sequence_id, start, int(key_states.shape[-2])
+                )
         if can_use_triton_decode_kv_write(
             key_states,
             value_states,

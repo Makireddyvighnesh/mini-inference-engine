@@ -12,14 +12,16 @@ class RequestState(str, Enum):
     DECODING = "decoding"
     FINISHED = "finished"
     CANCELLED = "cancelled"
+    FAILED = "failed"
 
 
 _ALLOWED_TRANSITIONS = {
-    RequestState.WAITING: {RequestState.PREFILL, RequestState.CANCELLED},
-    RequestState.PREFILL: {RequestState.DECODING, RequestState.CANCELLED},
-    RequestState.DECODING: {RequestState.FINISHED, RequestState.CANCELLED},
+    RequestState.WAITING: {RequestState.PREFILL, RequestState.CANCELLED, RequestState.FAILED},
+    RequestState.PREFILL: {RequestState.DECODING, RequestState.CANCELLED, RequestState.FAILED},
+    RequestState.DECODING: {RequestState.FINISHED, RequestState.CANCELLED, RequestState.FAILED},
     RequestState.FINISHED: set(),
     RequestState.CANCELLED: set(),
+    RequestState.FAILED: set(),
 }
 
 
@@ -40,7 +42,7 @@ class RequestLifecycle:
 
     @property
     def terminal(self) -> bool:
-        return self.state in {RequestState.FINISHED, RequestState.CANCELLED}
+        return self.state in {RequestState.FINISHED, RequestState.CANCELLED, RequestState.FAILED}
 
     def transition(self, target: RequestState) -> None:
         if target not in _ALLOWED_TRANSITIONS[self.state]:
@@ -54,4 +56,3 @@ class RequestLifecycle:
         if not self.terminal:
             raise RequestStateError("resources can only be released for terminal requests")
         self.resources_released = True
-

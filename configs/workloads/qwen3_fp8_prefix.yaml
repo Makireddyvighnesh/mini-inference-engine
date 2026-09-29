@@ -1,0 +1,36 @@
+schema_version: 1
+project: MiniLLM-L4
+phase: 7
+
+model:
+  id: Qwen/Qwen3-4B-Instruct-2507-FP8
+  revision: 8591804019c8b22094c3b5b4454e0edc05dffc98
+  device: cuda:0
+  local_files_only: true
+  fp8_kernel_path: sm89
+
+workload:
+  seed: 17
+  request_count: 8
+  shared_prefix_tokens: 512
+  suffix_tokens: 16
+  output_tokens: 8
+  arrival_interval_ms: 20.0
+  reuse_rates: [0.0, 0.5, 1.0]
+
+engine:
+  block_size: 16
+  num_blocks: 512
+  max_entries: 8
+  max_batch_size: 4
+  max_prefill_tokens: 2048
+  decode_backend: auto
+  decode_mode: eager
+
+benchmark:
+  warmup_repetitions: 1
+  repetitions: 3
+  sample_interval_seconds: 0.25
+  collect_gpu: true
+  collect_system_telemetry: true
+  timer_overhead_iterations: 1000
