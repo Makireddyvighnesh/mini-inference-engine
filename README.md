@@ -24,8 +24,9 @@ command.
   <img alt="Speedup from each technique: KV cache 2.0x, continuous batching 17x, paged KV 2.3x, CUDA Graphs 2.5x, prefix cache 13x, mixed batching with adaptive chunks 19x" src="docs/assets/showcase/speedups-light.svg">
 </picture>
 
-¹ Measured on the static-batch decode engine. The continuous/mixed serving
-engine does not use CUDA Graphs yet; that is the next step.
+¹ This row is the single-request decode engine from the showcase run. CUDA
+Graphs also run inside the continuous/mixed serving engine; see
+[CUDA Graphs in the serving engine](#cuda-graphs-in-the-serving-engine).
 
 Workloads: KV cache and CUDA Graphs use one request with a 512-token prompt
 (the KV-cache gap grows with prompt length). Continuous batching and paged KV
@@ -41,7 +42,7 @@ pause is the median over runs of each run's longest gap between two tokens.
 - **KV cache:** Keeps each layer's keys/values so a new token attends to cached history instead of re-running the prompt. Capacity, positions, and release have explicit ownership instead of opaque library state.
 - **Continuous batching:** Admits new requests between decode steps and retires finished ones immediately, instead of waiting for a static batch to drain. With paged KV, a request waits only when KV memory is actually full.
 - **Paged KV:** Uses fixed-size KV pages with per-request block tables, a fused Triton paged-decode kernel, and flattened (packed) prefill with `cu_seqlens`, so batch changes require no cache copying. Eager paged decode is slightly slower per step (60 vs 56 ms for one request), but it removes copies, uses less memory, and enables graph capture.
-- **CUDA Graphs:** Decode was host-bound (~2,000 kernel launches per token, GPU ~40% busy); replaying a captured graph per batch size removes launch overhead (GPU ~95% busy). FP8 kernel autotuning is bucketed and pre-tuned so it never runs inside a request.
+- **CUDA Graphs:** Decode was host-bound (~2,000 kernel launches per token, GPU ~40% busy); replaying a captured graph removes launch overhead (GPU ~90% busy). In the serving engine one graph is captured per batch-size bucket (1/2/4/8/16/32); the live batch is padded to the bucket with rows that touch only their own scratch KV page, so requests can join and leave between steps. Prefill and iterations that carry prompt chunks stay eager. FP8 kernel autotuning is bucketed and pre-tuned so it never runs inside a request.
 - **Prefix cache:** Identical prompt prefixes share immutable KV pages. Reference counts track shared ownership, with LRU eviction to reclaim pages.
 - **Mixed batching + adaptive chunks:** Each iteration is one forward pass holding every decode token plus prompt chunks, shortest prompt first; a self-calibrating cost model chooses chunk size by time (about 150 ms when busy, 400 ms when idle), with aging so long prompts are not starved. Lower-right causal FlashAttention keeps chunked prefill bit-identical to whole-prompt prefill. On this workload a fixed 512-token budget does as well; adaptive sizing pays off when a long prompt runs on an idle engine, where it finishes the long prompt fastest while a newcomer still waits under 0.6 s (see [chunked prefill notes](docs/phase_notes/chunked_prefill.md)).
 
@@ -152,6 +153,32 @@ interference per arriving prompt, chunk-size sweeps) are in
 
 </details>
 
+## CUDA Graphs in the serving engine
+
+Separate L4 run (1 warm-up + 3 measured runs, zero allocator retries) comparing
+eager and graph decode inside the continuous/mixed scheduler. Graph and eager
+policies emit identical tokens (72/72 request outputs across 9 policies).
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/cuda_graphs/decode-tpot-dark.svg">
+  <img alt="Time per output token by batch size: eager stays near 64-67 ms; CUDA Graph decode is 22.6 ms at batch 1 rising to 37.8 ms at batch 32" src="docs/assets/cuda_graphs/decode-tpot-light.svg">
+</picture>
+
+| | Eager | CUDA Graph | Gain |
+|---|---|---|---|
+| Decode, 1 request (time per token) | 63.8 ms | 22.6 ms | **2.8x** |
+| Decode, 32 requests (time per token) | 66.8 ms | 37.8 ms | **1.8x** |
+| Serving 16 arriving requests (time per token) | 68.2 ms | 34.7 ms | **2.0x** |
+| Serving 16 arriving requests (output tok/s) | 196.9 | 341.6 | **1.7x** |
+| Long prompts arriving constantly, mixed + adaptive (output tok/s) | 39.2 | 49.8 | **1.3x** |
+| Prefill, 8192 tokens (time to first token) | 2,170 ms | 2,168 ms | none |
+
+Graphs speed up decode only. Prefill is not graphed and already keeps the GPU
+busy, and iterations that carry prompt chunks stay eager, so the gain shrinks
+when long prompts arrive constantly. Each batch-size bucket costs about 0.27 s
+to capture once and ~22 MiB of graph memory. Details:
+[CUDA Graphs notes](docs/phase_notes/cuda_graphs.md).
+
 ## Reproduce
 
 Run from the repository root that contains `minillm_l4/`:
@@ -164,6 +191,12 @@ Run from the repository root that contains `minillm_l4/`:
 # README charts (light and dark SVG)
 .conda-env/bin/python minillm_l4/scripts/make_showcase_charts.py \
     minillm_l4/results/showcase_<date>/showcase.json minillm_l4/docs/assets/showcase
+
+# Eager vs CUDA Graph comparison, and its charts
+.conda-env/bin/python -m minillm_l4.benchmarks.commands.run_cuda_graphs \
+    --output-dir minillm_l4/results/cuda_graphs_$(date +%Y%m%d)
+.conda-env/bin/python minillm_l4/scripts/make_cuda_graph_charts.py \
+    minillm_l4/results/cuda_graphs_<date>/cuda_graphs.json minillm_l4/docs/assets/cuda_graphs
 
 # Watch the engine stream tokens with live TTFT / TPOT
 .conda-env/bin/python minillm_l4/scripts/stream_generate.py \

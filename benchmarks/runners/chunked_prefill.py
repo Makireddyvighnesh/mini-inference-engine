@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections import deque
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Any, Sequence
 
 import torch
@@ -14,6 +15,7 @@ from minillm_l4.engine.kv_cache import (
     PagedKvOutOfMemoryError,
     select_decode_block_tokens,
     select_decode_split_count,
+    triton_is_available,
 )
 from minillm_l4.engine.kv_cache.packed import PackedSequenceMetadata
 from minillm_l4.engine.model_runner.qwen3_mixed import MixedRow, build_mixed_metadata, qwen3_mixed_forward
@@ -25,6 +27,11 @@ from ..core.harness import RequestEventRecorder
 from ..core.schemas import RequestOutcome, RequestSpec
 from .continuous_prefix import ContinuousPrefixPagedRunner, _LiveRequest
 from .continuous_requests import _wait_until_ms
+from .paged_kv import _first_model_device
+from .decode_graph import (
+    DEFAULT_GRAPH_BATCH_SIZES, DecodeGraph, DecodeGraphBuffers,
+    graph_pool_memory_bytes, select_graph_bucket, validate_graph_batch_sizes,
+)
 
 
 @dataclass
@@ -54,12 +61,22 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
     (decode rows included).  A large prompt therefore advances a bounded
     chunk per step instead of stalling decode for its whole prefill.
     ``prefill_chunk_size`` optionally caps one request's chunk.
+
+    ``cuda_graphs=True`` lazily captures decode-only buckets (default
+    1/2/4/8/16/32). ``graph_mixed_decode=True`` separates graph decode from
+    eager prompt work; ``graph_mixed_decode_order`` chooses decode-first
+    (default) or prefill-first. Prefix reuse and unsupported devices/dispatch
+    retain eager execution. See docs/phase_notes/cuda_graphs.md.
     """
 
     def __init__(self, model: Any, *, prefill_chunk_size: int | None = 128,
                  batched_prefill: bool = True, mixed_batch: bool = False,
                  packed_prefill_token_limit: int | None = None,
                  adaptive_chunking: bool = False, planner: AdaptiveChunkPlanner | None = None,
+                 cuda_graphs: bool = False,
+                 graph_batch_sizes: Sequence[int] = DEFAULT_GRAPH_BATCH_SIZES,
+                 graph_mixed_decode: bool = False,
+                 graph_mixed_decode_order: str = "decode_first",
                  **kwargs: Any) -> None:
         if prefill_chunk_size is not None and (
             isinstance(prefill_chunk_size, bool)
@@ -67,8 +84,51 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
             or prefill_chunk_size < 1
         ):
             raise ValueError("prefill_chunk_size must be positive or None")
+        if not isinstance(cuda_graphs, bool) or not isinstance(graph_mixed_decode, bool):
+            raise ValueError("cuda_graphs and graph_mixed_decode must be booleans")
+        self.graph_batch_sizes = validate_graph_batch_sizes(graph_batch_sizes)
+        if graph_mixed_decode and (not cuda_graphs or not mixed_batch):
+            raise ValueError("graph_mixed_decode requires cuda_graphs=True and mixed_batch=True")
+        if graph_mixed_decode_order not in {"decode_first", "prefill_first"}:
+            raise ValueError("graph_mixed_decode_order must be decode_first or prefill_first")
+        self.cuda_graphs = cuda_graphs
+        self.graph_mixed_decode = graph_mixed_decode
+        self.graph_mixed_decode_order = graph_mixed_decode_order
         kwargs.setdefault("decode_sdpa_compat", True)
+        self._graphs: dict[int, DecodeGraph] = {}
+        self._graph_max_sequence_length = 0
+        self._graph_scratch_owner = "__cuda_graph_scratch__"
+        self._graph_scratch_blocks: tuple[int, ...] = ()
+        self._graph_disabled_reasons: list[str] = []
+        self._request_num_blocks = kwargs["num_blocks"]
+        if cuda_graphs:
+            device = torch.device(kwargs.get("device") or _first_model_device(model))
+            if device.type != "cuda" or not torch.cuda.is_available():
+                self._graph_disabled_reasons.append("CUDA graphs require a CUDA device")
+            if kwargs.get("enable_prefix", True):
+                self._graph_disabled_reasons.append("prefix reuse is enabled")
+            if kwargs.get("decode_backend", "auto") == "torch" or not triton_is_available():
+                self._graph_disabled_reasons.append("CUDA graphs require Triton decode")
+            if not kwargs["decode_sdpa_compat"]:
+                self._graph_disabled_reasons.append("graph decode requires SDPA-compatible decode to keep the reduction policy fixed")
+            if not 1 <= kwargs["block_size"] <= 128:
+                self._graph_disabled_reasons.append("Triton decode requires block_size in 1..128")
+            rope = getattr(model.config, "rope_parameters", None) or {}
+            if rope.get("rope_type", "default") != "default":
+                self._graph_disabled_reasons.append("graph decode requires default RoPE (dynamic RoPE may synchronize)")
+            if not self._graph_disabled_reasons:
+                # Extra pages are exclusively scratch: request KV capacity is
+                # unchanged, including when the caller supplied an exact pool.
+                if kwargs["num_blocks"] < 1:
+                    raise ValueError("num_blocks must be positive")
+                kwargs["num_blocks"] += self.graph_batch_sizes[-1]
         super().__init__(model, **kwargs)
+        if cuda_graphs and not self._graph_disabled_reasons:
+            scratch = self.allocator.allocate(
+                self._graph_scratch_owner,
+                token_count=self.graph_batch_sizes[-1] * self.allocator.block_size,
+            )
+            self._graph_scratch_blocks = scratch.block_ids
         self.prefill_chunk_size = prefill_chunk_size
         self.batched_prefill = bool(batched_prefill)
         self.mixed_batch = bool(mixed_batch)
@@ -86,6 +146,123 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
         self.planner = (planner or AdaptiveChunkPlanner()) if adaptive_chunking else None
         self._last_arrival_ms: float | None = None
         self._queued = 0
+        self._reset_graph_counters()
+
+    def _reset_graph_counters(self) -> None:
+        self._graph_replays = self._eager_decode_steps = 0
+        self._graph_fallbacks = dict.fromkeys(self._graph_disabled_reasons, 0)
+        self._graph_captures_this_run: list[int] = []
+
+    def _graph_bucket(self, rows: int) -> int | None:
+        if not self.cuda_graphs or self._graph_disabled_reasons:
+            return None
+        return select_graph_bucket(rows, self.graph_batch_sizes)
+
+    def _note_eager_decode(self, rows: int, *, mixed_prompt: bool = False) -> None:
+        self._eager_decode_steps += 1
+        if not self.cuda_graphs:
+            return
+        reasons = self._graph_disabled_reasons or (
+            ["decode batch exceeds the largest graph bucket"] if self._graph_bucket(rows) is None
+            else ["prompt chunks use one eager mixed forward"] if mixed_prompt else []
+        )
+        for reason in reasons:
+            self._graph_fallbacks[reason] = self._graph_fallbacks.get(reason, 0) + 1
+
+    def _graph_decode_call(self, buffers: DecodeGraphBuffers) -> tuple[torch.Tensor, torch.Tensor | None]:
+        output = self.model(
+            input_ids=buffers.input_ids,
+            # HF mask construction may inspect device positions. Paged attention
+            # ignores this mask; supply the already prepared mapping to bypass it.
+            attention_mask={"full_attention": None},
+            position_ids=buffers.position_ids, use_cache=False, return_dict=True, logits_to_keep=1,
+            paged_kv_cache=self.cache,
+            paged_sequence_ids=tuple(f"graph-row-{i}" for i in range(buffers.input_ids.shape[0])),
+            paged_query_start_positions=buffers.position_ids,
+            paged_block_tables=buffers.block_tables, paged_sequence_lengths=buffers.sequence_lengths,
+            paged_attention_backend="triton", paged_decode_graph=True,
+            paged_decode_max_sequence_length=self._graph_max_sequence_length,
+            paged_decode_split_count=1, paged_decode_block_tokens=128,
+            paged_decode_use_gqa_reuse=False, paged_decode_sdpa_compat=True,
+        )
+        logits = output.logits[:, -1, :]
+        gaps = None
+        if self.record_logit_gaps:
+            top_two = logits.float().topk(2, dim=-1).values
+            gaps = top_two[:, 0] - top_two[:, 1]
+        return logits.argmax(dim=-1, keepdim=True), gaps
+
+    def _capture_decode_graph(self, bucket: int) -> DecodeGraph:
+        """Lazy capture, including warmup and one scratch-only replay.
+
+        Each bucket owns a private graph pool. All capture-time writes target
+        scratch pages, so warming a bucket cannot modify a live request's KV.
+        """
+        started = perf_counter()
+        buffers = DecodeGraphBuffers.allocate(
+            bucket, math.ceil(self._graph_max_sequence_length / self.allocator.block_size),
+            self._graph_scratch_blocks, device=self.device, block_size=self.allocator.block_size,
+        )
+        current = torch.cuda.current_stream(self.device)
+        warmup = torch.cuda.Stream(device=self.device)
+        warmup.wait_stream(current)
+        with torch.inference_mode(), torch.cuda.stream(warmup):
+            for _ in range(3):
+                self._graph_decode_call(buffers)
+        current.wait_stream(warmup)
+        torch.cuda.synchronize(self.device)
+        graph = torch.cuda.CUDAGraph()
+        with torch.inference_mode(), torch.cuda.graph(graph):
+            tokens, gaps = self._graph_decode_call(buffers)
+        graph.replay()
+        torch.cuda.synchronize(self.device)
+        captured = DecodeGraph(graph, buffers, tokens, gaps, (perf_counter() - started) * 1000,
+                               graph_pool_memory_bytes(graph))
+        self._graphs[bucket] = captured
+        self._graph_captures_this_run.append(bucket)
+        return captured
+
+    def _decode(self, active: list[_LiveRequest]) -> None:
+        bucket = self._graph_bucket(len(active))
+        if bucket is None:
+            self._note_eager_decode(len(active))
+            super()._decode(active)  # eager call, dispatch, and ordering unchanged
+            return
+        owners = tuple(state.request.request_id for state in active)
+        old_lengths = tuple(self.allocator.get_block_table(owner).token_count for owner in owners)
+        with torch.inference_mode():
+            self.cache.reserve_append(owners, 1)
+            if self.allocator.shared_block_count:
+                raise RuntimeError("graph decode cannot write shared KV pages")
+            captured = self._graphs.get(bucket) or self._capture_decode_graph(bucket)
+            captured.buffers.pack(
+                [state.generated[-1] for state in active], old_lengths,
+                [self.allocator.get_block_table(owner).block_ids for owner in owners],
+            )
+            captured.graph.replay()
+            self._graph_replays += 1
+            # Clone real outputs: graph-owned output storage is overwritten on
+            # replay; eager fallback must retain a stable next_token per row.
+            next_tokens = captured.output_tokens[:len(active)].clone().detach()
+            values = next_tokens[:, 0].tolist()  # one real-row D2H copy
+            gaps = captured.logit_gaps[:len(active)].tolist() if captured.logit_gaps is not None else None
+        now = max(state.recorder.now_ns() for state in active)
+        for row, (state, token) in enumerate(zip(active, values, strict=True)):
+            state.next_token = next_tokens[row:row + 1]
+            index = len(state.generated)
+            state.generated.append(int(token))
+            state.decode_calls += 1
+            if gaps is not None:
+                state.decode_top2_logit_gaps.append(float(gaps[row]))
+            state.recorder.mark_token_ready(index, token_id=int(token), timestamp_ns=now)
+            state.recorder.mark_token_sent(index, token_id=int(token), timestamp_ns=now)
+
+    def close(self) -> None:
+        self._graphs.clear()
+        if self._graph_scratch_owner in self.allocator.sequence_ids:
+            self.cache.release(self._graph_scratch_owner)
+        self._graph_scratch_blocks = ()
+        super().close()
 
     @property
     def runner_name(self) -> str:
@@ -126,6 +303,17 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
                 count = int(min(remaining, budget, cap))
                 chunks.append((state, state.mixed_position, count))
                 budget -= count
+        if active and not chunks and self._graph_bucket(len(active)) is not None:
+            started = active[0].recorder.now_ns()
+            self._decode(active)
+            ended = active[0].recorder.now_ns()
+            return {
+                "kind": "mixed_step", "decode_rows": len(active), **plan_info,
+                "prefill_tokens": 0, "total_tokens": len(active),
+                "start_ms": started / 1e6, "end_ms": ended / 1e6, "wall_ms": (ended - started) / 1e6,
+                "chunk_records": [], "decode_request_ids": [s.request.request_id for s in active],
+                "decode_mode": "graph", "split_decode": False,
+            }
         rows = [MixedRow(state.request.request_id, (state.generated[-1],),
                          self.allocator.get_block_table(state.request.request_id).token_count, decode=True)
                 for state in active]
@@ -140,17 +328,29 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
                 state.recorder.record("prefill_start", timestamp_ns=started, metadata={
                     "runner": self.runner_name, "reused_tokens": 0})
             state.recorder.record("prefill_chunk_start", timestamp_ns=started, metadata={"start_token": start})
+        split_decode = bool(active and chunks and self.graph_mixed_decode
+                            and self._graph_bucket(len(active)) is not None)
+        forward_active = active
+        if split_decode:
+            # Both orders write disjoint pages; prefill keeps one-row logits.
+            # Decode-first sends its tokens immediately after replay/readback.
+            if self.graph_mixed_decode_order == "decode_first":
+                self._decode(active)
+            forward_active = []
+            rows = rows[len(active):]
+        elif active:
+            self._note_eager_decode(len(active), mixed_prompt=bool(chunks))
         with torch.inference_mode():
-            if active:
-                self.cache.reserve_append(tuple(state.request.request_id for state in active), 1)
+            if forward_active:
+                self.cache.reserve_append(tuple(state.request.request_id for state in forward_active), 1)
             for state, start, count in chunks:
                 self.cache.reserve_append((state.request.request_id,), count)
-            max_length = max((s.request.prompt_tokens + s.request.max_new_tokens - 1 for s in active), default=1)
+            max_length = max((s.request.prompt_tokens + s.request.max_new_tokens - 1 for s in forward_active), default=1)
             input_ids, positions, metadata = build_mixed_metadata(
                 rows, self.cache, device=self.device,
                 decode_attention_backend=self.decode_backend,
                 decode_split_count=1 if self.decode_sdpa_compat else select_decode_split_count(
-                    max_length, batch_size=max(len(active), 1)),
+                    max_length, batch_size=max(len(forward_active), 1)),
                 decode_max_sequence_length=max_length,
                 decode_block_tokens=128 if self.decode_sdpa_compat else select_decode_block_tokens(max_length),
                 decode_sdpa_compat=self.decode_sdpa_compat,
@@ -165,12 +365,16 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
             parts += [output.prefill_logits[s.request.request_id].argmax(dim=-1, keepdim=True) for s in completing]
             next_tokens = torch.cat(parts).detach() if parts else None
             values = next_tokens[:, 0].tolist() if next_tokens is not None else []
+        if split_decode and self.graph_mixed_decode_order == "prefill_first":
+            self._decode(active)
         ended = (active or [chunks[0][0]])[0].recorder.now_ns()
-        if self.planner is not None:
+        # The model predicts one eager forward; split timings also include
+        # graph decode, so retain the prior and valid eager observations.
+        if self.planner is not None and not split_decode:
             self.planner.cost.observe(len(active), [(start, count) for _, start, count in chunks],
                                       (ended - started) / 1e6)
 
-        for row, state in enumerate(active):
+        for row, state in enumerate(forward_active):
             token = int(values[row])
             state.next_token = next_tokens[row:row + 1]
             index = len(state.generated)
@@ -192,7 +396,7 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
                 "end_ms": ended / 1e6, "wall_ms": (ended - started) / 1e6,
             })
         for offset, state in enumerate(completing):
-            row = len(active) + offset
+            row = len(forward_active) + offset
             token = int(values[row])
             state.next_token = next_tokens[row:row + 1]
             state.generated.append(token)
@@ -207,6 +411,9 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
             "start_ms": started / 1e6, "end_ms": ended / 1e6, "wall_ms": (ended - started) / 1e6,
             "chunk_records": chunk_records,
             "decode_request_ids": [state.request.request_id for state in active],
+            "decode_mode": "graph" if split_decode else "eager" if active else None,
+            "split_decode": split_decode,
+            "split_decode_order": self.graph_mixed_decode_order if split_decode else None,
         }
 
     def _prefill_step(self, state: _PartialRequest, token_limit: int) -> dict[str, Any]:
@@ -329,6 +536,17 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
         unknown = self.cancel_request_ids - {request.request_id for request in requests}
         if unknown:
             raise ValueError(f"unknown cancellation IDs: {sorted(unknown)}")
+        self._reset_graph_counters()
+        if self.cuda_graphs and not self._graph_disabled_reasons:
+            if any(r.request_id == self._graph_scratch_owner for r in requests):
+                raise ValueError("request ID is reserved for graph scratch pages")
+            max_length = min(max(r.prompt_tokens + r.max_new_tokens - 1 for r in requests),
+                             self._request_num_blocks * self.allocator.block_size)
+            if max_length != self._graph_max_sequence_length:
+                # Graph shapes belong to a workload capacity, not a request ID.
+                # Reuse across repetitions; discard when a new workload changes it.
+                self._graphs.clear()
+                self._graph_max_sequence_length = max_length
         self.prefixes.clear()
         start_stats = self.prefixes.snapshot()
         states = {
@@ -358,10 +576,15 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
                 # Decode has priority; no prefill batching wait stalls a live row.
                 if active and not self.mixed_batch:
                     owners = [state.request.request_id for state in active]
+                    started = clock.now_ns()
                     self._decode(active)
+                    ended = clock.now_ns()
                     peak_blocks = max(peak_blocks, self.allocator.allocated_block_count)
                     finished = [state for state in active if len(state.generated) >= state.request.max_new_tokens or state.generated[-1] in self.eos_token_ids]
-                    records.append({"kind": "decode", "request_ids": owners, "batch_size": len(active), "finished_request_ids": [s.request.request_id for s in finished]})
+                    records.append({"kind": "decode", "request_ids": owners, "batch_size": len(active),
+                                    "finished_request_ids": [s.request.request_id for s in finished],
+                                    "decode_mode": "graph" if self._graph_bucket(len(active)) is not None else "eager",
+                                    "start_ms": started / 1e6, "end_ms": ended / 1e6, "wall_ms": (ended - started) / 1e6})
                     for state in finished:
                         self._complete(state, outcomes)
                     finished_ids = {state.request.request_id for state in finished}
@@ -384,7 +607,7 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
                     state = states[selected[0].request_id]
                     owner = state.request.request_id
                     final_length = state.request.prompt_tokens + state.request.max_new_tokens - 1
-                    if math.ceil(final_length / self.allocator.block_size) > self.allocator.num_blocks:
+                    if math.ceil(final_length / self.allocator.block_size) > self._request_num_blocks:
                         self._fail(state, outcomes, "request exceeds total KV capacity")
                     else:
                         try:
@@ -420,7 +643,8 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
                         chunk_records = step.pop("chunk_records")
                         if step["decode_rows"]:
                             records.append({"kind": "decode", "request_ids": step["decode_request_ids"],
-                                            "batch_size": step["decode_rows"]})
+                                            "batch_size": step["decode_rows"], "decode_mode": step["decode_mode"],
+                                            "wall_ms": step["wall_ms"] if not step["prefill_tokens"] else None})
                         records.extend(chunk_records)
                         records.append(step)
                         newly_decoding = [state for state in prefilling if state.generated]
@@ -521,8 +745,34 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
             "maximum_step_tokens": max((record["total_tokens"] for record in records if record["kind"] == "mixed_step"), default=0), "prefix_enabled": self.enable_prefix,
             "prefill_chunk_size": self.prefill_chunk_size, "max_prefill_tokens": self.max_prefill_tokens,
             "max_batch_size": self.max_batch_size, "maximum_inflight_requests": peak_inflight,
-            "decode_mode_requested": self.decode_mode, "decode_mode_used": "eager",
-            "graph_fallback_reason": "dynamic request membership and partial prefills" if self.decode_mode == "graph" else None,
+            "decode_mode_requested": "graph" if self.cuda_graphs else self.decode_mode,
+            "decode_mode_used": ("mixed" if self._graph_replays and self._eager_decode_steps else
+                                 "graph" if self._graph_replays else "eager"),
+            "cuda_graphs": self.cuda_graphs, "graph_mixed_decode": self.graph_mixed_decode,
+            "graph_mixed_decode_order": self.graph_mixed_decode_order,
+            "graph_batch_sizes": list(self.graph_batch_sizes),
+            "graph_replays": self._graph_replays, "eager_decode_steps": self._eager_decode_steps,
+            "graph_replay_share": self._graph_replays / (self._graph_replays + self._eager_decode_steps)
+                if self._graph_replays + self._eager_decode_steps else 0.0,
+            "graph_fallback_reason": ("; ".join(self._graph_fallbacks) if self._graph_fallbacks else
+                                      "cuda_graphs=False (legacy decode_mode request)" if self.decode_mode == "graph" and not self.cuda_graphs else None),
+            "graph_fallback_steps_by_reason": dict(self._graph_fallbacks),
+            "captured_buckets": sorted(self._graphs),
+            "graph_captures_this_run": list(self._graph_captures_this_run),
+            "capture_ms": {str(n): graph.capture_ms for n, graph in sorted(self._graphs.items())},
+            "graph_pool_memory_bytes_per_bucket": {str(n): graph.pool_memory_bytes for n, graph in sorted(self._graphs.items())},
+            "graph_pool_memory_bytes": sum(graph.pool_memory_bytes for graph in self._graphs.values()),
+            "graph_scratch_pages": len(self._graph_scratch_blocks),
+            "graph_scratch_memory_bytes": (len(self._graph_scratch_blocks) * self.cache.num_layers
+                * self.cache.num_kv_heads * self.allocator.block_size * self.cache.head_dim
+                * self.cache.key_blocks.element_size() * 2),
+            "graph_static_buffer_memory_bytes_per_bucket": {
+                str(n): sum(t.numel() * t.element_size() for t in
+                            (g.buffers.input_ids, g.buffers.position_ids, g.buffers.sequence_lengths,
+                             g.buffers.block_tables, g.buffers.attention_mask))
+                for n, g in sorted(self._graphs.items())},
+            "request_kv_num_blocks": self._request_num_blocks,
+            "graph_max_sequence_length": self._graph_max_sequence_length,
             "decode_sdpa_compat": self.decode_sdpa_compat,
             "hits": hits, "misses": misses, "hit_rate": hits / (hits + misses) if hits + misses else 0.0,
             "reused_tokens": stats["reused_tokens"] - start_stats["reused_tokens"],

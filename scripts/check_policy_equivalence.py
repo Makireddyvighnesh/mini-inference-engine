@@ -36,10 +36,20 @@ POLICIES = {
     "mixed_512": dict(prefill_chunk_size=None, mixed_batch=True, max_prefill_tokens=512),
     "mixed_2048": dict(prefill_chunk_size=None, mixed_batch=True, max_prefill_tokens=2048),
     "adaptive": dict(prefill_chunk_size=None, mixed_batch=True, adaptive_chunking=True),
+    "whole_graph": dict(prefill_chunk_size=None, cuda_graphs=True),
+    "mixed_512_graph": dict(prefill_chunk_size=None, mixed_batch=True, max_prefill_tokens=512, cuda_graphs=True),
+    "adaptive_graph": dict(prefill_chunk_size=None, mixed_batch=True, adaptive_chunking=True, cuda_graphs=True),
+    "adaptive_graph_split": dict(prefill_chunk_size=None, mixed_batch=True, adaptive_chunking=True,
+                                 cuda_graphs=True, graph_mixed_decode=True),
+    "adaptive_graph_split_prefill_first": dict(prefill_chunk_size=None, mixed_batch=True, adaptive_chunking=True,
+                                             cuda_graphs=True, graph_mixed_decode=True,
+                                             graph_mixed_decode_order="prefill_first"),
 }
 
 
 def main() -> int:
+    if not torch.cuda.is_available():
+        raise RuntimeError("policy equivalence gate requires CUDA; CPU graph fallback is not graph validation")
     bundle = load_qwen_fp8(fp8_kernel_path="sm89", local_files_only=True)
     requests = tuple(
         RequestSpec(f"r{i}", tuple(exact_token_ids(bundle.tokenizer, SyntheticSample(
@@ -59,6 +69,12 @@ def main() -> int:
         recorders = tuple(RequestEventRecorder(r.request_id, run_started_ns=start) for r in requests)
         try:
             result = runner(requests, recorders)
+            if any(outcome.status != "completed" or len(outcome.generated_token_ids) != OUTPUT_TOKENS
+                   for outcome in result):
+                raise RuntimeError(f"{name}: incomplete request outputs")
+            summary = runner.last_summary
+            if options.get("cuda_graphs") and not summary["graph_replays"]:
+                raise RuntimeError(f"{name}: no graph replays: {summary['graph_fallback_reason']}")
             chunks = [r["computed_tokens"] for r in runner.last_summary["prefill_records"]]
         finally:
             runner.close()
@@ -66,14 +82,18 @@ def main() -> int:
             gc.collect()
             torch.cuda.empty_cache()
         outputs[name] = [list(outcome.generated_token_ids) for outcome in result]
-        print(f"{name:12s} {(time.perf_counter_ns() - start) / 1e9:6.1f} s, {len(chunks)} prefill chunks, "
-              f"smallest {min(chunks)} tokens", flush=True)
+        print(f"{name:34s} {(time.perf_counter_ns() - start) / 1e9:6.1f} s, {len(chunks)} prefill chunks, "
+              f"smallest {min(chunks)} tokens, mode={summary['decode_mode_used']}, "
+              f"replays={summary['graph_replays']}, eager={summary['eager_decode_steps']}, "
+              f"buckets={summary['captured_buckets']}", flush=True)
     failures = 0
     for name, rows in outputs.items():
+        if name == "whole":
+            continue
         for request, row, reference in zip(requests, rows, outputs["whole"], strict=True):
             if row != reference:
                 failures += 1
-                first = next(i for i, (a, b) in enumerate(zip(row, reference)) if a != b)
+                first = next((i for i, (a, b) in enumerate(zip(row, reference)) if a != b), min(len(row), len(reference)))
                 print(f"MISMATCH {name} {request.request_id} ({request.prompt_tokens} tokens) at output {first}")
     total = len(requests) * (len(POLICIES) - 1)
     print(f"{total - failures}/{total} request outputs identical to whole-prompt prefill "

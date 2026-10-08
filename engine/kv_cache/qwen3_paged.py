@@ -96,6 +96,7 @@ class PagedQwen3Attention(nn.Module):
         decode_block_tokens = int(kwargs.pop("paged_decode_block_tokens", 16))
         decode_use_gqa_reuse = kwargs.pop("paged_decode_use_gqa_reuse", False)
         decode_sdpa_compat = bool(kwargs.pop("paged_decode_sdpa_compat", False))
+        decode_graph = bool(kwargs.pop("paged_decode_graph", False))
 
         if packed_metadata is not None:
             if not isinstance(packed_metadata, PackedSequenceMetadata):
@@ -228,6 +229,7 @@ class PagedQwen3Attention(nn.Module):
             decode_block_tokens=decode_block_tokens,
             decode_use_gqa_reuse=decode_use_gqa_reuse,
             decode_sdpa_compat=decode_sdpa_compat,
+            decode_graph=decode_graph,
         )
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.inner.o_proj(attn_output)
@@ -347,6 +349,7 @@ class PagedQwen3Attention(nn.Module):
         decode_block_tokens: int,
         decode_use_gqa_reuse: Any,
         decode_sdpa_compat: bool,
+        decode_graph: bool = False,
     ) -> torch.Tensor:
         """Write rectangular-batch K/V into pages and attend from the pages.
 
@@ -356,6 +359,16 @@ class PagedQwen3Attention(nn.Module):
 
         if len(sequence_ids) != int(query_states.shape[0]):
             raise ValueError("paged_sequence_ids must match the hidden-state batch size")
+        # Graph rows have fixed synthetic IDs, not allocator owners. Reservation
+        # and ownership are checked by the serving runner before packing. Never
+        # freeze an owner's current length into a replay-time device assertion.
+        if decode_graph:
+            if page_cache.allocator.shared_block_count:
+                raise ValueError("graph decode does not support shared KV blocks")
+            if attention_backend != "triton" or not isinstance(query_start_positions, torch.Tensor):
+                raise ValueError("graph decode requires Triton and device query positions")
+            if not query_start_positions.is_cuda:
+                raise ValueError("graph decode requires CUDA query positions")
         if query_start_positions is None:
             starts: Sequence[int] | torch.Tensor | None = None
         else:
@@ -385,6 +398,8 @@ class PagedQwen3Attention(nn.Module):
             page_cache.key_blocks[self.layer_idx],
             page_cache.value_blocks[self.layer_idx],
         )
+        if decode_graph and not use_fast_writer:
+            raise ValueError("graph decode requires the Triton one-token KV writer")
         if use_fast_writer:
             write_positions = _triton_query_positions(
                 starts, sequence_ids=sequence_ids, cache=page_cache,
@@ -398,9 +413,9 @@ class PagedQwen3Attention(nn.Module):
                     batch_size=len(sequence_ids), num_blocks=page_cache.allocator.num_blocks,
                     block_size=page_cache.allocator.block_size, query_positions=write_positions,
                     max_sequence_length=(
-                        decode_max_sequence_length if decode_split_count and decode_split_count > 1 else None
+                        decode_max_sequence_length if decode_graph or (decode_split_count and decode_split_count > 1) else None
                     ),
-                    reserved_lengths=tuple(
+                    reserved_lengths=None if decode_graph else tuple(
                         page_cache.allocator.get_block_table(sid).token_count for sid in sequence_ids
                     ),
                 )
