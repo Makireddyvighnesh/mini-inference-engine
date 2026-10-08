@@ -95,3 +95,25 @@ def test_install_is_reversible_and_bitwise_on_a_model(head_dim):
         uninstall_fused_kernels(model)
         after = model(input_ids=ids).logits
     assert torch.equal(fused, before) and torch.equal(after, before)
+
+
+def test_warmup_compiles_every_variant_serving_can_hit():
+    from minillm_l4.engine.kernels import fused
+
+    def compiled():
+        return {name: sum(len(cache[0]) for cache in getattr(fused, name).device_caches.values())
+                for name in ("_rms_norm_kernel", "_silu_mul_kernel", "_rope_kernel")}
+
+    config = Qwen3Config(hidden_size=2560, intermediate_size=9728, num_hidden_layers=1, num_attention_heads=32,
+                         num_key_value_heads=8, head_dim=128, vocab_size=64)
+    fused.warm_fused_kernels(Qwen3ForCausalLM(config).to("cuda", torch.bfloat16))
+    before = compiled()
+    for seq, batch in ((1, 1), (1, 9), (128, 1), (300, 1), (4096, 1)):  # decode, aligned and odd prompts
+        cos = torch.zeros(batch, seq, 128, dtype=torch.bfloat16, device="cuda")
+        q, k = (torch.zeros(batch, seq, h, 128, dtype=torch.bfloat16, device="cuda").transpose(1, 2) for h in (32, 8))
+        apply_rotary_pos_emb(q, k, cos, cos)
+        flat = torch.zeros(seq * batch, 2560, dtype=torch.bfloat16, device="cuda")
+        rms_norm(flat, torch.ones(2560, dtype=torch.bfloat16, device="cuda"), 1e-6, residual=flat)
+        gate = torch.zeros(seq * batch, 9728, dtype=torch.bfloat16, device="cuda")
+        silu_mul(gate, gate)
+    assert compiled() == before

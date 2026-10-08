@@ -653,6 +653,15 @@ def _memory_summary(samples: Sequence[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _gpu_utilization_summary(samples: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    # Prefer NVML readings taken periodically during the run; the before/after
+    # nvidia-smi snapshots alone are two endpoint readings, not a run profile.
+    periodic = [
+        float(sample["gpu_utilization_percent"])
+        for sample in samples
+        if sample.get("label") == "periodic" and sample.get("gpu_utilization_percent") is not None
+    ]
+    if periodic:
+        return {**summarize(periodic).to_dict(), "source": "nvml_periodic"}
     values = [
         float(sample["nvidia_smi"]["gpu_utilization_percent"])
         for sample in samples
@@ -660,7 +669,7 @@ def _gpu_utilization_summary(samples: Sequence[dict[str, Any]]) -> dict[str, Any
         and sample["nvidia_smi"].get("gpu_utilization_percent") is not None
     ]
     return (
-        summarize(values).to_dict()
+        {**summarize(values).to_dict(), "source": "nvidia_smi_endpoints"}
         if values
         else {"available": False, "count": 0}
     )

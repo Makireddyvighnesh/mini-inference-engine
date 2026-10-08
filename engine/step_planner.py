@@ -14,6 +14,12 @@ not a fixed token count:
 chunks and recalibrates online from measured steps.  Waiting prompts are
 served shortest-remaining-first with aging, so a long prompt is not starved.
 Tokens per step are also capped by free GPU memory.
+
+The memory cap is hard: a step never holds more tokens than it allows (with
+decode rows using it all, prompts wait; with none, a prompt still advances one
+page).  The time limit is a target: the first prompt always advances at least
+``min_chunk_tokens`` and a prompt within 128 tokens of its end is finished in
+one step, so a step can exceed the limit; ``plan`` reports ``over_limit``.
 """
 
 from __future__ import annotations
@@ -128,8 +134,10 @@ class AdaptiveChunkPlanner:
         """Choose (candidate, tokens) chunks whose predicted step time fits the limit."""
 
         limit_ms = self.busy_step_ms if busy else self.idle_step_ms
-        token_cap = self.max_step_tokens if memory_token_cap is None else min(self.max_step_tokens, memory_token_cap)
-        token_cap = max(token_cap - decode_rows, self.min_chunk_tokens)
+        token_cap = max(self.max_step_tokens - decode_rows, self.min_chunk_tokens)
+        if memory_token_cap is not None:
+            memory_room = memory_token_cap - decode_rows
+            token_cap = min(token_cap, max(memory_room, 0 if decode_rows else self.granularity))
         order = sorted(candidates, key=lambda c: c.remaining - self.aging_tokens_per_s * c.waited_ms / 1000.0)
         chosen: list[tuple[PromptCandidate, int]] = []
         segments: list[tuple[int, int]] = []
@@ -163,8 +171,10 @@ class AdaptiveChunkPlanner:
             chosen.append((candidate, best))
             segments.append((candidate.start, best))
             used += best
+        predicted = self.cost.predict(decode_rows, segments)
         info = {"busy": busy, "limit_ms": limit_ms, "token_cap": token_cap,
-                "predicted_ms": self.cost.predict(decode_rows, segments)}
+                "memory_token_cap": memory_token_cap, "predicted_ms": predicted,
+                "over_limit": bool(segments) and predicted > limit_ms}
         return chosen, info
 
 

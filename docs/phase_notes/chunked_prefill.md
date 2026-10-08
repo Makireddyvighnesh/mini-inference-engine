@@ -292,7 +292,9 @@ the rest of it. `adaptive_chunking=True` therefore limits each pass by time:
   by ridge regression from measured passes;
 - shortest remaining prompt first with aging (2,000 tokens of priority per
   second waited), a minimum chunk of 144 tokens, never a final remainder of
-  1-128 tokens, and tokens per pass capped by free GPU memory.
+  1-128 tokens, and tokens per pass capped by free GPU memory. The memory cap
+  is hard; the time limit is a target that the minimum chunk and the tail rule
+  may exceed (each plan reports `over_limit`; see "Robustness fixes" below).
 
 Whole fresh prompts (single or packed together) now always take the packed
 path, which writes K/V straight into pages and is 9-20% faster than the
@@ -372,3 +374,30 @@ Phase 8 is complete. Recommended default: `mixed_batch=True,
 adaptive_chunking=True`. Remaining limits: prefix reuse is not supported in
 mixed mode; mixed passes cost ~3 ms more than a plain decode step; decode is
 still eager (CUDA Graph decode inside the mixed runner is Phase 9).
+
+### Robustness fixes (2026-10-08)
+
+A read-only review found three serving bugs, each reproduced on CPU and now
+covered by a regression test in `tests/test_chunked_prefill.py`:
+
+- **Late cancellation.** A request marked for cancellation that arrived while
+  other rows were decoding was admitted at the second admission point, which
+  skipped the cancellation check, and ran to completion. Both admission points
+  now cancel.
+- **Context length.** Admission checked only KV pool capacity, so a prompt
+  longer than the model's positions was accepted. Like vLLM, a request whose
+  prompt plus `max_new_tokens` exceeds `max_model_len` (default: the model's
+  `max_position_embeddings`) now fails at admission without running.
+- **Soft memory cap.** The planner's 144-token progress floor overrode the
+  free-memory token cap, and the memory estimate never went below one page.
+  The cap is now hard: decode rows that use it all make prompts wait; with no
+  decode rows a prompt still advances one page. Steps whose plan exceeds the
+  time limit are counted (`planned_steps_over_time_limit` in the run summary).
+
+CUDA out-of-memory behavior is now defined: an `OutOfMemoryError` during any
+forward fails every admitted, unfinished request (their KV may be partly
+written), releases their pages, empties the allocator cache, and keeps serving
+the queue; finished requests keep their outputs. The run summary reports
+`oom_errors` and `oom_failed_requests`. Any other exception still aborts the
+run. Whole-prompt and fixed-budget paths have no memory cap; only adaptive
+chunking sizes steps from free memory.

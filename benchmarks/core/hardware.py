@@ -144,6 +144,48 @@ def collect_environment_metadata() -> dict[str, Any]:
     return metadata
 
 
+_NVML: dict[str, Any] = {}
+
+
+def _nvml_utilization_percent(properties: Any) -> int | None:
+    """GPU busy percent from NVML (the counter nvidia-smi reports), or None.
+
+    Reads libnvidia-ml directly through ctypes: microseconds per call and no
+    subprocess, so periodic samples can run during a timed window.
+    """
+
+    import ctypes
+
+    try:
+        if "lib" not in _NVML:
+            _NVML["lib"] = None
+            lib = ctypes.CDLL("libnvidia-ml.so.1")
+            if lib.nvmlInit_v2() != 0:
+                return None
+            _NVML["lib"] = lib
+        lib = _NVML["lib"]
+        if lib is None:
+            return None
+        bus_id = (f"{properties.pci_domain_id:08X}:{properties.pci_bus_id:02X}:"
+                  f"{properties.pci_device_id:02X}.0")
+        handle = _NVML.get(bus_id)
+        if handle is None:
+            handle = ctypes.c_void_p()
+            if lib.nvmlDeviceGetHandleByPciBusId_v2(bus_id.encode(), ctypes.byref(handle)) != 0:
+                return None
+            _NVML[bus_id] = handle
+
+        class Utilization(ctypes.Structure):
+            _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
+
+        rates = Utilization()
+        if lib.nvmlDeviceGetUtilizationRates(handle, ctypes.byref(rates)) != 0:
+            return None
+        return int(rates.gpu)
+    except (OSError, AttributeError):
+        return None
+
+
 def capture_gpu_snapshot(
     label: str,
     *,
@@ -173,6 +215,7 @@ def capture_gpu_snapshot(
         "torch_memory_reserved_bytes": None,
         "torch_peak_memory_allocated_bytes": None,
         "torch_peak_memory_reserved_bytes": None,
+        "gpu_utilization_percent": None,
         "nvidia_smi": None,
     }
 
@@ -218,6 +261,7 @@ def capture_gpu_snapshot(
                 "torch_peak_memory_reserved_bytes": int(
                     torch.cuda.max_memory_reserved(device_index)
                 ),
+                "gpu_utilization_percent": _nvml_utilization_percent(properties),
             }
         )
     if include_system_telemetry:

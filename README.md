@@ -69,14 +69,15 @@ the same request-event schema.
 
 | Engine | Time to first token | Time per output token | Decode tok/s | GPU busy |
 |---|---|---|---|---|
-| HF `generate()` | 89 ms | 56.1 ms | 17.8 | 41% |
+| HF `generate()` | 89 ms | 56.1 ms | 17.8 | 43% |
 | Manual decode loop | 88 ms | 55.4 ms | 18.1 | 44% |
 | No KV cache (recompute) | 88 ms | 113.0 ms | 8.8 | 99% |
-| Explicit KV cache | 88 ms | 55.9 ms | 17.9 | 41% |
+| Explicit KV cache | 88 ms | 55.9 ms | 17.9 | 44% |
 | Paged KV + Triton decode | 102 ms | 60.0 ms | 16.7 | 40% |
 | Paged KV + CUDA Graph decode | 90 ms | **22.6 ms** | **44.2** | 100% |
 
-Decode tok/s is 1,000 / time per output token.
+Decode tok/s is 1,000 / time per output token. GPU busy is the median of NVML utilization
+sampled every 0.25 s during each run (about 30 samples per run).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/showcase/batch-scaling-dark.svg">

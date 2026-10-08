@@ -300,12 +300,20 @@ def warm_fused_kernels(model: Any) -> None:
                 x = torch.zeros(rows, width, dtype=torch.bfloat16, device=device)
                 rms_norm(x, weight, 1e-6)
                 rms_norm(x, weight, 1e-6, residual=x)
-        gate = torch.zeros(1, int(config.intermediate_size), dtype=torch.bfloat16, device=device)
-        silu_mul(gate, gate)
+        # silu_mul switches block size at 2**20 elements (about 108 prompt rows).
+        intermediate = int(config.intermediate_size)
+        for rows in (1, -(-(1 << 20) // intermediate)):
+            gate = torch.zeros(rows, intermediate, dtype=torch.bfloat16, device=device)
+            silu_mul(gate, gate)
+        # Triton specializes integer arguments that equal 1 or are multiples of 16,
+        # so RoPE compiles per (q heads, kv heads) x (decode, seq % 16 == 0, other):
+        # warm one [B, T, H, D] -> [B, H, T, D] view of each, as projections produce.
         head_dim = int(getattr(config, "head_dim", config.hidden_size // config.num_attention_heads))
-        q = torch.zeros(1, 1, 1, head_dim, dtype=torch.bfloat16, device=device)
-        cos = torch.zeros(1, 1, head_dim, dtype=torch.bfloat16, device=device)
-        apply_rotary_pos_emb(q, q, cos, cos)
+        heads = (int(config.num_attention_heads), int(getattr(config, "num_key_value_heads", config.num_attention_heads)))
+        for seq in (1, 16, 17):
+            q, k = (torch.zeros(1, seq, h, head_dim, dtype=torch.bfloat16, device=device).transpose(1, 2) for h in heads)
+            cos = torch.zeros(1, seq, head_dim, dtype=torch.bfloat16, device=device)
+            apply_rotary_pos_emb(q, k, cos, cos)
     torch.cuda.synchronize(device)
 
 

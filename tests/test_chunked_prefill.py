@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from copy import deepcopy
 
 import pytest
@@ -453,3 +454,82 @@ def test_cost_model_recalibrates_toward_measurements():
     for tokens in (256, 512, 1024, 2048) * 4:
         model.observe(0, [(0, tokens)], 30.0 + 0.1 * tokens)  # a faster machine than the prior
     assert abs(model.predict(0, [(0, 1024)]) - (30.0 + 0.1 * 1024)) < 25.0
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_request_cancelled_while_others_decode_is_never_run(mixed):
+    model = _model()
+    # Every forward path ends in the final norm; slow it so decode is busy when "late" arrives.
+    model.model.norm.register_forward_pre_hook(lambda *_: time.sleep(0.005))
+    runner = ChunkedPrefillPagedRunner(model, block_size=2, num_blocks=32, max_batch_size=4,
+        max_prefill_tokens=8, prefill_chunk_size=None, mixed_batch=mixed,
+        cancel_request_ids=("late",), device="cpu", enable_prefix=False)
+    result = _run(runner, (RequestSpec("a", (1, 2, 3), 12),
+                           RequestSpec("late", (4, 5), 4, scheduled_arrival_ms=20.0)))
+    rows = {row["request_id"]: row["outcome"] for row in result.runs[0]["requests"]}
+    assert rows["a"]["status"] == "completed"
+    assert rows["late"]["status"] == "cancelled" and rows["late"]["generated_token_ids"] == []
+    assert runner.last_summary["active_request_blocks_after_run"] == 0
+    runner.close()
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_requests_above_model_context_length_fail_at_admission(mixed):
+    runner = ChunkedPrefillPagedRunner(_model(), block_size=2, num_blocks=128, max_batch_size=4,
+        max_prefill_tokens=128, prefill_chunk_size=None, mixed_batch=mixed, device="cpu", enable_prefix=False)
+    prompt = tuple(i % 31 + 1 for i in range(60))
+    result = _run(runner, (RequestSpec("fits", prompt, 4), RequestSpec("too-long", prompt, 5),
+                           RequestSpec("prompt-too-long", prompt + prompt[:10], 1)))
+    rows = {row["request_id"]: row["outcome"] for row in result.runs[0]["requests"]}
+    assert rows["fits"]["status"] == "completed" and len(rows["fits"]["generated_token_ids"]) == 4
+    for name in ("too-long", "prompt-too-long"):
+        assert rows[name]["status"] == "failed" and "context length" in rows[name]["error"]
+    assert runner.max_model_len == 64
+    runner.close()
+    with pytest.raises(ValueError, match="max_model_len"):
+        ChunkedPrefillPagedRunner(_model(), block_size=2, num_blocks=8, max_batch_size=1,
+                                  max_prefill_tokens=8, max_model_len=1, device="cpu")
+
+
+def test_planner_memory_cap_is_hard_and_time_overrun_is_reported():
+    planner = AdaptiveChunkPlanner()
+    prompt = PromptCandidate("p", 8192, 0, 0.0)
+    plan, info = planner.plan([prompt], decode_rows=0, busy=True, memory_token_cap=100)
+    assert sum(count for _, count in plan) <= 100  # below the 144-token progress floor
+    plan, info = planner.plan([prompt], decode_rows=0, busy=True, memory_token_cap=0)
+    assert sum(count for _, count in plan) == planner.granularity  # alone, a prompt still advances
+    plan, info = planner.plan([prompt, PromptCandidate("q", 300, 0, 0.0)], decode_rows=40, busy=True,
+                              memory_token_cap=48)
+    assert sum(count for _, count in plan) + 40 <= 48
+    plan, info = planner.plan([prompt], decode_rows=40, busy=True, memory_token_cap=30)
+    assert plan == [] and not info["over_limit"]  # decode rows use all memory: prompts wait
+    slow = AdaptiveChunkPlanner(busy_step_ms=1.0)  # nothing fits: the progress floor overruns
+    plan, info = slow.plan([prompt], decode_rows=0, busy=True)
+    assert plan[0][1] == slow.min_chunk_tokens and info["over_limit"]
+
+
+def test_cuda_oom_fails_only_inflight_requests_and_serving_continues():
+    model = _model()
+    original = model.forward
+    calls = 0
+
+    def oom_once(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise torch.OutOfMemoryError("CUDA out of memory (injected)")
+        return original(**kwargs)
+
+    model.forward = oom_once
+    runner = ChunkedPrefillPagedRunner(model, block_size=2, num_blocks=32, max_batch_size=2,
+        max_prefill_tokens=2, prefill_chunk_size=2, device="cpu", enable_prefix=False)
+    result = _run(runner, (RequestSpec("a", tuple(range(1, 10)), 2),
+                           RequestSpec("b", (4, 5), 3, scheduled_arrival_ms=30.0)))
+    rows = {row["request_id"]: row["outcome"] for row in result.runs[0]["requests"]}
+    assert rows["a"]["status"] == "failed" and "out of memory" in rows["a"]["error"]
+    assert rows["b"]["status"] == "completed" and len(rows["b"]["generated_token_ids"]) == 3
+    summary = runner.last_summary
+    assert summary["status"] == "completed" and summary["oom_errors"] == 1 and summary["oom_failed_requests"] == 1
+    assert summary["active_request_blocks_after_run"] == 0
+    runner.close()
+    assert runner.allocator.free_block_count == runner.allocator.num_blocks

@@ -37,8 +37,11 @@ are ~1,000 tiny kernel launches per step.
 methods on that model and patches the RoPE function in Transformers' Qwen3 module and
 in `engine/kv_cache/qwen3_paged.py` (reference counted); `uninstall_fused_kernels`
 restores the PyTorch path. Install pre-compiles every kernel specialization so no
-Triton compile lands in a timed request. Rows narrower than 128 or not a multiple of 4
-fall back to PyTorch.
+Triton compile lands in a timed request (Triton specializes integer arguments
+equal to 1 or divisible by 16, so RoPE is warmed for decode, aligned, and odd
+token counts with both head counts, and `silu_mul` for both block sizes;
+`tests/test_fused_kernels.py` checks that serving shapes compile nothing new).
+Rows narrower than 128 or not a multiple of 4 fall back to PyTorch.
 
 ## Exactness
 

@@ -23,6 +23,10 @@ except ImportError:  # pragma: no cover - covered by the runtime availability ch
 
 
 SUPPORTED_BLOCK_SIZE = (128, 128)
+# Row counts above this share its autotune bucket.  Every config uses
+# BLOCK_K=128, so the config only changes speed, never a row's bits; a forward
+# larger than any pre-tuned bucket would otherwise pay a multi-second search.
+MAX_M_BUCKET = 16384
 _original_fp8_linear: Callable[..., torch.Tensor] | None = None
 
 
@@ -273,13 +277,13 @@ def sm89_fp8_linear(
         output.stride(1),
         scales_2d.stride(0),
         scales_2d.stride(1),
-        1 << (m - 1).bit_length(),
+        min(1 << (m - 1).bit_length(), MAX_M_BUCKET),
     )
     result = output.reshape(*input.shape[:-1], n)
     return result if bias is None else result + bias
 
 
-def pretune_sm89_fp8(model: Any, max_tokens: int = 16384) -> int:
+def pretune_sm89_fp8(model: Any, max_tokens: int = MAX_M_BUCKET) -> int:
     """Autotune every power-of-two row bucket up to ``max_tokens`` for each
     FP8 projection shape in ``model``, so no search happens inside a timed
     request.  Results persist in the Triton cache; returns the bucket count.

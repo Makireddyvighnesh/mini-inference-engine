@@ -281,3 +281,15 @@ def test_blocking_gpu_snapshots_are_outside_the_timed_run(
     assert run["gpu"]["after"] == {"label": "after"}
     assert run["duration_ms"] < snapshot_ms
     assert result.summary["metrics"]["ttft_ms"]["maximum"] < snapshot_ms
+
+
+def test_gpu_utilization_prefers_periodic_nvml_samples():
+    from minillm_l4.benchmarks.core.harness import _gpu_utilization_summary
+
+    endpoints = [{"label": label, "gpu_utilization_percent": None, "nvidia_smi": {"gpu_utilization_percent": 0}}
+                 for label in ("before", "after")]
+    periodic = [{"label": "periodic", "gpu_utilization_percent": value} for value in (90, 100, 100)]
+    summary = _gpu_utilization_summary(endpoints + periodic)
+    assert summary["source"] == "nvml_periodic" and summary["count"] == 3 and summary["p50"] == 100
+    fallback = _gpu_utilization_summary(endpoints)
+    assert fallback["source"] == "nvidia_smi_endpoints" and fallback["count"] == 2

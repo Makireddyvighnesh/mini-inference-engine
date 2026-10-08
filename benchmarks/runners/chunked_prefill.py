@@ -77,6 +77,7 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
                  graph_batch_sizes: Sequence[int] = DEFAULT_GRAPH_BATCH_SIZES,
                  graph_mixed_decode: bool = False,
                  graph_mixed_decode_order: str = "decode_first",
+                 max_model_len: int | None = None,
                  **kwargs: Any) -> None:
         if prefill_chunk_size is not None and (
             isinstance(prefill_chunk_size, bool)
@@ -129,6 +130,10 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
                 token_count=self.graph_batch_sizes[-1] * self.allocator.block_size,
             )
             self._graph_scratch_blocks = scratch.block_ids
+        # Like vLLM, reject prompt + max output above the model's context length.
+        self.max_model_len = int(max_model_len or getattr(model.config, "max_position_embeddings", 0) or 0) or None
+        if self.max_model_len is not None and self.max_model_len < 2:
+            raise ValueError("max_model_len must be at least 2")
         self.prefill_chunk_size = prefill_chunk_size
         self.batched_prefill = bool(batched_prefill)
         self.mixed_batch = bool(mixed_batch)
@@ -518,7 +523,7 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
         if self.device.type != "cuda":
             return None
         free, _ = torch.cuda.mem_get_info(self.device)
-        return max(int((free - 2**30) // (128 * 1024)), self.allocator.block_size)
+        return max(int((free - 2**30) // (128 * 1024)), 0)
 
     def _complete(self, state: _PartialRequest, outcomes: dict[str, RequestOutcome]) -> None:
         super()._complete(state, outcomes)
@@ -564,149 +569,171 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
         prefilling: deque[_PartialRequest] = deque()
         outcomes: dict[str, RequestOutcome] = {}
         records: list[dict[str, Any]] = []
-        deferred = budget_deferred = peak_blocks = peak_inflight = 0
+        deferred = budget_deferred = peak_blocks = peak_inflight = oom_errors = 0
         failure: str | None = None
         clock = recorders[0]
         try:
             while not scheduler.empty or active or prefilling:
-                if scheduler.admit(clock.now_ns() / 1e6):
-                    self._last_arrival_ms = clock.now_ns() / 1e6
-                for item in scheduler.cancel_ready(set(self.cancel_request_ids)):
-                    self._cancel(states[item.request_id], outcomes)
-                # Decode has priority; no prefill batching wait stalls a live row.
-                if active and not self.mixed_batch:
-                    owners = [state.request.request_id for state in active]
-                    started = clock.now_ns()
-                    self._decode(active)
-                    ended = clock.now_ns()
-                    peak_blocks = max(peak_blocks, self.allocator.allocated_block_count)
-                    finished = [state for state in active if len(state.generated) >= state.request.max_new_tokens or state.generated[-1] in self.eos_token_ids]
-                    records.append({"kind": "decode", "request_ids": owners, "batch_size": len(active),
-                                    "finished_request_ids": [s.request.request_id for s in finished],
-                                    "decode_mode": "graph" if self._graph_bucket(len(active)) is not None else "eager",
-                                    "start_ms": started / 1e6, "end_ms": ended / 1e6, "wall_ms": (ended - started) / 1e6})
-                    for state in finished:
-                        self._complete(state, outcomes)
-                    finished_ids = {state.request.request_id for state in finished}
-                    active = [state for state in active if state.request.request_id not in finished_ids]
-                if not active and not prefilling and not scheduler.ready_count:
-                    if scheduler.next_arrival_ms is None:
-                        break
-                    _wait_until_ms(clock, scheduler.next_arrival_ms)
-                    continue
-                now = clock.now_ns() / 1e6
-                if scheduler.admit(now):
-                    self._last_arrival_ms = now
-                if not active and not prefilling and scheduler.should_wait_for_batch(now, active_count=0):
-                    _wait_until_ms(clock, float(scheduler.oldest_ready_arrival_ms) + self.max_wait_ms)
-                    continue
-                # Admit every ready request that fits; queue only on exhausted slots or pages.
-                while scheduler.ready_count and len(active) + len(prefilling) < self.max_batch_size:
-                    inflight = active + list(prefilling)
-                    selected = scheduler.next_batch(costs, max_requests=1)
-                    state = states[selected[0].request_id]
-                    owner = state.request.request_id
-                    final_length = state.request.prompt_tokens + state.request.max_new_tokens - 1
-                    if math.ceil(final_length / self.allocator.block_size) > self._request_num_blocks:
-                        self._fail(state, outcomes, "request exceeds total KV capacity")
-                    else:
-                        try:
-                            if self.enable_prefix:
-                                state.reused_tokens = self.prefixes.attach(owner, state.request.prompt_token_ids, output_tokens=state.request.max_new_tokens)
-                            else:
-                                self.allocator.allocate(owner)
-                            future = self._future_blocks(state) + sum(self._future_blocks(item) for item in inflight)
-                            if not self.prefixes.evict_until_free(future):
-                                raise PagedKvOutOfMemoryError("insufficient capacity for all in-flight requests to finish")
-                            else:
-                                if self.enable_prefix:
-                                    self.prefixes.record_admission(state.reused_tokens)
-                                state.recorder.record("admission")
-                                state.admitted_ms = state.recorder.now_ns() / 1e6
-                                state.recorder.record("execution_start")
-                                state.lifecycle.transition(RequestState.PREFILL)
-                                prefilling.append(state)
-                                peak_inflight = max(peak_inflight, len(inflight) + 1)
-                        except PagedKvOutOfMemoryError:
-                            if owner in self.allocator.sequence_ids:
-                                self.cache.release(owner)
-                            if inflight:
-                                scheduler.defer_front(selected)
-                                deferred += 1
-                                break
-                            self._fail(state, outcomes, "KV capacity unavailable")
-                if self.mixed_batch:
-                    self._queued = scheduler.ready_count
-                    if active or prefilling:
-                        step = self._mixed_step(active, prefilling)
+                try:
+                    if scheduler.admit(clock.now_ns() / 1e6):
+                        self._last_arrival_ms = clock.now_ns() / 1e6
+                    for item in scheduler.cancel_ready(set(self.cancel_request_ids)):
+                        self._cancel(states[item.request_id], outcomes)
+                    # Decode has priority; no prefill batching wait stalls a live row.
+                    if active and not self.mixed_batch:
+                        owners = [state.request.request_id for state in active]
+                        started = clock.now_ns()
+                        self._decode(active)
+                        ended = clock.now_ns()
                         peak_blocks = max(peak_blocks, self.allocator.allocated_block_count)
-                        chunk_records = step.pop("chunk_records")
-                        if step["decode_rows"]:
-                            records.append({"kind": "decode", "request_ids": step["decode_request_ids"],
-                                            "batch_size": step["decode_rows"], "decode_mode": step["decode_mode"],
-                                            "wall_ms": step["wall_ms"] if not step["prefill_tokens"] else None})
-                        records.extend(chunk_records)
-                        records.append(step)
-                        newly_decoding = [state for state in prefilling if state.generated]
-                        for state in newly_decoding:
-                            prefilling.remove(state)
-                        still_active = []
-                        for state in active + newly_decoding:
+                        finished = [state for state in active if len(state.generated) >= state.request.max_new_tokens or state.generated[-1] in self.eos_token_ids]
+                        records.append({"kind": "decode", "request_ids": owners, "batch_size": len(active),
+                                        "finished_request_ids": [s.request.request_id for s in finished],
+                                        "decode_mode": "graph" if self._graph_bucket(len(active)) is not None else "eager",
+                                        "start_ms": started / 1e6, "end_ms": ended / 1e6, "wall_ms": (ended - started) / 1e6})
+                        for state in finished:
+                            self._complete(state, outcomes)
+                        finished_ids = {state.request.request_id for state in finished}
+                        active = [state for state in active if state.request.request_id not in finished_ids]
+                    if not active and not prefilling and not scheduler.ready_count:
+                        if scheduler.next_arrival_ms is None:
+                            break
+                        _wait_until_ms(clock, scheduler.next_arrival_ms)
+                        continue
+                    now = clock.now_ns() / 1e6
+                    if scheduler.admit(now):
+                        self._last_arrival_ms = now
+                    for item in scheduler.cancel_ready(set(self.cancel_request_ids)):
+                        self._cancel(states[item.request_id], outcomes)
+                    if not active and not prefilling and scheduler.should_wait_for_batch(now, active_count=0):
+                        _wait_until_ms(clock, float(scheduler.oldest_ready_arrival_ms) + self.max_wait_ms)
+                        continue
+                    # Admit every ready request that fits; queue only on exhausted slots or pages.
+                    while scheduler.ready_count and len(active) + len(prefilling) < self.max_batch_size:
+                        inflight = active + list(prefilling)
+                        selected = scheduler.next_batch(costs, max_requests=1)
+                        state = states[selected[0].request_id]
+                        owner = state.request.request_id
+                        final_length = state.request.prompt_tokens + state.request.max_new_tokens - 1
+                        if self.max_model_len is not None and final_length + 1 > self.max_model_len:
+                            self._fail(state, outcomes, f"request exceeds model context length "
+                                       f"({final_length + 1} > {self.max_model_len} tokens)")
+                        elif math.ceil(final_length / self.allocator.block_size) > self._request_num_blocks:
+                            self._fail(state, outcomes, "request exceeds total KV capacity")
+                        else:
+                            try:
+                                if self.enable_prefix:
+                                    state.reused_tokens = self.prefixes.attach(owner, state.request.prompt_token_ids, output_tokens=state.request.max_new_tokens)
+                                else:
+                                    self.allocator.allocate(owner)
+                                future = self._future_blocks(state) + sum(self._future_blocks(item) for item in inflight)
+                                if not self.prefixes.evict_until_free(future):
+                                    raise PagedKvOutOfMemoryError("insufficient capacity for all in-flight requests to finish")
+                                else:
+                                    if self.enable_prefix:
+                                        self.prefixes.record_admission(state.reused_tokens)
+                                    state.recorder.record("admission")
+                                    state.admitted_ms = state.recorder.now_ns() / 1e6
+                                    state.recorder.record("execution_start")
+                                    state.lifecycle.transition(RequestState.PREFILL)
+                                    prefilling.append(state)
+                                    peak_inflight = max(peak_inflight, len(inflight) + 1)
+                            except PagedKvOutOfMemoryError:
+                                if owner in self.allocator.sequence_ids:
+                                    self.cache.release(owner)
+                                if inflight:
+                                    scheduler.defer_front(selected)
+                                    deferred += 1
+                                    break
+                                self._fail(state, outcomes, "KV capacity unavailable")
+                    if self.mixed_batch:
+                        self._queued = scheduler.ready_count
+                        if active or prefilling:
+                            step = self._mixed_step(active, prefilling)
+                            peak_blocks = max(peak_blocks, self.allocator.allocated_block_count)
+                            chunk_records = step.pop("chunk_records")
+                            if step["decode_rows"]:
+                                records.append({"kind": "decode", "request_ids": step["decode_request_ids"],
+                                                "batch_size": step["decode_rows"], "decode_mode": step["decode_mode"],
+                                                "wall_ms": step["wall_ms"] if not step["prefill_tokens"] else None})
+                            records.extend(chunk_records)
+                            records.append(step)
+                            newly_decoding = [state for state in prefilling if state.generated]
+                            for state in newly_decoding:
+                                prefilling.remove(state)
+                            still_active = []
+                            for state in active + newly_decoding:
+                                if len(state.generated) >= state.request.max_new_tokens or state.generated[-1] in self.eos_token_ids:
+                                    self._complete(state, outcomes)
+                                else:
+                                    still_active.append(state)
+                            active = still_active
+                        continue
+                    decoding = bool(active)
+                    while (self.prefill_chunk_size is None and self.batched_prefill and len(prefilling) > 1
+                            and all(state.session is None and not state.reused_tokens for state in prefilling)):
+                        # Whole prompts that arrived together share one flattened forward,
+                        # packed FIFO up to the per-forward token limit.
+                        limit = self.packed_prefill_token_limit or math.inf
+                        batch, tokens = [], 0
+                        for state in prefilling:
+                            if batch and tokens + state.request.prompt_tokens > limit:
+                                break
+                            batch.append(state)
+                            tokens += state.request.prompt_tokens
+                        for _ in batch:
+                            prefilling.popleft()
+                        # A prompt at or above the limit runs alone; packing resumes after it.
+                        step_records = self._packed_prefill(batch)
+                        for record in step_records:
+                            record["while_decoding"] = decoding
+                            records.append(record)
+                        peak_blocks = max(peak_blocks, self.allocator.allocated_block_count)
+                        for state in batch:
                             if len(state.generated) >= state.request.max_new_tokens or state.generated[-1] in self.eos_token_ids:
                                 self._complete(state, outcomes)
                             else:
-                                still_active.append(state)
-                        active = still_active
-                    continue
-                decoding = bool(active)
-                while (self.prefill_chunk_size is None and self.batched_prefill and len(prefilling) > 1
-                        and all(state.session is None and not state.reused_tokens for state in prefilling)):
-                    # Whole prompts that arrived together share one flattened forward,
-                    # packed FIFO up to the per-forward token limit.
-                    limit = self.packed_prefill_token_limit or math.inf
-                    batch, tokens = [], 0
-                    for state in prefilling:
-                        if batch and tokens + state.request.prompt_tokens > limit:
-                            break
-                        batch.append(state)
-                        tokens += state.request.prompt_tokens
-                    for _ in batch:
-                        prefilling.popleft()
-                    # A prompt at or above the limit runs alone; packing resumes after it.
-                    step_records = self._packed_prefill(batch)
-                    for record in step_records:
+                                active.append(state)
+                    # Spend the iteration's prompt budget round-robin across partial prompts.
+                    budget = math.inf if self.prefill_chunk_size is None else self.max_prefill_tokens
+                    while prefilling and budget > 0:
+                        state = prefilling.popleft()
+                        remaining = state.request.prompt_tokens - (
+                            state.session.next_position if state.session else state.reused_tokens
+                        )
+                        limit = remaining if self.prefill_chunk_size is None else int(min(self.prefill_chunk_size, budget))
+                        if self.prefill_chunk_size is None and state.session is None and not state.reused_tokens:
+                            # A whole fresh prompt takes the packed path: K/V go straight into pages.
+                            record = self._packed_prefill([state])[0]
+                        else:
+                            record = self._prefill_step(state, limit)
                         record["while_decoding"] = decoding
                         records.append(record)
-                    peak_blocks = max(peak_blocks, self.allocator.allocated_block_count)
-                    for state in batch:
-                        if len(state.generated) >= state.request.max_new_tokens or state.generated[-1] in self.eos_token_ids:
-                            self._complete(state, outcomes)
+                        budget -= record["computed_tokens"]
+                        peak_blocks = max(peak_blocks, self.allocator.allocated_block_count)
+                        if state.generated:
+                            if len(state.generated) >= state.request.max_new_tokens or state.generated[-1] in self.eos_token_ids:
+                                self._complete(state, outcomes)
+                            else:
+                                active.append(state)
                         else:
-                            active.append(state)
-                # Spend the iteration's prompt budget round-robin across partial prompts.
-                budget = math.inf if self.prefill_chunk_size is None else self.max_prefill_tokens
-                while prefilling and budget > 0:
-                    state = prefilling.popleft()
-                    remaining = state.request.prompt_tokens - (
-                        state.session.next_position if state.session else state.reused_tokens
-                    )
-                    limit = remaining if self.prefill_chunk_size is None else int(min(self.prefill_chunk_size, budget))
-                    if self.prefill_chunk_size is None and state.session is None and not state.reused_tokens:
-                        # A whole fresh prompt takes the packed path: K/V go straight into pages.
-                        record = self._packed_prefill([state])[0]
-                    else:
-                        record = self._prefill_step(state, limit)
-                    record["while_decoding"] = decoding
-                    records.append(record)
-                    budget -= record["computed_tokens"]
-                    peak_blocks = max(peak_blocks, self.allocator.allocated_block_count)
-                    if state.generated:
-                        if len(state.generated) >= state.request.max_new_tokens or state.generated[-1] in self.eos_token_ids:
-                            self._complete(state, outcomes)
-                        else:
-                            active.append(state)
-                    else:
-                        prefilling.append(state)
+                            prefilling.append(state)
+                except torch.OutOfMemoryError as error:
+                    # A forward ran out of GPU memory part-way: the KV of every
+                    # in-flight request may be half-written, so fail those requests,
+                    # free their pages, and keep serving the queue.  Completed
+                    # requests keep their outputs.
+                    oom_errors += 1
+                    lost = [s for s in states.values()  # includes a packed batch already dequeued
+                            if not s.lifecycle.terminal and s.lifecycle.state is not RequestState.WAITING]
+                    for state in lost:
+                        state.session = None
+                        self._fail(state, outcomes, f"CUDA out of memory: {error}")
+                    active, prefilling = [], deque()
+                    records.append({"kind": "oom", "failed_request_ids": [s.request.request_id for s in lost],
+                                    "at_ms": clock.now_ns() / 1e6})
+                    if self.device.type == "cuda":
+                        torch.cuda.empty_cache()
         except Exception as error:
             failure = f"{type(error).__name__}: {error}"
             self.prefixes.clear()
@@ -723,7 +750,7 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
                 states=states, scheduler=scheduler, records=records,
                 start_stats=start_stats, deferred=deferred,
                 budget_deferred=budget_deferred, peak_blocks=peak_blocks,
-                peak_inflight=peak_inflight, failure=failure,
+                peak_inflight=peak_inflight, failure=failure, oom_errors=oom_errors,
             )
         if len(outcomes) != len(requests):
             raise RuntimeError("chunked scheduler left requests unfinished")
@@ -733,7 +760,7 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
         self, *, states: dict[str, _PartialRequest], scheduler: ContinuousBatchScheduler,
         records: list[dict[str, Any]], start_stats: dict[str, Any], deferred: int,
         budget_deferred: int, peak_blocks: int, peak_inflight: int,
-        failure: str | None,
+        failure: str | None, oom_errors: int = 0,
     ) -> None:
         stats = self.prefixes.snapshot()
         chunks = [record for record in records if record["kind"] == "prefill_chunk"]
@@ -781,6 +808,9 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
             "prefill_chunks": len(chunks), "prefill_chunks_while_decoding": sum(record["while_decoding"] for record in chunks),
             "maximum_decode_batch_size": max((record["batch_size"] for record in records if record["kind"] == "decode"), default=0),
             "deferred_admissions": deferred, "budget_deferred_admissions": budget_deferred,
+            "oom_errors": oom_errors,
+            "oom_failed_requests": sum(len(r["failed_request_ids"]) for r in records if r["kind"] == "oom"),
+            "planned_steps_over_time_limit": sum(bool(r.get("over_limit")) for r in records if r["kind"] == "mixed_step"),
             "maximum_queue_depth": scheduler.maximum_queue_depth,
             "max_physical_blocks": peak_blocks, "peak_kv_utilization": peak_blocks / self.allocator.num_blocks,
             "evictions": stats["evictions"] - start_stats["evictions"],
