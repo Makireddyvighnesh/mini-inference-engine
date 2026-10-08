@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import statistics
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Sequence
 
 from .schemas import EventRecord, RequestOutcome, RequestSpec
 
@@ -11,7 +11,7 @@ from .schemas import EventRecord, RequestOutcome, RequestSpec
 def percentile(values: Sequence[float], percentile_value: float) -> float:
     """Return a linearly interpolated percentile.
 
-    The definition is intentionally shared by every Phase 0 report so small
+    The definition is intentionally shared by every benchmark report so small
     samples do not silently switch between library-specific percentile rules.
     """
 

@@ -21,8 +21,6 @@ from minillm_l4.benchmarks.runners.continuous_requests import (
 )
 from minillm_l4.benchmarks.runners.huggingface_baseline import (
     BASELINE_BUCKETS,
-    MODEL_ID,
-    MODEL_REVISION,
     build_hf_workload,
     load_qwen_fp8,
 )

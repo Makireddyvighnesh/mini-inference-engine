@@ -28,11 +28,9 @@ from minillm_l4.engine.kv_cache import (
 from minillm_l4.engine.model_runner.qwen3_packed import qwen3_packed_prefill
 
 from .paged_kv import (
-    _elapsed_ms,
     _first_model_device,
     _paged_activation_dtype,
     _select_next_token,
-    _synchronize,
     _token_values,
 )
 from minillm_l4.engine.kv_cache.qwen3_paged import install_paged_qwen3_attention
