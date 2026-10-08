@@ -179,6 +179,32 @@ when long prompts arrive constantly. Each batch-size bucket costs about 0.27 s
 to capture once and ~22 MiB of graph memory. Details:
 [CUDA Graphs notes](docs/phase_notes/cuda_graphs.md).
 
+## Fused kernels
+
+Between the FP8 matmuls, each layer ran dozens of small PyTorch ops (RMSNorm's casts,
+square, mean and scaling; SiLU and the gate multiply; RoPE's slices, negation and
+concatenation), each reading and writing a full activation tensor. Four fused Triton
+kernels (RMSNorm, residual add + RMSNorm, SiLU x up, RoPE) do each in one pass. They are
+bit-identical to the PyTorch ops, including PyTorch's reduction order inside RMSNorm, so
+tokens do not change (112/112 request outputs identical across eager, chunked, adaptive,
+and CUDA Graph policies). Separate L4 run, zero allocator retries:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/fused_kernels/prefill-ttft-dark.svg">
+  <img alt="Prefill time to first token with and without fused kernels: 10 to 23 percent faster, 2,105 ms to 1,618 ms at 8192 tokens" src="docs/assets/fused_kernels/prefill-ttft-light.svg">
+</picture>
+
+| | Unfused | Fused | Change |
+|---|---|---|---|
+| Prefill, 2,048 tokens | 396.8 ms | 334.0 ms | **-16%** |
+| Prefill, 8,192 tokens | 2,104.5 ms | 1,618.2 ms | **-23%** |
+| Decode, 1 request, eager (time per token) | 62.5 ms | 50.2 ms | **-20%** |
+| Decode, 1 request, CUDA Graph (time per token) | 22.6 ms | 20.7 ms | -8% |
+| Serving 16 requests with CUDA Graphs (output tok/s) | 339.7 | 357.9 | +5% |
+| q-head RMSNorm alone, 2,048 tokens | 0.783 ms | 0.098 ms | 8.0x faster |
+
+Details: [fused kernels notes](docs/phase_notes/fused_kernels.md).
+
 ## Reproduce
 
 Run from the repository root that contains `minillm_l4/`:
@@ -197,6 +223,10 @@ Run from the repository root that contains `minillm_l4/`:
     --output-dir minillm_l4/results/cuda_graphs_$(date +%Y%m%d)
 .conda-env/bin/python minillm_l4/scripts/make_cuda_graph_charts.py \
     minillm_l4/results/cuda_graphs_<date>/cuda_graphs.json minillm_l4/docs/assets/cuda_graphs
+
+# Unfused vs fused kernels (per op and end to end)
+.conda-env/bin/python -m minillm_l4.benchmarks.commands.run_fused_kernels \
+    --output-dir minillm_l4/results/fused_kernels_$(date +%Y%m%d)
 
 # Watch the engine stream tokens with live TTFT / TPOT
 .conda-env/bin/python minillm_l4/scripts/stream_generate.py \

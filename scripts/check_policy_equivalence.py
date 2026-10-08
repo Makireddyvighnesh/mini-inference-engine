@@ -27,6 +27,7 @@ from minillm_l4.benchmarks.core.schemas import RequestSpec  # noqa: E402
 from minillm_l4.benchmarks.core.synthetic import SyntheticSample, exact_token_ids  # noqa: E402
 from minillm_l4.benchmarks.runners.chunked_prefill import ChunkedPrefillPagedRunner  # noqa: E402
 from minillm_l4.benchmarks.runners.huggingface_baseline import load_qwen_fp8  # noqa: E402
+from minillm_l4.engine.kernels.fused import install_fused_kernels, uninstall_fused_kernels  # noqa: E402
 
 LENGTHS = (128, 8192, 600, 2048, 4097, 1000, 3000, 256)
 OUTPUT_TOKENS = 64
@@ -44,6 +45,13 @@ POLICIES = {
     "adaptive_graph_split_prefill_first": dict(prefill_chunk_size=None, mixed_batch=True, adaptive_chunking=True,
                                              cuda_graphs=True, graph_mixed_decode=True,
                                              graph_mixed_decode_order="prefill_first"),
+    # Fused Triton norm / add+norm / SiLU-mul / RoPE kernels (engine/kernels/fused.py).
+    "whole_fused": dict(prefill_chunk_size=None, fused=True),
+    "chunked_256_fused": dict(prefill_chunk_size=256, max_prefill_tokens=256, fused=True),
+    "adaptive_fused": dict(prefill_chunk_size=None, mixed_batch=True, adaptive_chunking=True, fused=True),
+    "whole_graph_fused": dict(prefill_chunk_size=None, cuda_graphs=True, fused=True),
+    "adaptive_graph_fused": dict(prefill_chunk_size=None, mixed_batch=True, adaptive_chunking=True,
+                                 cuda_graphs=True, fused=True),
 }
 
 
@@ -61,6 +69,12 @@ def main() -> int:
     blocks = sum(math.ceil((r.prompt_tokens + OUTPUT_TOKENS) / 16) for r in requests)
     outputs = {}
     for name, options in POLICIES.items():
+        options = dict(options)
+        fused = options.pop("fused", False)
+        if fused and not install_fused_kernels(bundle.model):
+            raise RuntimeError("fused kernels unavailable")
+        if not fused:
+            uninstall_fused_kernels(bundle.model)
         runner = ChunkedPrefillPagedRunner(
             bundle.model, block_size=16, num_blocks=blocks, max_batch_size=len(requests),
             device="cuda", decode_backend="auto", decode_sdpa_compat=True, enable_prefix=False,
