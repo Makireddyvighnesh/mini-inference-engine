@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import torch
 
+from .decode_metadata import validate_decode_metadata
+
 try:
     import triton
     import triton.language as tl
@@ -19,6 +21,7 @@ if triton is not None:
         key_source_ptr,
         value_source_ptr,
         sequence_lengths_ptr,
+        query_positions_ptr,
         block_table_ptr,
         key_destination_ptr,
         value_destination_ptr,
@@ -26,7 +29,14 @@ if triton is not None:
         source_stride_head: tl.constexpr,
         source_stride_token: tl.constexpr,
         source_stride_dim: tl.constexpr,
+        value_source_stride_batch: tl.constexpr,
+        value_source_stride_head: tl.constexpr,
+        value_source_stride_token: tl.constexpr,
+        value_source_stride_dim: tl.constexpr,
         table_stride_batch: tl.constexpr,
+        table_stride_block: tl.constexpr,
+        length_stride_batch: tl.constexpr,
+        position_stride_batch: tl.constexpr,
         key_destination_stride_block: tl.constexpr,
         key_destination_stride_head: tl.constexpr,
         key_destination_stride_token: tl.constexpr,
@@ -39,6 +49,7 @@ if triton is not None:
         block_size: tl.constexpr,
         head_dim: tl.constexpr,
         block_dim: tl.constexpr,
+        HAS_QUERY_POSITIONS: tl.constexpr,
     ):
         program_id = tl.program_id(0)
         batch_index = program_id // source_batch_count
@@ -46,14 +57,16 @@ if triton is not None:
         dim_offsets = tl.arange(0, block_dim)
         dim_mask = dim_offsets < head_dim
 
-        sequence_length = tl.load(sequence_lengths_ptr + batch_index)
+        sequence_length = tl.load(sequence_lengths_ptr + batch_index * length_stride_batch)
         logical_position = sequence_length - 1
+        if HAS_QUERY_POSITIONS:
+            logical_position = tl.load(query_positions_ptr + batch_index * position_stride_batch)
         logical_block = logical_position // block_size
         offset_in_block = logical_position % block_size
         physical_block = tl.load(
             block_table_ptr
             + batch_index * table_stride_batch
-            + logical_block,
+            + logical_block * table_stride_block,
         )
 
         source_offsets = (
@@ -67,8 +80,13 @@ if triton is not None:
             mask=dim_mask,
             other=0.0,
         )
+        value_source_offsets = (
+            batch_index * value_source_stride_batch
+            + kv_head * value_source_stride_head
+            + dim_offsets * value_source_stride_dim
+        )
         value_values = tl.load(
-            value_source_ptr + source_offsets,
+            value_source_ptr + value_source_offsets,
             mask=dim_mask,
             other=0.0,
         )
@@ -111,11 +129,15 @@ def can_use_triton_decode_kv_write(
         and value_states.is_cuda
         and key_blocks.is_cuda
         and value_blocks.is_cuda
+        and key_blocks.device == value_blocks.device == key_states.device == value_states.device
         and block_tables is not None
         and block_tables.is_cuda
         and sequence_lengths is not None
         and sequence_lengths.is_cuda
+        and block_tables.device == sequence_lengths.device == key_states.device
         and key_states.ndim == 4
+        and key_blocks.ndim == value_blocks.ndim == 4
+        and key_blocks.shape == value_blocks.shape
         and value_states.shape == key_states.shape
         and int(key_states.shape[2]) == 1
         and key_states.dtype == value_states.dtype == key_blocks.dtype == value_blocks.dtype
@@ -136,8 +158,11 @@ def triton_write_decode_kv(
     sequence_lengths: torch.Tensor,
     key_blocks: torch.Tensor,
     value_blocks: torch.Tensor,
+    *,
+    query_start_positions: torch.Tensor | None = None,
+    _validate_metadata: bool = True,
 ) -> None:
-    """Write one newly appended token per request directly into its page."""
+    """Write one token at its explicit position, or at the appended KV tail."""
 
     if not can_use_triton_decode_kv_write(
         key_states,
@@ -153,11 +178,19 @@ def triton_write_decode_kv(
     num_kv_heads = int(key_states.shape[1])
     head_dim = int(key_states.shape[3])
     block_size = int(key_blocks.shape[2])
+    if _validate_metadata:
+        validate_decode_metadata(
+            block_tables, sequence_lengths, device=key_states.device,
+            batch_size=batch_size, num_blocks=int(key_blocks.shape[0]),
+            block_size=block_size, query_positions=query_start_positions,
+        )
+    position_buffer = sequence_lengths if query_start_positions is None else query_start_positions
     block_dim = triton.next_power_of_2(head_dim)
     _write_decode_kv_kernel[(batch_size * num_kv_heads,)](
         key_states,
         value_states,
         sequence_lengths,
+        position_buffer,
         block_tables,
         key_blocks,
         value_blocks,
@@ -165,7 +198,14 @@ def triton_write_decode_kv(
         key_states.stride(1),
         key_states.stride(2),
         key_states.stride(3),
+        value_states.stride(0),
+        value_states.stride(1),
+        value_states.stride(2),
+        value_states.stride(3),
         block_tables.stride(0),
+        block_tables.stride(1),
+        sequence_lengths.stride(0),
+        position_buffer.stride(0),
         key_blocks.stride(0),
         key_blocks.stride(1),
         key_blocks.stride(2),
@@ -178,6 +218,7 @@ def triton_write_decode_kv(
         block_size,
         head_dim,
         block_dim,
+        HAS_QUERY_POSITIONS=query_start_positions is not None,
         num_warps=4,
     )
 

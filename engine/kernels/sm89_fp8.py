@@ -127,7 +127,11 @@ if triton is not None:
                 num_stages=3,
             ),
         ],
-        key=["M", "N", "K"],
+        # Tune per power-of-two row bucket, not per exact M: continuous
+        # batching and flattened prefill produce ever-new token counts, and a
+        # fresh per-M search costs seconds inside a live request.
+        key=["M_BUCKET", "N", "K"],
+        cache_results=True,
     )
     @triton.jit
     def _fp8_linear_kernel(
@@ -146,6 +150,7 @@ if triton is not None:
         stride_on,
         stride_sn,
         stride_sk,
+        M_BUCKET,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
@@ -268,9 +273,38 @@ def sm89_fp8_linear(
         output.stride(1),
         scales_2d.stride(0),
         scales_2d.stride(1),
+        1 << (m - 1).bit_length(),
     )
     result = output.reshape(*input.shape[:-1], n)
     return result if bias is None else result + bias
+
+
+def pretune_sm89_fp8(model: Any, max_tokens: int = 16384) -> int:
+    """Autotune every power-of-two row bucket up to ``max_tokens`` for each
+    FP8 projection shape in ``model``, so no search happens inside a timed
+    request.  Results persist in the Triton cache; returns the bucket count.
+    """
+
+    shapes = {
+        (module.weight, module.weight_scale_inv, tuple(getattr(module, "block_size", SUPPORTED_BLOCK_SIZE)))
+        for module in model.modules()
+        if getattr(getattr(module, "weight", None), "dtype", None) == torch.float8_e4m3fn
+        and isinstance(getattr(module, "weight_scale_inv", None), torch.Tensor)
+    }
+    unique = {}
+    for weight, scales, block in shapes:
+        unique.setdefault(tuple(weight.shape), (weight, scales, block))
+    dtype = next(p.dtype for p in model.parameters() if p.dtype in {torch.bfloat16, torch.float16})
+    buckets = [1 << i for i in range(max(1, int(max_tokens)).bit_length())]
+    with torch.inference_mode():
+        for weight, scales, block in unique.values():
+            for rows in buckets:
+                sm89_fp8_linear(
+                    torch.zeros((rows, weight.shape[1]), dtype=dtype, device=weight.device),
+                    weight, scales, block_size=list(block),
+                )
+    torch.cuda.synchronize()
+    return len(unique) * len(buckets)
 
 
 def install_sm89_fp8_dispatch() -> dict[str, Any]:

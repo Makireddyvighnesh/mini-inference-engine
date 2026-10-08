@@ -10,9 +10,11 @@ from torch import nn
 
 from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
 
+from .mixed import MixedBatchMetadata
 from .packed import PackedSequenceMetadata
+from .decode_metadata import validate_decode_metadata
 from .paged import PagedKvCache
-from .paged_attention import packed_paged_attention, paged_attention
+from .paged_attention import _triton_query_positions, packed_paged_attention, paged_attention
 from .triton_packed_kv import (
     can_use_triton_packed_kv_write,
     triton_write_packed_kv,
@@ -53,6 +55,7 @@ class PagedQwen3Attention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         page_cache = kwargs.pop("paged_kv_cache", None)
         packed_metadata = kwargs.pop("paged_packed_metadata", None)
+        mixed_metadata = kwargs.pop("paged_mixed_metadata", None)
         if page_cache is None:
             if packed_metadata is not None:
                 raise ValueError(
@@ -71,6 +74,10 @@ class PagedQwen3Attention(nn.Module):
             raise NotImplementedError(
                 "the direct adapter currently supports full-attention Qwen3 layers only"
             )
+        if mixed_metadata is not None:
+            if not isinstance(mixed_metadata, MixedBatchMetadata):
+                raise TypeError("paged_mixed_metadata must be MixedBatchMetadata")
+            return self._mixed_forward(hidden_states, position_embeddings, page_cache, mixed_metadata), None
 
         sequence_ids = tuple(
             str(sequence_id)
@@ -88,6 +95,7 @@ class PagedQwen3Attention(nn.Module):
         )
         decode_block_tokens = int(kwargs.pop("paged_decode_block_tokens", 16))
         decode_use_gqa_reuse = kwargs.pop("paged_decode_use_gqa_reuse", False)
+        decode_sdpa_compat = bool(kwargs.pop("paged_decode_sdpa_compat", False))
 
         if packed_metadata is not None:
             if not isinstance(packed_metadata, PackedSequenceMetadata):
@@ -211,7 +219,142 @@ class PagedQwen3Attention(nn.Module):
             sin,
         )
 
-        if len(sequence_ids) != int(hidden_states.shape[0]):
+        attn_output = self._paged_attend(
+            query_states, key_states, value_states, page_cache, sequence_ids,
+            query_start_positions=query_start_positions, block_tables=block_tables,
+            sequence_lengths=sequence_lengths, attention_backend=attention_backend,
+            decode_split_count=decode_split_count,
+            decode_max_sequence_length=decode_max_sequence_length,
+            decode_block_tokens=decode_block_tokens,
+            decode_use_gqa_reuse=decode_use_gqa_reuse,
+            decode_sdpa_compat=decode_sdpa_compat,
+        )
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.inner.o_proj(attn_output)
+        return attn_output, None
+
+
+
+    def _mixed_forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        page_cache: PagedKvCache,
+        metadata: MixedBatchMetadata,
+    ) -> torch.Tensor:
+        """Attention for a flat batch of decode tokens and prompt chunks.
+
+        Projections run once over every row.  Decode rows go through the
+        decode path's own writer and paged kernel; each prompt chunk writes its
+        K/V into pages and attends to its request's prefix with the aligned
+        SDPA call used by whole-prompt prefill.
+        """
+
+        # Imported lazily: the generation package imports this module.
+        from minillm_l4.engine.generation.chunked_prefill import aligned_prefill_sdpa
+
+        if hidden_states.ndim != 2 or int(hidden_states.shape[0]) != metadata.total_tokens:
+            raise ValueError("mixed attention expects flat hidden states covering the metadata")
+        total = metadata.total_tokens
+        query = self.inner.q_norm(self.inner.q_proj(hidden_states).view(total, -1, self.head_dim))
+        key = self.inner.k_norm(self.inner.k_proj(hidden_states).view(total, -1, self.head_dim))
+        value = self.inner.v_proj(hidden_states).view(total, -1, self.head_dim)
+        # [tokens, heads, dim] -> [1, heads, tokens, dim] for the shared RoPE helper.
+        query = query.permute(1, 0, 2).unsqueeze(0)
+        key = key.permute(1, 0, 2).unsqueeze(0)
+        value = value.permute(1, 0, 2).unsqueeze(0)
+        cos, sin = position_embeddings
+        query, key = apply_rotary_pos_emb(query, key, cos, sin)
+
+        output = query.new_empty((total, query.shape[1] * self.head_dim))
+        if metadata.decode_count:
+            rows = metadata.decode_rows
+
+            def as_decode_batch(states: torch.Tensor) -> torch.Tensor:
+                # [1, heads, tokens, dim] -> [decode rows, heads, 1, dim]
+                return states[0].index_select(1, rows).permute(1, 0, 2).unsqueeze(2).contiguous()
+
+            decode_output = self._paged_attend(
+                as_decode_batch(query), as_decode_batch(key), as_decode_batch(value),
+                page_cache, metadata.decode_sequence_ids,
+                query_start_positions=metadata.decode_start_positions,
+                block_tables=metadata.decode_block_tables,
+                sequence_lengths=metadata.decode_sequence_lengths,
+                attention_backend=metadata.decode_attention_backend,
+                decode_split_count=metadata.decode_split_count,
+                decode_max_sequence_length=metadata.decode_max_sequence_length,
+                decode_block_tokens=metadata.decode_block_tokens,
+                decode_use_gqa_reuse=False,
+                decode_sdpa_compat=metadata.decode_sdpa_compat,
+            )
+            output.index_copy_(0, rows, decode_output.reshape(metadata.decode_count, -1))
+        segments = metadata.prefill_segments
+        key_pages, value_pages = page_cache.key_blocks[self.layer_idx], page_cache.value_blocks[self.layer_idx]
+        if segments:
+            prefill = slice(metadata.decode_count, total)
+            if metadata.prefill_block_tables is not None and can_use_triton_packed_kv_write(
+                key[:, :, prefill, :], value[:, :, prefill, :], metadata.prefill_token_to_sequence,
+                metadata.prefill_token_positions, metadata.prefill_block_tables, key_pages, value_pages,
+            ):
+                triton_write_packed_kv(
+                    key[:, :, prefill, :], value[:, :, prefill, :], metadata.prefill_token_to_sequence,
+                    metadata.prefill_token_positions, metadata.prefill_block_tables, key_pages, value_pages,
+                )
+            else:
+                for segment in segments:
+                    chunk = slice(segment.flat_start, segment.flat_end)
+                    page_cache.write_layer_segment(
+                        segment.sequence_id, self.layer_idx, key[:, :, chunk, :], value[:, :, chunk, :],
+                        start_token=segment.start_position,
+                    )
+        for index, segment in enumerate(segments):
+            chunk = slice(segment.flat_start, segment.flat_end)
+            chunk_key, chunk_value = key[:, :, chunk, :], value[:, :, chunk, :]
+            if segment.start_position and metadata.prefill_page_ids:
+                pages = metadata.prefill_page_ids[index]
+
+                def gather(blocks: torch.Tensor) -> torch.Tensor:
+                    # [pages, heads, page_tokens, dim] -> [1, heads, tokens, dim]
+                    picked = blocks.index_select(0, pages).permute(1, 0, 2, 3)
+                    flat = picked.reshape(picked.shape[0], -1, picked.shape[3])
+                    return flat[:, : segment.end_position].unsqueeze(0).contiguous()
+
+                prefix_key, prefix_value = gather(key_pages), gather(value_pages)
+            elif segment.start_position:
+                prefix_key, prefix_value = page_cache.gather_layer(segment.sequence_id, self.layer_idx)
+            else:
+                prefix_key, prefix_value = chunk_key, chunk_value
+            attended, _ = aligned_prefill_sdpa(
+                self, query[:, :, chunk, :], prefix_key, prefix_value, None, scaling=self.scaling,
+            )
+            output[chunk] = attended.reshape(segment.token_count, -1)
+        return self.inner.o_proj(output)
+
+    def _paged_attend(
+        self,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        page_cache: PagedKvCache,
+        sequence_ids: tuple[str, ...],
+        *,
+        query_start_positions: Any,
+        block_tables: torch.Tensor | None,
+        sequence_lengths: torch.Tensor | None,
+        attention_backend: str,
+        decode_split_count: int | None,
+        decode_max_sequence_length: int | None,
+        decode_block_tokens: int,
+        decode_use_gqa_reuse: Any,
+        decode_sdpa_compat: bool,
+    ) -> torch.Tensor:
+        """Write rectangular-batch K/V into pages and attend from the pages.
+
+        Shared by the decode/rectangular path and the decode rows of a mixed
+        forward, so both use exactly the same writer and attention kernel.
+        """
+
+        if len(sequence_ids) != int(query_states.shape[0]):
             raise ValueError("paged_sequence_ids must match the hidden-state batch size")
         if query_start_positions is None:
             starts: Sequence[int] | torch.Tensor | None = None
@@ -234,14 +377,33 @@ class PagedQwen3Attention(nn.Module):
                 page_cache.allocator.assert_writable_range(
                     sequence_id, start, int(key_states.shape[-2])
                 )
-        if can_use_triton_decode_kv_write(
+        use_fast_writer = can_use_triton_decode_kv_write(
             key_states,
             value_states,
             block_tables,
             sequence_lengths,
             page_cache.key_blocks[self.layer_idx],
             page_cache.value_blocks[self.layer_idx],
-        ):
+        )
+        if use_fast_writer:
+            write_positions = _triton_query_positions(
+                starts, sequence_ids=sequence_ids, cache=page_cache,
+                query_tokens=1, device=query_states.device,
+            )
+            # All layers consume the same metadata. Validate once before any
+            # KV write; graph capture records live device assertions here.
+            if self.layer_idx == 0:
+                validate_decode_metadata(
+                    block_tables, sequence_lengths, device=query_states.device,
+                    batch_size=len(sequence_ids), num_blocks=page_cache.allocator.num_blocks,
+                    block_size=page_cache.allocator.block_size, query_positions=write_positions,
+                    max_sequence_length=(
+                        decode_max_sequence_length if decode_split_count and decode_split_count > 1 else None
+                    ),
+                    reserved_lengths=tuple(
+                        page_cache.allocator.get_block_table(sid).token_count for sid in sequence_ids
+                    ),
+                )
             triton_write_decode_kv(
                 key_states,
                 value_states,
@@ -249,6 +411,8 @@ class PagedQwen3Attention(nn.Module):
                 sequence_lengths,
                 page_cache.key_blocks[self.layer_idx],
                 page_cache.value_blocks[self.layer_idx],
+                query_start_positions=write_positions,
+                _validate_metadata=False,
             )
         else:
             for row, sequence_id in enumerate(sequence_ids):
@@ -277,12 +441,12 @@ class PagedQwen3Attention(nn.Module):
                     start_token=start,
                 )
 
-        attn_output = paged_attention(
+        return paged_attention(
             query_states,
             page_cache,
             sequence_ids,
             layer_index=self.layer_idx,
-            query_start_positions=starts,
+            query_start_positions=write_positions if use_fast_writer else starts,
             scale=self.scaling,
             num_key_value_groups=self.num_key_value_groups,
             causal=True,
@@ -292,11 +456,10 @@ class PagedQwen3Attention(nn.Module):
             decode_max_sequence_length=decode_max_sequence_length,
             decode_use_gqa_reuse=decode_use_gqa_reuse,
             decode_block_tokens=decode_block_tokens,
+            decode_sdpa_compat=decode_sdpa_compat,
             backend=attention_backend,
+            _validate_metadata=not use_fast_writer,
         )
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.inner.o_proj(attn_output)
-        return attn_output, None
 
 
 def install_paged_qwen3_attention(model: Any) -> tuple[PagedQwen3Attention, ...]:

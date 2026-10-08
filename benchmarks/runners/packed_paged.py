@@ -60,6 +60,7 @@ class PackedPagedPrefillBatchRunner:
         kv_dtype: torch.dtype | None = None,
         prefill_backend: str = "auto",
         decode_backend: str = "auto",
+        decode_sdpa_compat: bool | None = None,
         trace_enabled: bool = False,
     ) -> None:
         if int(block_size) < 1:
@@ -91,6 +92,7 @@ class PackedPagedPrefillBatchRunner:
         self.kv_dtype = kv_dtype
         self.prefill_backend = prefill_backend
         self.decode_backend = decode_backend
+        self.decode_sdpa_compat = bool(decode_sdpa_compat)
         self.trace_enabled = bool(trace_enabled)
         self.last_cache_snapshot: dict[str, Any] | None = None
         self.last_execution_trace: dict[str, Any] | None = None
@@ -183,9 +185,13 @@ class PackedPagedPrefillBatchRunner:
                 decode_max_sequence_length,
                 batch_size=batch_size,
             )
+            if self.decode_sdpa_compat:
+                decode_split_count = 1
             decode_block_tokens = select_decode_block_tokens(
                 decode_max_sequence_length
             )
+            if self.decode_sdpa_compat:
+                decode_block_tokens = 128
         with trace.span(
             "input_flattening_and_device_transfer",
             category="request_preparation",
@@ -390,7 +396,7 @@ class PackedPagedPrefillBatchRunner:
                             logits_to_keep=1,
                             paged_kv_cache=paged_cache,
                             paged_sequence_ids=owner_ids,
-                            paged_query_start_positions=old_lengths,
+                            paged_query_start_positions=decode_positions,
                             paged_block_tables=decode_block_tables,
                             paged_sequence_lengths=decode_sequence_lengths,
                             paged_attention_backend=self.decode_backend,
@@ -400,6 +406,7 @@ class PackedPagedPrefillBatchRunner:
                             ),
                             paged_decode_block_tokens=decode_block_tokens,
                             paged_decode_use_gqa_reuse=False,
+                            paged_decode_sdpa_compat=self.decode_sdpa_compat,
                         )
                     decode_model_ms += measurement.wall_ms
                     with trace.span(
@@ -478,6 +485,7 @@ class PackedPagedPrefillBatchRunner:
                 "decode_block_tokens": decode_block_tokens,
                 "decode_gqa_reuse": False,
                 "decode_max_sequence_length": decode_max_sequence_length,
+                "decode_sdpa_compat": self.decode_sdpa_compat,
                 "packed_kv_write_backend": (
                     "triton_scatter"
                     if self.device.type == "cuda" and triton_is_available()

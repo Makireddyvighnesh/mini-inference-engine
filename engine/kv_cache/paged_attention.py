@@ -14,11 +14,13 @@ materialize a left-padded dense KV batch.
 from __future__ import annotations
 
 import math
+import operator
 from contextlib import nullcontext
 from collections.abc import Sequence
+from types import SimpleNamespace
 
 import torch
-import torch.nn.functional as F
+from transformers.integrations.sdpa_attention import sdpa_attention_forward
 
 from .packed import PackedSequenceMetadata
 from .paged import PagedKvCache, PagedKvShapeError
@@ -45,16 +47,55 @@ def _normalize_positions(
             for sequence_id in sequence_ids
         )
     if isinstance(positions, torch.Tensor):
+        if positions.dtype not in {torch.int32, torch.int64}:
+            raise ValueError("query_start_positions must contain integer positions")
         if positions.ndim == 2 and positions.shape[-1] == 1:
             positions = positions[:, 0]
         if positions.ndim != 1:
             raise ValueError("query_start_positions tensor must be one-dimensional")
-        normalized = tuple(int(value) for value in positions.detach().cpu().tolist())
+        normalized = tuple(positions.detach().cpu().tolist())
     else:
-        normalized = tuple(int(value) for value in positions)
+        try:
+            normalized = tuple(operator.index(value) for value in positions)
+        except TypeError as error:
+            raise ValueError("query_start_positions must contain integer positions") from error
     if len(normalized) != len(sequence_ids):
         raise ValueError("query_start_positions must contain one value per sequence")
     return normalized
+
+
+def _triton_query_positions(
+    positions: Sequence[int] | torch.Tensor | None,
+    *,
+    sequence_ids: Sequence[str],
+    cache: PagedKvCache,
+    query_tokens: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Keep device positions live for graph replay; validate host positions."""
+
+    if isinstance(positions, torch.Tensor) and positions.is_cuda:
+        if positions.ndim == 2 and positions.shape[-1] == 1:
+            positions = positions[:, 0]
+        if positions.ndim != 1:
+            raise ValueError("query_start_positions tensor must be one-dimensional")
+        if positions.shape[0] != len(sequence_ids):
+            raise ValueError("query_start_positions must contain one value per sequence")
+        return positions
+
+    normalized = _normalize_positions(
+        positions, sequence_ids=sequence_ids, cache=cache, query_tokens=query_tokens,
+    )
+    for sequence_id, start in zip(sequence_ids, normalized, strict=True):
+        if start < 0:
+            raise ValueError("query_start_position must be non-negative")
+        length = cache.allocator.get_block_table(sequence_id).token_count
+        if start + query_tokens > length:
+            raise PagedKvShapeError(
+                f"query range [{start}, {start + query_tokens}) exceeds "
+                f"cached token count {length} for sequence {sequence_id!r}"
+            )
+    return torch.tensor(normalized, dtype=torch.long, device=device)
 
 
 def _block_attention_for_sequence(
@@ -193,7 +234,9 @@ def paged_attention(
     decode_max_sequence_length: int | None = None,
     decode_use_gqa_reuse: bool | None = None,
     decode_block_tokens: int = 16,
+    decode_sdpa_compat: bool = False,
     backend: str = "auto",
+    _validate_metadata: bool = True,
 ) -> torch.Tensor:
     """Compute attention directly from physical KV blocks.
 
@@ -254,12 +297,6 @@ def paged_attention(
             f"{cache.num_kv_heads} KV heads; got heads={num_heads}, groups={groups}"
         )
     normalized_layer = cache._validate_layer_index(layer_index)
-    positions = _normalize_positions(
-        query_start_positions,
-        sequence_ids=normalized_ids,
-        cache=cache,
-        query_tokens=query_tokens,
-    )
     attention_scale = float(scale) if scale is not None else 1.0 / math.sqrt(head_dim)
 
     use_triton = can_use_triton_paged_decode(
@@ -274,6 +311,16 @@ def paged_attention(
     if backend != "torch" and use_triton:
         assert block_tables is not None
         assert sequence_lengths is not None
+        # Storage length may extend beyond this query. The kernels must bound
+        # both their page loads and softmax by the query's causal position.
+        # Device positions are read during execution, including graph replay.
+        causal_positions = (
+            _triton_query_positions(
+                query_start_positions, sequence_ids=normalized_ids,
+                cache=cache, query_tokens=query_tokens, device=query.device,
+            )
+            if causal else None
+        )
         return triton_paged_decode_attention(
             query,
             cache.key_blocks[normalized_layer],
@@ -287,8 +334,19 @@ def paged_attention(
             max_sequence_length=decode_max_sequence_length,
             use_gqa_reuse=decode_use_gqa_reuse,
             block_tokens=decode_block_tokens,
+            query_start_positions=causal_positions,
+            sdpa_compat=decode_sdpa_compat,
+            _validate_metadata=_validate_metadata,
+            _reserved_lengths=(
+                tuple(cache.allocator.get_block_table(sid).token_count for sid in normalized_ids)
+                if _validate_metadata else None
+            ),
         )
 
+    positions = _normalize_positions(
+        query_start_positions, sequence_ids=normalized_ids,
+        cache=cache, query_tokens=query_tokens,
+    )
     rows = [
         _block_attention_for_sequence(
             query[row],
@@ -467,51 +525,25 @@ def _sdpa_packed_prefill_attention(
         if force_math
         else nullcontext()
     )
+    # Delegate to the exact Transformers SDPA adapter a whole unpadded prompt
+    # uses (in Transformers 5.x: no mask, is_causal, enable_gqa), so each
+    # request's attention takes the same kernel and rounding as HF prefill.
+    module = SimpleNamespace(num_key_value_groups=num_key_value_groups, is_causal=True)
     with kernel_context:
         for request_index in range(metadata.batch_size):
             token_slice = metadata.request_slice(request_index)
             # Query enters as [tokens, query_heads, dim]; SDPA expects
-            # [batch, heads, tokens, dim].  The trusted Transformers path
-            # receives an all-ones attention mask during generation, which
-            # makes its SDPA adapter repeat GQA K/V heads instead of using
-            # enable_gqa.  Match that representation here so greedy logits
-            # remain bitwise-compatible.
+            # [batch, heads, tokens, dim] and returns [batch, tokens, heads, dim].
             query_row = query[token_slice].permute(1, 0, 2).unsqueeze(0)
-            key_row = key_states[:, :, token_slice, :]
-            value_row = value_states[:, :, token_slice, :]
-            if num_key_value_groups > 1:
-                key_row = (
-                    key_row[:, :, None, :, :]
-                    .expand(
-                        -1,
-                        -1,
-                        num_key_value_groups,
-                        -1,
-                        -1,
-                    )
-                    .reshape(1, -1, key_row.shape[2], key_row.shape[3])
-                )
-                value_row = (
-                    value_row[:, :, None, :, :]
-                    .expand(
-                        -1,
-                        -1,
-                        num_key_value_groups,
-                        -1,
-                        -1,
-                    )
-                    .reshape(1, -1, value_row.shape[2], value_row.shape[3])
-                )
-            row_output = F.scaled_dot_product_attention(
+            row_output, _ = sdpa_attention_forward(
+                module,
                 query_row,
-                key_row,
-                value_row,
-                dropout_p=0.0,
-                is_causal=True,
-                scale=scale,
-                enable_gqa=False,
+                key_states[:, :, token_slice, :],
+                value_states[:, :, token_slice, :],
+                None,
+                scaling=scale,
             )
-            outputs.append(row_output.squeeze(0).permute(1, 0, 2))
+            outputs.append(row_output.squeeze(0))
     return torch.cat(outputs, dim=0)
 
 

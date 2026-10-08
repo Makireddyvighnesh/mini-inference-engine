@@ -34,6 +34,7 @@ def qwen3_packed_prefill(
     paged_kv_cache: PagedKvCache,
     block_tables: torch.Tensor | None = None,
     attention_backend: str = "auto",
+    row_logits: bool = False,
 ) -> PackedPrefillOutput:
     """Run one packed Qwen3 prefill and write K/V into physical pages.
 
@@ -44,8 +45,12 @@ def qwen3_packed_prefill(
         metadata: Request boundaries and local token positions.
         paged_kv_cache: Cache already allocated for each request's prompt.
         block_tables: Optional ``[batch, max_blocks]`` physical page table.
-        attention_backend: ``auto``, ``torch``, or ``triton`` for packed
-            prefill attention.
+        attention_backend: ``auto``, ``torch``, ``triton``, ``sdpa``, or
+            ``sdpa_math`` for packed prefill attention.
+        row_logits: Project each request's final hidden state separately.
+            A multi-row ``lm_head`` GEMM rounds differently from the one-row
+            projection a single-request prefill uses; per-row projection keeps
+            first-token logits bitwise identical to that reference.
 
     The output contains only the last hidden state of each prompt's final
     token projected to vocabulary logits.  Intermediate hidden states remain
@@ -95,7 +100,10 @@ def qwen3_packed_prefill(
     hidden_states = norm(hidden_states)
     last_indices = metadata.last_token_indices.to(dtype=torch.long)
     last_hidden_states = hidden_states.index_select(0, last_indices)
-    logits = lm_head(last_hidden_states)
+    if row_logits:
+        logits = torch.cat([lm_head(last_hidden_states[row:row + 1]) for row in range(metadata.batch_size)])
+    else:
+        logits = lm_head(last_hidden_states)
     if logits.ndim != 2 or int(logits.shape[0]) != metadata.batch_size:
         raise RuntimeError("packed Qwen3 prefill returned invalid logits")
     return PackedPrefillOutput(

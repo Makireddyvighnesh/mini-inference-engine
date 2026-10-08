@@ -1,0 +1,30 @@
+schema_version: 1
+project: MiniLLM-L4
+phase: 8
+model:
+  id: Qwen/Qwen3-4B-Instruct-2507-FP8
+  revision: 8591804019c8b22094c3b5b4454e0edc05dffc98
+  device: cuda:0
+  local_files_only: true
+  fp8_kernel_path: sm89
+workloads:
+  dataset: data/synthetic/workloads_v1.jsonl
+  seed: 17
+  prompt_lengths: [128, 256, 512, 1024, 2048, 4096, 8192]
+  generation_lengths: [128, 512, 1048]
+  batch_sizes: [1, 2, 4, 8]
+  mixed_arrival_interval_ms: 100.0
+  mixed_short_output_tokens: 128
+engine:
+  block_size: 16
+  max_prefill_tokens: 256
+  decode_backend: auto
+  decode_sdpa_compat: true
+  modes: [prefill, isolated, static, continuous, chunked_128, chunked_256]
+benchmark:
+  warmup_repetitions: 1
+  repetitions: 3
+  sample_interval_seconds: 0.25
+  collect_gpu: true
+  collect_system_telemetry: true
+  timer_overhead_iterations: 1000

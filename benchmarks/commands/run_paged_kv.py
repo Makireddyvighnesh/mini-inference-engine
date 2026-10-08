@@ -84,6 +84,10 @@ def parse_args() -> argparse.Namespace:
         help="Paged decode implementation; auto selects Triton on supported CUDA inputs.",
     )
     parser.add_argument(
+        "--decode-numerics", choices=("auto", "accurate", "sdpa_compat"), default=None,
+        help="Auto matches dense BF16 SDPA in hybrid/graph paths; accurate preserves FP32 page reductions.",
+    )
+    parser.add_argument(
         "--prefill-backend",
         choices=(
             "auto",
@@ -355,6 +359,12 @@ def main() -> None:
     )
     if decode_backend not in {"auto", "torch", "triton"}:
         raise ValueError("cache.decode_backend must be auto, torch, or triton")
+    decode_numerics = str(
+        cache_config.get("decode_numerics", "auto")
+        if args.decode_numerics is None else args.decode_numerics
+    )
+    if decode_numerics not in {"auto", "accurate", "sdpa_compat"}:
+        raise ValueError("cache.decode_numerics must be auto, accurate, or sdpa_compat")
     prefill_backend = str(
         cache_config.get("packed_prefill_backend", "auto")
         if args.prefill_backend is None
@@ -429,6 +439,7 @@ def main() -> None:
             "block_sizes": block_sizes,
             "capacity_token_slots": capacity_token_slots,
             "decode_backend": decode_backend,
+            "decode_numerics": decode_numerics,
             "packed_prefill_backend": prefill_backend,
             "graph_prefill_backend": graph_prefill_backend,
             "batch_sizes": batch_sizes,
@@ -552,6 +563,9 @@ def main() -> None:
                     }
                     if is_direct or is_hybrid or is_graph or is_packed:
                         runner_kwargs["decode_backend"] = decode_backend
+                        runner_kwargs["decode_sdpa_compat"] = (
+                            None if decode_numerics == "auto" else decode_numerics == "sdpa_compat"
+                        )
                     if is_packed:
                         runner_kwargs["prefill_backend"] = prefill_backend
                     if is_graph:

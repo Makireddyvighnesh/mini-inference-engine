@@ -205,8 +205,14 @@ def load_qwen_fp8(
     local_files_only: bool = True,
     fp8_fallback_dtype: str = "auto",
     fp8_kernel_path: str = "auto",
+    pretune_tokens: int | None = 16384,
 ) -> HfModelBundle:
-    """Load the pinned Qwen checkpoint using Transformers' native FP8 path."""
+    """Load the pinned Qwen checkpoint using Transformers' native FP8 path.
+
+    With the ``sm89`` kernel, every power-of-two row bucket up to
+    ``pretune_tokens`` is autotuned at load time (cached on disk), so no
+    timed request pays a multi-second Triton search.  ``None`` skips it.
+    """
 
     selected_device = _cuda_device(device)
     if not torch.cuda.is_available():
@@ -274,6 +280,12 @@ def load_qwen_fp8(
     )
     model.eval()
     model_load_time_ms = (time.perf_counter() - model_start) * 1000.0
+    if fp8_kernel_path == "sm89" and pretune_tokens:
+        from minillm_l4.engine.kernels.sm89_fp8 import pretune_sm89_fp8
+
+        tune_start = time.perf_counter()
+        kernel_strategy["pretuned_row_buckets"] = pretune_sm89_fp8(model, max_tokens=pretune_tokens)
+        kernel_strategy["pretune_ms"] = (time.perf_counter() - tune_start) * 1000.0
 
     return HfModelBundle(
         model=model,

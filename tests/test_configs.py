@@ -19,6 +19,8 @@ def test_project_workload_configs_are_yaml_and_validate() -> None:
         ("qwen3_fp8_capacity_limit.yaml", 5),
         ("qwen3_fp8_capacity_limit_128.yaml", 5),
         ("qwen3_fp8_long_context.yaml", 6),
+        ("qwen3_fp8_chunked.yaml", 8),
+        ("qwen3_fp8_phase_sweep.yaml", 8),
     )
     for filename, expected_phase in configurations:
         path = PROJECT_ROOT / "configs" / "workloads" / filename

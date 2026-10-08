@@ -176,6 +176,101 @@ def test_decode_tile_selector_uses_profiled_long_context_tile(
 
 
 @pytest.mark.skipif(not triton_is_available(), reason="requires CUDA and Triton")
+@pytest.mark.parametrize("backend", ["auto", "triton"])
+@pytest.mark.parametrize("split_count", [1, 4])
+@pytest.mark.parametrize("use_gqa_reuse", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("device_positions", [False, True])
+def test_triton_decode_respects_each_query_causal_position(
+    backend: str,
+    split_count: int,
+    use_gqa_reuse: bool,
+    causal: bool,
+    device_positions: bool,
+) -> None:
+    """A position-1 query must not read the large values at positions 2/3."""
+
+    device = torch.device("cuda")
+    allocator = PagedKvAllocator(num_blocks=4, block_size=2)
+    cache = PagedKvCache(
+        allocator, num_layers=1, num_kv_heads=1, head_dim=64,
+        dtype=torch.bfloat16, device=device,
+    )
+    sequence_ids = ("earlier-query", "latest-query")
+    values = torch.tensor(
+        [[1.0, 2.0, 100.0, 200.0], [4.0, 8.0, 16.0, 32.0]],
+        dtype=torch.bfloat16, device=device,
+    ).reshape(2, 1, 4, 1).expand(2, 1, 4, 64).contiguous()
+    keys = torch.zeros_like(values)
+    for row, sequence_id in enumerate(sequence_ids):
+        allocator.allocate(sequence_id, token_count=4)
+        cache.write_layer_segment(
+            sequence_id, 0, keys[row : row + 1], values[row : row + 1],
+            start_token=0,
+        )
+    query = torch.ones((2, 2, 1, 64), dtype=torch.bfloat16, device=device)
+    positions = (
+        torch.tensor([[1, 99], [3, 99]], dtype=torch.long, device=device)[:, :1]
+        if device_positions else (1, 3)
+    )
+    common = dict(
+        layer_index=0, query_start_positions=positions,
+        num_key_value_groups=2, causal=causal,
+    )
+    expected = paged_attention(query, cache, sequence_ids, backend="torch", **common)
+    lengths = torch.tensor([4, 4], dtype=torch.int32, device=device)
+    original_lengths = lengths.clone()
+    actual = paged_attention(
+        query, cache, sequence_ids, backend=backend,
+        block_tables=cache.block_table_tensor(sequence_ids).to(torch.int32),
+        sequence_lengths=lengths,
+        decode_split_count=split_count, decode_max_sequence_length=4,
+        decode_use_gqa_reuse=use_gqa_reuse, **common,
+    )
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    if causal:
+        torch.testing.assert_close(actual[0], torch.full_like(actual[0], 1.5), atol=0, rtol=0)
+    torch.testing.assert_close(lengths, original_lengths, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not triton_is_available(), reason="requires CUDA and Triton")
+def test_triton_decode_causal_position_updates_on_cuda_graph_replay() -> None:
+    device = torch.device("cuda")
+    allocator = PagedKvAllocator(num_blocks=2, block_size=2)
+    allocator.allocate("a", token_count=4)
+    cache = PagedKvCache(
+        allocator, num_layers=1, num_kv_heads=1, head_dim=64,
+        dtype=torch.bfloat16, device=device,
+    )
+    values = torch.tensor(
+        [1.0, 2.0, 100.0, 200.0], dtype=torch.bfloat16, device=device,
+    ).reshape(1, 1, 4, 1).expand(1, 1, 4, 64).contiguous()
+    cache.write_layer_segment("a", 0, torch.zeros_like(values), values, start_token=0)
+    query = torch.ones((1, 1, 1, 64), dtype=torch.bfloat16, device=device)
+    positions = torch.tensor([[1]], dtype=torch.long, device=device)
+    kwargs = dict(
+        layer_index=0, query_start_positions=positions,
+        block_tables=cache.block_table_tensor(("a",)).to(torch.int32),
+        sequence_lengths=torch.tensor([4], dtype=torch.int32, device=device),
+        backend="triton",
+    )
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(3):
+            paged_attention(query, cache, ("a",), **kwargs)
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = paged_attention(query, cache, ("a",), **kwargs)
+    graph.replay()
+    torch.testing.assert_close(actual, torch.full_like(actual, 1.5), atol=0, rtol=0)
+    positions.fill_(3)
+    graph.replay()
+    torch.testing.assert_close(actual, torch.full_like(actual, 76.0), atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not triton_is_available(), reason="requires CUDA and Triton")
 @pytest.mark.parametrize("block_size", [8, 16, 32, 64])
 @pytest.mark.parametrize("split_count", [1, 2, 4])
 @pytest.mark.parametrize("use_gqa_reuse", [False, True])

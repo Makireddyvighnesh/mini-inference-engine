@@ -4,6 +4,14 @@ MiniLLM-L4 is the isolated inference-engineering project for one NVIDIA L4.
 It is intentionally kept under this directory so it does not change the
 existing `adaserve/`, `llmperflab/`, `scripts/`, or root benchmark results.
 
+## Benchmark results
+
+Saved measurements for Phases 0–8 are available in
+[benchmark_results/](benchmark_results/README.md), with additional hardware,
+precision, capacity, decode-profile, and vLLM comparisons. The Markdown
+archive includes workload details, correctness status, and local source paths.
+Raw JSON/JSONL artifacts remain in the Git-ignored `results/` directory.
+
 ## Phases
 
 Each phase is benchmarked on the L4 against the same request/event schema and
@@ -20,6 +28,7 @@ performance numbers count.
 | 5 | Iteration-level continuous batching | [continuous batching](docs/phase_notes/continuous_batching.md), [capacity stress](docs/phase_notes/capacity_stress.md) |
 | 6 | Paged KV blocks, direct paged attention, packed ragged prefill, Triton kernels, fixed-shape CUDA Graph decode | [paged KV](docs/phase_notes/paged_kv.md) |
 | 7 | Exact-token prefix caching: shared immutable blocks, reference counts, LRU eviction, continuous admission | [prefix cache](docs/phase_notes/prefix_cache.md) |
+| 8 | Chunked prefill: resource-based admission, flattened prefill, mixed prefill/decode batching under a token budget, adaptive time-budgeted chunk sizes | [chunked prefill](docs/phase_notes/chunked_prefill.md) |
 
 The [decode-step profile](docs/phase_notes/decode_profile.md) shows why
 Transformers decode is host-bound on the L4 and how that shapes the later
@@ -202,6 +211,24 @@ new work should use the organized paths shown above.
 
 ## Commands
 
+For the extended 128–8192 prompt-length sweep with up to 1048 output tokens,
+see [prefill/decode isolation and batching](docs/phase_notes/prefill_decode_sweep.md).
+It separates phase timing and compares matched static and continuous traces,
+with checkpointed raw results and Markdown export.
+
+Compare chunked and unchunked prefill on identical scheduled traffic:
+
+```bash
+.conda-env/bin/python -m minillm_l4.benchmarks.commands.run_chunked_prefill --dry-run
+.conda-env/bin/python -m minillm_l4.benchmarks.commands.run_chunked_prefill \
+  --workload all --chunk-sizes 128 256
+```
+
+This command uses the existing exact-token references and saves dated raw
+results, a source snapshot, and a Markdown report under `benchmark_results/`.
+See the [chunked-prefill note](docs/phase_notes/chunked_prefill.md) for scheduling
+behavior, timing boundaries, correctness gates, and validation limits.
+
 Install the pinned Python dependencies in your CUDA-enabled environment:
 
 ```bash
@@ -308,6 +335,36 @@ experimental fused-SDPA path, or use `--prefill-backend triton` to require the
 project-owned packed CUDA kernel. `torch` remains the readable reference.
 CUDA Graph mode uses packed prefill by default; use
 `--graph-prefill-backend dense` for the dense-prefill control.
+
+Decode has two explicit numerical policies. `--decode-numerics auto` selects
+`sdpa_compat` for the pinned BF16 Qwen dense-prefill hybrid/graph paths; other
+paths retain `accurate`. The compatibility kernel still reads physical pages
+directly, but uses reverse 128-token tiles, activation-dtype unnormalized
+softmax weights, and one KV split to match the L4 SDPA backend more closely.
+`--decode-numerics accurate` preserves FP32 softmax/value reductions and the
+profiled split-KV choices. It can be closer to FP64 while choosing a different
+greedy token than BF16 SDPA. Both implementations remain available; benchmark
+artifacts record the policy, effective tile size, and split count. Neither
+policy promises universal bitwise equality across attention backends.
+
+Paged decode validates query positions, live physical block IDs, KV lengths,
+and split coverage before page access. Sliced metadata tensors and independent
+K/V source strides are supported. CUDA Graphs record live device assertions;
+invalid replay metadata raises a CUDA device assertion and requires a fresh
+CUDA context, so serving callers should reject invalid requests before replay.
+
+Run the full suite including the pinned-model regression (local weights and
+an L4 are required):
+
+```bash
+MINILLM_RUN_MODEL_TESTS=1 .conda-env/bin/python -m pytest minillm_l4/tests -q
+```
+
+Without that environment variable, the small CPU/GPU tests still run and the
+real-model integration tests are explicitly skipped. The integration tests
+retain the dense reference, including the previously failing seventeenth
+token of `baseline-short-003`, and cover all four KV block sizes at batches
+1/2/4 plus dense-prefill graph replay.
 
 For a packed-prefill smoke test on the L4:
 

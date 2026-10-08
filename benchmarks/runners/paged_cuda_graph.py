@@ -76,6 +76,7 @@ class PagedCudaGraphBatchRunner:
         device: str | torch.device = "cuda:0",
         logits_mode: str = "last",
         decode_backend: str = "auto",
+        decode_sdpa_compat: bool | None = None,
         prefill_backend: str = "packed",
         trace_enabled: bool = False,
     ) -> None:
@@ -97,6 +98,12 @@ class PagedCudaGraphBatchRunner:
             raise RuntimeError("paged CUDA Graph decode requires CUDA")
         self.decode_backend = decode_backend
         self.prefill_backend = prefill_backend
+        self.decode_sdpa_compat = (
+            self._resolve_prefill_backend() == "dense"
+            and _paged_activation_dtype(model) == torch.bfloat16
+            and getattr(getattr(model, "config", None), "_attn_implementation", None) == "sdpa"
+            if decode_sdpa_compat is None else bool(decode_sdpa_compat)
+        )
         self.trace_enabled = bool(trace_enabled)
         self._shape: tuple[int, int, int] | None = None
         self._owner_ids: tuple[str, ...] = ()
@@ -216,7 +223,6 @@ class PagedCudaGraphBatchRunner:
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         sequence_lengths: torch.Tensor,
-        starts: tuple[int, ...],
         attention_mask: torch.Tensor | None = None,
         decode_max_sequence_length: int | None = None,
     ) -> torch.Tensor:
@@ -232,13 +238,13 @@ class PagedCudaGraphBatchRunner:
             logits_to_keep=1,
             paged_kv_cache=self._cache,
             paged_sequence_ids=self._owner_ids,
-            paged_query_start_positions=starts,
+            paged_query_start_positions=position_ids,
             paged_block_tables=self._block_tables,
             paged_sequence_lengths=sequence_lengths,
             paged_attention_backend=self.decode_backend,
             paged_decode_split_count=(
                 1
-                if decode_max_sequence_length is None
+                if decode_max_sequence_length is None or self.decode_sdpa_compat
                 else select_decode_split_count(
                     decode_max_sequence_length,
                     batch_size=int(input_ids.shape[0]),
@@ -246,11 +252,12 @@ class PagedCudaGraphBatchRunner:
             ),
             paged_decode_max_sequence_length=decode_max_sequence_length,
             paged_decode_block_tokens=(
-                16
+                128 if self.decode_sdpa_compat else 16
                 if decode_max_sequence_length is None
                 else select_decode_block_tokens(decode_max_sequence_length)
             ),
             paged_decode_use_gqa_reuse=False,
+            paged_decode_sdpa_compat=self.decode_sdpa_compat,
         )
         return _next_token(output)
 
@@ -271,7 +278,6 @@ class PagedCudaGraphBatchRunner:
             token,
             positions,
             lengths,
-            (prompt_tokens,) * batch_size,
             decode_max_sequence_length=max_sequence_length,
         )
         torch.cuda.synchronize(self.device)
@@ -316,7 +322,6 @@ class PagedCudaGraphBatchRunner:
                 static_input,
                 positions,
                 lengths,
-                (prompt_tokens,) * batch_size,
                 attention_mask=attention_mask,
                 decode_max_sequence_length=max_sequence_length,
             )
@@ -361,7 +366,9 @@ class PagedCudaGraphBatchRunner:
             max_sequence_length,
             batch_size=batch_size,
         )
-        decode_block_tokens = select_decode_block_tokens(max_sequence_length)
+        if self.decode_sdpa_compat:
+            decode_split_count = 1
+        decode_block_tokens = 128 if self.decode_sdpa_compat else select_decode_block_tokens(max_sequence_length)
         shape = (batch_size, prompt_tokens, output_tokens)
         owner_ids = tuple(request.request_id for request in requests)
         if self._shape is not None and (
@@ -601,6 +608,7 @@ class PagedCudaGraphBatchRunner:
             "decode_block_tokens": decode_block_tokens,
             "decode_gqa_reuse": False,
             "decode_max_sequence_length": max_sequence_length,
+            "decode_sdpa_compat": self.decode_sdpa_compat,
             "capture_time_ms": self._capture_time_ms,
             "capture_cost_in_steady_state_metrics": False,
             "allocation_policy": "full_request_reservation_for_fixed_graph_addresses",

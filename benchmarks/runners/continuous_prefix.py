@@ -61,6 +61,7 @@ class ContinuousPrefixPagedRunner(PrefixCachedPagedRunner):
         cancel_request_ids: Sequence[str] = (),
         eos_token_id: int | Sequence[int] | None = None,
         record_logit_gaps: bool = False,
+        decode_sdpa_compat: bool = False,
     ) -> None:
         if max_batch_size < 1 or max_prefill_tokens < 1:
             raise ValueError("batch size and prefill budget must be positive")
@@ -91,6 +92,7 @@ class ContinuousPrefixPagedRunner(PrefixCachedPagedRunner):
         # Per-step top-2 logit gaps are a tie diagnostic; computing them costs
         # an extra top-k and host transfer every decode step, so it is opt-in.
         self.record_logit_gaps = bool(record_logit_gaps)
+        self.decode_sdpa_compat = bool(decode_sdpa_compat)
         self.last_summary: dict[str, Any] | None = None
         self.run_summaries: list[dict[str, Any]] = []
         self.last_lifecycles: dict[str, RequestLifecycle] = {}
@@ -197,9 +199,13 @@ class ContinuousPrefixPagedRunner(PrefixCachedPagedRunner):
                 paged_decode_max_sequence_length=max_length,
                 paged_decode_split_count=select_decode_split_count(
                     max_length, batch_size=len(active)
+                ) if not self.decode_sdpa_compat else 1,
+                paged_decode_block_tokens=(
+                    select_decode_block_tokens(max_length)
+                    if not self.decode_sdpa_compat else 128
                 ),
-                paged_decode_block_tokens=select_decode_block_tokens(max_length),
                 paged_decode_use_gqa_reuse=False,
+                paged_decode_sdpa_compat=self.decode_sdpa_compat,
             )
             next_tokens = output.logits[:, -1, :].argmax(dim=-1, keepdim=True).detach()
             if self.record_logit_gaps:

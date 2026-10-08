@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import torch
 
+from .decode_metadata import validate_decode_metadata
+
 try:
     import triton
     import triton.language as tl
@@ -28,6 +30,7 @@ if triton is not None:
         value_ptr,
         block_table_ptr,
         sequence_length_ptr,
+        query_position_ptr,
         output_ptr,
         scale,
         query_stride_batch: tl.constexpr,
@@ -43,6 +46,9 @@ if triton is not None:
         value_stride_token: tl.constexpr,
         value_stride_dim: tl.constexpr,
         table_stride_batch: tl.constexpr,
+        table_stride_block: tl.constexpr,
+        length_stride_batch: tl.constexpr,
+        position_stride_batch: tl.constexpr,
         output_stride_batch: tl.constexpr,
         output_stride_head: tl.constexpr,
         output_stride_token: tl.constexpr,
@@ -53,6 +59,8 @@ if triton is not None:
         HEAD_DIM: tl.constexpr,
         BLOCK_DIM: tl.constexpr,
         BLOCK_TOKENS: tl.constexpr,
+        HAS_QUERY_POSITIONS: tl.constexpr,
+        SDPA_COMPAT: tl.constexpr,
     ):
         """Decode one KV head and all of its grouped query heads together.
 
@@ -81,7 +89,10 @@ if triton is not None:
             other=0.0,
         )
 
-        sequence_length = tl.load(sequence_length_ptr + batch_index)
+        sequence_length = tl.load(sequence_length_ptr + batch_index * length_stride_batch)
+        if HAS_QUERY_POSITIONS:
+            query_position = tl.load(query_position_ptr + batch_index * position_stride_batch)
+            sequence_length = tl.minimum(sequence_length, query_position + 1)
         tile_count = tl.cdiv(sequence_length, BLOCK_TOKENS)
         token_offsets = tl.arange(0, BLOCK_TOKENS)
         running_max = tl.full((GROUP_SIZE,), -float("inf"), tl.float32)
@@ -89,14 +100,15 @@ if triton is not None:
         accumulator = tl.zeros((GROUP_SIZE, BLOCK_DIM), dtype=tl.float32)
 
         for tile_index in tl.range(0, tile_count):
-            logical_tokens = tile_index * BLOCK_TOKENS + token_offsets
+            logical_tile = tile_count - 1 - tile_index if SDPA_COMPAT else tile_index
+            logical_tokens = logical_tile * BLOCK_TOKENS + token_offsets
             token_mask = logical_tokens < sequence_length
             logical_blocks = logical_tokens // BLOCK_SIZE
             offsets_in_block = logical_tokens % BLOCK_SIZE
             physical_blocks = tl.load(
                 block_table_ptr
                 + batch_index * table_stride_batch
-                + logical_blocks,
+                + logical_blocks * table_stride_block,
                 mask=token_mask,
                 other=0,
             )
@@ -137,10 +149,13 @@ if triton is not None:
                 mask=token_mask[:, None] & dim_mask[None, :],
                 other=0.0,
             )
+            value_probabilities = probabilities
+            if SDPA_COMPAT:
+                value_probabilities = probabilities.to(values.dtype).to(tl.float32)
             accumulator = (
                 accumulator * previous_weight[:, None]
                 + tl.sum(
-                    probabilities[:, :, None] * values[None, :, :],
+                    value_probabilities[:, :, None] * values[None, :, :],
                     axis=1,
                 )
             )
@@ -168,6 +183,7 @@ if triton is not None:
         value_ptr,
         block_table_ptr,
         sequence_length_ptr,
+        query_position_ptr,
         output_ptr,
         scale,
         query_stride_batch: tl.constexpr,
@@ -183,6 +199,9 @@ if triton is not None:
         value_stride_token: tl.constexpr,
         value_stride_dim: tl.constexpr,
         table_stride_batch: tl.constexpr,
+        table_stride_block: tl.constexpr,
+        length_stride_batch: tl.constexpr,
+        position_stride_batch: tl.constexpr,
         output_stride_batch: tl.constexpr,
         output_stride_head: tl.constexpr,
         output_stride_token: tl.constexpr,
@@ -193,6 +212,8 @@ if triton is not None:
         HEAD_DIM: tl.constexpr,
         BLOCK_DIM: tl.constexpr,
         BLOCK_TOKENS: tl.constexpr,
+        HAS_QUERY_POSITIONS: tl.constexpr,
+        SDPA_COMPAT: tl.constexpr,
     ):
         program_id = tl.program_id(0)
         batch_index = program_id // NUM_HEADS
@@ -208,7 +229,10 @@ if triton is not None:
         )
         query = tl.load(query_ptr + query_offsets, mask=dim_mask, other=0.0)
 
-        sequence_length = tl.load(sequence_length_ptr + batch_index)
+        sequence_length = tl.load(sequence_length_ptr + batch_index * length_stride_batch)
+        if HAS_QUERY_POSITIONS:
+            query_position = tl.load(query_position_ptr + batch_index * position_stride_batch)
+            sequence_length = tl.minimum(sequence_length, query_position + 1)
         tile_count = tl.cdiv(sequence_length, BLOCK_TOKENS)
         running_max = -float("inf")
         running_sum = 0.0
@@ -216,14 +240,15 @@ if triton is not None:
         token_offsets = tl.arange(0, BLOCK_TOKENS)
 
         for tile_index in tl.range(0, tile_count):
-            logical_tokens = tile_index * BLOCK_TOKENS + token_offsets
+            logical_tile = tile_count - 1 - tile_index if SDPA_COMPAT else tile_index
+            logical_tokens = logical_tile * BLOCK_TOKENS + token_offsets
             token_mask = logical_tokens < sequence_length
             logical_blocks = logical_tokens // BLOCK_SIZE
             offsets_in_block = logical_tokens % BLOCK_SIZE
             physical_blocks = tl.load(
                 block_table_ptr
                 + batch_index * table_stride_batch
-                + logical_blocks,
+                + logical_blocks * table_stride_block,
                 mask=token_mask,
                 other=0,
             )
@@ -263,8 +288,11 @@ if triton is not None:
                 mask=token_mask[:, None] & dim_mask[None, :],
                 other=0.0,
             )
+            value_probabilities = probabilities
+            if SDPA_COMPAT:
+                value_probabilities = probabilities.to(values.dtype).to(tl.float32)
             accumulator = accumulator * previous_weight + tl.sum(
-                probabilities[:, None] * values,
+                value_probabilities[:, None] * values,
                 axis=0,
             )
             running_sum = (
@@ -288,6 +316,7 @@ if triton is not None:
         value_ptr,
         block_table_ptr,
         sequence_length_ptr,
+        query_position_ptr,
         partial_max_ptr,
         partial_sum_ptr,
         partial_output_ptr,
@@ -306,6 +335,9 @@ if triton is not None:
         value_stride_token: tl.constexpr,
         value_stride_dim: tl.constexpr,
         table_stride_batch: tl.constexpr,
+        table_stride_block: tl.constexpr,
+        length_stride_batch: tl.constexpr,
+        position_stride_batch: tl.constexpr,
         partial_max_stride_batch: tl.constexpr,
         partial_max_stride_head: tl.constexpr,
         partial_max_stride_split: tl.constexpr,
@@ -323,6 +355,7 @@ if triton is not None:
         HEAD_DIM: tl.constexpr,
         BLOCK_DIM: tl.constexpr,
         BLOCK_TOKENS: tl.constexpr,
+        HAS_QUERY_POSITIONS: tl.constexpr,
     ):
         """Compute one split-KV partial while sharing K/V across GQA heads."""
 
@@ -347,7 +380,10 @@ if triton is not None:
             other=0.0,
         )
 
-        sequence_length = tl.load(sequence_length_ptr + batch_index)
+        sequence_length = tl.load(sequence_length_ptr + batch_index * length_stride_batch)
+        if HAS_QUERY_POSITIONS:
+            query_position = tl.load(query_position_ptr + batch_index * position_stride_batch)
+            sequence_length = tl.minimum(sequence_length, query_position + 1)
         split_start = split_index * split_span
         split_end = tl.minimum(sequence_length, split_start + split_span)
         tokens_in_split = tl.maximum(split_end - split_start, 0)
@@ -365,7 +401,7 @@ if triton is not None:
             physical_blocks = tl.load(
                 block_table_ptr
                 + batch_index * table_stride_batch
-                + logical_blocks,
+                + logical_blocks * table_stride_block,
                 mask=token_mask,
                 other=0,
             )
@@ -451,6 +487,7 @@ if triton is not None:
         value_ptr,
         block_table_ptr,
         sequence_length_ptr,
+        query_position_ptr,
         partial_max_ptr,
         partial_sum_ptr,
         partial_output_ptr,
@@ -469,6 +506,9 @@ if triton is not None:
         value_stride_token: tl.constexpr,
         value_stride_dim: tl.constexpr,
         table_stride_batch: tl.constexpr,
+        table_stride_block: tl.constexpr,
+        length_stride_batch: tl.constexpr,
+        position_stride_batch: tl.constexpr,
         partial_max_stride_batch: tl.constexpr,
         partial_max_stride_head: tl.constexpr,
         partial_max_stride_split: tl.constexpr,
@@ -486,6 +526,7 @@ if triton is not None:
         HEAD_DIM: tl.constexpr,
         BLOCK_DIM: tl.constexpr,
         BLOCK_TOKENS: tl.constexpr,
+        HAS_QUERY_POSITIONS: tl.constexpr,
     ):
         """Compute one online-softmax partial for one request/head/chunk."""
 
@@ -505,7 +546,10 @@ if triton is not None:
         )
         query = tl.load(query_ptr + query_offsets, mask=dim_mask, other=0.0)
 
-        sequence_length = tl.load(sequence_length_ptr + batch_index)
+        sequence_length = tl.load(sequence_length_ptr + batch_index * length_stride_batch)
+        if HAS_QUERY_POSITIONS:
+            query_position = tl.load(query_position_ptr + batch_index * position_stride_batch)
+            sequence_length = tl.minimum(sequence_length, query_position + 1)
         split_start = split_index * split_span
         split_end = tl.minimum(sequence_length, split_start + split_span)
         tokens_in_split = tl.maximum(split_end - split_start, 0)
@@ -526,7 +570,7 @@ if triton is not None:
             physical_blocks = tl.load(
                 block_table_ptr
                 + batch_index * table_stride_batch
-                + logical_blocks,
+                + logical_blocks * table_stride_block,
                 mask=token_mask,
                 other=0,
             )
@@ -761,15 +805,21 @@ def can_use_triton_paged_decode(
         and key_blocks.is_cuda
         and value_blocks.is_cuda
         and query.ndim == 4
+        and key_blocks.ndim == value_blocks.ndim == 4
+        and key_blocks.device == value_blocks.device == query.device
+        and int(key_blocks.shape[1]) > 0
+        and int(key_blocks.shape[3]) == int(query.shape[3])
         and int(query.shape[2]) == 1
         and query.dtype in {torch.float16, torch.bfloat16, torch.float32}
         and key_blocks.dtype == query.dtype
         and value_blocks.dtype == query.dtype
         and block_tables is not None
         and block_tables.is_cuda
+        and block_tables.device == query.device
         and block_tables.ndim == 2
         and sequence_lengths is not None
         and sequence_lengths.is_cuda
+        and sequence_lengths.device == query.device
         and sequence_lengths.ndim == 1
     )
 
@@ -786,12 +836,19 @@ def triton_paged_decode_attention(
     max_sequence_length: int | None = None,
     use_gqa_reuse: bool | None = False,
     block_tokens: int = 16,
+    query_start_positions: torch.Tensor | None = None,
+    sdpa_compat: bool = False,
+    _validate_metadata: bool = True,
+    _reserved_lengths: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     """Decode one token per request directly from physical KV pages.
 
     ``query`` is ``[batch, query_heads, 1, head_dim]`` and each cache tensor is
     ``[physical_blocks, kv_heads, block_size, head_dim]``. The result uses the
     Qwen attention-interface layout ``[batch, 1, query_heads, head_dim]``.
+    When query positions are supplied, each row reads only the first
+    ``min(sequence_length, query_position + 1)`` KV tokens. Device positions
+    may be updated between CUDA Graph replays.
     """
 
     if not can_use_triton_paged_decode(
@@ -811,6 +868,20 @@ def triton_paged_decode_attention(
         raise ValueError("block-table batch does not match query batch")
     if int(sequence_lengths.shape[0]) != batch_size:
         raise ValueError("sequence lengths do not match query batch")
+    if query_start_positions is not None:
+        if (
+            query_start_positions.ndim != 1
+            or int(query_start_positions.shape[0]) != batch_size
+            or query_start_positions.device != query.device
+            or query_start_positions.dtype not in {torch.int32, torch.int64}
+        ):
+            raise ValueError(
+                "query positions must be an integer vector on the query device "
+                "with one value per row"
+            )
+    position_buffer = (
+        sequence_lengths if query_start_positions is None else query_start_positions
+    )
     if num_heads % num_kv_heads != 0:
         raise ValueError("query heads must be divisible by KV heads")
     group_size = num_heads // num_kv_heads
@@ -825,12 +896,19 @@ def triton_paged_decode_attention(
     if block_size < 1 or block_size > 128:
         raise ValueError("Triton paged decode supports block sizes from 1 to 128")
     block_tokens = int(block_tokens)
-    if block_tokens not in {8, 16, 32, 64}:
-        raise ValueError("block_tokens must be one of 8, 16, 32, or 64")
+    if block_tokens not in ({8, 16, 32, 64, 128} if sdpa_compat else {8, 16, 32, 64}):
+        raise ValueError("block_tokens must be 8, 16, 32, or 64 (128 only in SDPA-compatible mode)")
 
     split_count = int(split_count)
     if split_count not in {1, 2, 4, 8}:
         raise ValueError("split_count must be one of 1, 2, 4, or 8")
+    if sdpa_compat:
+        if split_count != 1:
+            raise ValueError("SDPA-compatible decode requires a single KV split")
+        # The pinned L4 SDPA decode backend traverses 128-token tiles in
+        # reverse order and rounds unnormalized softmax weights before P*V.
+        # Keep this explicit: it matches backend numerics, not FP64 accuracy.
+        block_tokens = 128
     if split_count > 1:
         if max_sequence_length is None or int(max_sequence_length) < 1:
             raise ValueError(
@@ -841,6 +919,15 @@ def triton_paged_decode_attention(
             raise ValueError(
                 "max_sequence_length must cover every requested split"
             )
+
+    if _validate_metadata:
+        validate_decode_metadata(
+            block_tables, sequence_lengths, device=query.device,
+            batch_size=batch_size, num_blocks=int(key_blocks.shape[0]),
+            block_size=block_size, query_positions=query_start_positions,
+            max_sequence_length=max_sequence_length if split_count > 1 else None,
+            reserved_lengths=_reserved_lengths,
+        )
 
     output = torch.empty_like(query)
     if split_count == 1:
@@ -857,6 +944,7 @@ def triton_paged_decode_attention(
                 value_blocks,
                 block_tables,
                 sequence_lengths,
+                position_buffer,
                 output,
                 float(scale),
                 query.stride(0),
@@ -872,6 +960,9 @@ def triton_paged_decode_attention(
                 value_blocks.stride(2),
                 value_blocks.stride(3),
                 block_tables.stride(0),
+                block_tables.stride(1),
+                sequence_lengths.stride(0),
+                position_buffer.stride(0),
                 output.stride(0),
                 output.stride(1),
                 output.stride(2),
@@ -882,6 +973,8 @@ def triton_paged_decode_attention(
                 HEAD_DIM=head_dim,
                 BLOCK_DIM=block_dim,
                 BLOCK_TOKENS=block_tokens,
+                HAS_QUERY_POSITIONS=query_start_positions is not None,
+                SDPA_COMPAT=bool(sdpa_compat),
                 num_warps=4,
             )
             return output.transpose(1, 2)
@@ -892,6 +985,7 @@ def triton_paged_decode_attention(
             value_blocks,
             block_tables,
             sequence_lengths,
+            position_buffer,
             output,
             float(scale),
             query.stride(0),
@@ -907,6 +1001,9 @@ def triton_paged_decode_attention(
             value_blocks.stride(2),
             value_blocks.stride(3),
             block_tables.stride(0),
+            block_tables.stride(1),
+            sequence_lengths.stride(0),
+            position_buffer.stride(0),
             output.stride(0),
             output.stride(1),
             output.stride(2),
@@ -917,6 +1014,8 @@ def triton_paged_decode_attention(
             HEAD_DIM=head_dim,
             BLOCK_DIM=block_dim,
             BLOCK_TOKENS=block_tokens,
+            HAS_QUERY_POSITIONS=query_start_positions is not None,
+            SDPA_COMPAT=bool(sdpa_compat),
             num_warps=4,
         )
         return output.transpose(1, 2)
@@ -950,6 +1049,7 @@ def triton_paged_decode_attention(
         value_blocks,
         block_tables,
         sequence_lengths,
+        position_buffer,
         partial_max,
         partial_sum,
         partial_output,
@@ -968,6 +1068,9 @@ def triton_paged_decode_attention(
         value_blocks.stride(2),
         value_blocks.stride(3),
         block_tables.stride(0),
+        block_tables.stride(1),
+        sequence_lengths.stride(0),
+        position_buffer.stride(0),
         partial_max.stride(0),
         partial_max.stride(1),
         partial_max.stride(2),
@@ -994,6 +1097,7 @@ def triton_paged_decode_attention(
         HEAD_DIM=head_dim,
         BLOCK_DIM=block_dim,
         BLOCK_TOKENS=block_tokens,
+        HAS_QUERY_POSITIONS=query_start_positions is not None,
         num_warps=4,
     )
     reduce_grid = (batch_size * num_heads,)

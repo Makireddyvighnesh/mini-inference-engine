@@ -484,16 +484,178 @@ schedule. Diagnostic tracing synchronizes around these stages, so its latency
 is intentionally separate from the clean asynchronous table above. The trace
 artifact is under `results/trace_graph_packed/`.
 
+## 2026-09-30 follow-up API and hybrid-numerics fixes
+
+The follow-up review reproduced four missing API protections on the L4:
+
+| Case | Before | Fix |
+|---|---|---|
+| Earlier query in the Qwen adapter, position 1 with KV length 4 | Fast writer overwrote position 3; `[1, 2, 100, 200]` became `[1, 2, 100, 7]` | Pass the live query position into the writer; now `[1, 7, 100, 200]` |
+| Strided sequence lengths / block-table columns | Wrong row length or page; examples returned 4 instead of 15, or 1.5 instead of 76 | Pass both metadata strides to all four attention kernels and the KV writer |
+| CUDA query position -1 / beyond the live KV span | NaN / silently accepted, unlike the host-position path | Eager range validation before launch; live graph device assertions |
+| Split limit 2 for a four-token attention read | Silently omitted the final two tokens | Reject limits that do not cover the actual causal read span |
+
+The writer additionally uses independent key/value source strides. Validation
+checks integer metadata on the correct device, positive lengths within the
+reserved/table capacity, and valid live physical block IDs. It happens once
+before layer-zero decode writes, rather than synchronizing each model layer.
+Unused table columns may remain `-1`. Graph capture performs no device-to-host
+copies; captured device assertions validate each replay's current metadata.
+An invalid replay assertion invalidates the CUDA context, so the serving
+boundary must continue to reject invalid request metadata before replay.
+
+### Hybrid greedy mismatch: backend numerical policy
+
+Identical dense queries and dense KV tensors were replayed through SDPA,
+FP64, and both paged attention implementations at the original failing step.
+The FP32 Triton reductions were consistently closer to FP64 than the dense
+BF16 SDPA output, but were not numerically identical to SDPA. This is not an
+incorrect prefill copy or a causal mask problem. Unnormalized softmax weight
+rounding and online-softmax tile traversal substantially explain the backend
+gap; small attention differences propagate through BF16/FP8 model operations
+and can change greedy logits.
+
+An explicit `sdpa_compat` policy retains direct page reads and FP32 Q*K
+products, but traverses 128-token tiles in reverse, rounds unnormalized P to
+the activation dtype before P*V, and uses one KV split. Auto selects it for
+the pinned BF16 SDPA dense-prefill hybrid/graph paths. `accurate` retains the
+existing FP32 reductions and split-KV selection; packed paths remain on that
+policy by default. No expected token IDs were changed and no numerical test
+was removed. This is tested compatibility for the pinned model/L4, not a
+universal bitwise SDPA emulator. The compatibility mode sacrifices split-KV
+parallelism; its performance is recorded separately.
+
+`tests/test_decode_metadata.py` covers the reproduced defects, independent
+source strides, invalid lengths/IDs/dtypes, valid short causal split spans,
+and mutable graph positions. Opt-in `tests/test_paged_model_integration.py`
+loads the pinned checkpoint, generates its trusted dense reference, anchors
+the original `" two"` token, and checks all block sizes 8/16/32/64 at batches
+1/2/4. It also tests dense-prefill graph replay on the actual failing request.
+
+Initial validation: all 228 then-present CPU/GPU/real-model tests passed.
+The matched 128/32, block-16, batch-1 smoke run now passes the unchanged
+reference: contiguous TTFT/TPOT 57.44/55.79 ms; hybrid 60.60/60.03 ms. The
+previous matched smoke was 57.26/55.92 and 61.15/59.88 ms respectively, with
+the hybrid correctness failure. These single-repetition numbers are a
+diagnostic before/after, not a statistically established speedup.
+
+Raw artifacts: `results/phase6_fixes_20260930/hybrid_compat/`,
+`precision/`, `precision_online/`, and `precision_final/`. The reproducible
+`scripts/inspect_decode_attention.py` compares identical real Q/K/V inputs
+and saves per-layer attention and projection errors. On the 36 captured
+layers, the average absolute attention difference from SDPA fell from
+9.48e-5 (`accurate`) to 1.46e-5 (`sdpa_compat`), approximately 6.5 times
+smaller. This is a numerical comparison on one identical-input diagnostic,
+not a latency improvement or a general bitwise-equivalence claim.
+
+### Final validation and sign-off
+
+The final CPU/GPU suite, including the pinned-model integration tests,
+passes **233 tests with no skips**. An isolated child CUDA context also
+confirms that a negative query position supplied *after capture* is rejected
+on replay; it does not poison the main test process. No failing test was
+removed, no expected token was changed, and no reference file was regenerated.
+
+The repeated matrix passes all **27/27 points**: contiguous, hybrid, and
+dense-prefill graph paths; 128/32, 512/64, and 2,048/128 prompt/output lengths;
+batches 1/2/4; block size 16; 32,768 physical token slots. Every point uses one
+warm-up and three measured repetitions. GPU/system sampling was disabled;
+these runs do not establish a GPU-utilization or peak-VRAM comparison.
+Every result records model revision, FP8 projections/BF16 activations,
+software/hardware identity, parent commit SHA, and dirty-worktree status.
+
+Current P50 measurements in milliseconds (not a before/after speedup table):
+
+| Prompt / output | Batch | Contiguous TPOT | Hybrid TPOT | Graph TTFT | Graph TPOT |
+|---|---:|---:|---:|---:|---:|
+| 128 / 32 | 1 | 56.03 | 60.50 | 59.52 | 21.95 |
+| 128 / 32 | 2 | 57.22 | 60.62 | 59.98 | 22.38 |
+| 128 / 32 | 4 | 56.77 | 60.84 | 92.49 | 22.87 |
+| 512 / 64 | 1 | 56.60 | 60.48 | 94.88 | 22.78 |
+| 512 / 64 | 2 | 57.00 | 61.07 | 192.47 | 23.24 |
+| 512 / 64 | 4 | 56.44 | 60.75 | 406.59 | 24.03 |
+| 2,048 / 128 | 1 | 56.79 | 60.36 | 423.42 | 24.71 |
+| 2,048 / 128 | 2 | 56.95 | 60.77 | 926.91 | 25.90 |
+| 2,048 / 128 | 4 | 56.24 | 60.68 | 1,910.85 | 28.28 |
+
+The graph runner measures one stable request group per run (1/2/4 requests),
+whereas contiguous/hybrid run all four workload requests. The table compares
+request-level latency, not matched whole-run throughput. The manifest
+contains both request-level rates and aggregate completed-run throughput;
+these must not be conflated. All final points pass exact-token checks and
+repeat-stability checks against the existing Phase 1 reference corpus.
+
+The unchanged packed-prefill numerical policy is additionally validated at
+batches 1 and 4, for both eager packed and packed-prefill graph execution,
+with three repetitions: **4/4 points pass**, for **31/31 total passing points**.
+The graph P50 TPOT in these packed controls is 22.45/23.32 ms (batch 1/4).
+
+Reproduction:
+
+```bash
+MINILLM_RUN_MODEL_TESTS=1 .conda-env/bin/python -m pytest minillm_l4/tests -q
+.conda-env/bin/python -m minillm_l4.benchmarks.commands.run_paged_kv \
+  --config minillm_l4/configs/workloads/qwen3_fp8_paged.yaml \
+  --workload all --modes contiguous paged_hybrid paged_graph \
+  --block-sizes 16 --batch-sizes 1 2 4 --graph-prefill-backend dense \
+  --repetitions 3 --warmup-repetitions 1 \
+  --no-gpu-sampling --no-system-telemetry \
+  --output-dir minillm_l4/results/phase6_fixes_20260930/validation
+```
+
+Full raw JSON, token events, P50/P90/P95/P99, and repeated-run variance are
+saved under [`validation`](../../results/phase6_fixes_20260930/validation/paged_kv_manifest.json)
+and [`packed_validation`](../../results/phase6_fixes_20260930/packed_validation/paged_kv_manifest.json).
+The pinned-model regression separately covers all block sizes 8/16/32/64 at
+batches 1/2/4, including the formerly failing request's full rollout.
+
+Phase 6's recorded definition of done is now satisfied for the validated
+pinned-model corpus and default numerical policies. `--decode-numerics
+accurate` deliberately preserves the earlier comparison implementation and
+may still differ from BF16 SDPA greedy tokens. Broader prompts/backends are
+not claimed to be universally token-identical. Chunked prefill and
+general dynamic-shape graph scheduling remain later-phase work. Historical
+results below describe the previous implementation, not the current default.
+
 ## 2026-09-28 correctness investigation and memory quantification
 
-### Definition of done
+### 2026-09-30 causal-position dispatch fix
+
+The public paged attention API previously ignored `query_start_positions` on
+its Triton path and used the full supplied KV length, exposing future tokens
+when a one-token query addressed an earlier position. All four Triton decode
+kernels now limit page loads and online softmax to
+`min(sequence_length, query_position + 1)` for causal attention. Noncausal
+attention retains the full KV span. CUDA device positions are read by the
+kernel at execution time; the graph runner passes its replay-updated position
+buffer rather than a fixed Python position. Static paged runners reuse their
+existing device position tensors to avoid extra per-layer host transfers.
+
+The GPU regression uses values `[1, 2, 100, 200]` and a query at position 1:
+the old Triton path returned 76, while the corrected path returns exactly 1.5
+from positions 0 and 1. Coverage includes mixed positions within a batch,
+host and strided device position inputs, automatic and explicit Triton
+dispatch, grouped-query and split-KV kernels, noncausal attention, and graph
+replay after changing the query position. This addresses a separate API bug;
+the hybrid greedy-token numerical mismatch documented below remains open.
+
+Validation on the L4: the complete CPU/GPU suite passes (`190 passed`, no
+skips). A matched short-prompt run (128 input / 32 output tokens, block size
+16, batch 1, one warm-up and one measured repetition) passes exact token
+checks for contiguous, packed-paged, and CUDA Graph paths. The hybrid path
+retains exactly its previous rollout, including the known token-17 mismatch,
+so the benchmark command exits nonzero for that pre-existing failure. Raw
+results and events are in
+[`causal_position_fix_20260930`](../../results/causal_position_fix_20260930/paged_kv_manifest.json).
+
+### Definition of done (historical sweep, updated sign-off)
 
 | Criterion | Evidence | Status |
 |---|---|---|
 | Randomized allocation/free tests pass | `tests/test_paged_kv_cache.py` (randomized allocate/append/release, no duplicate block IDs) | Done |
 | Blocks never leak or alias incorrectly | same tests; every sweep run releases all blocks | Done |
 | Out-of-memory behavior is controlled | OOM rejection without partial allocation (tests); admission guard in the capacity experiment | Done |
-| Generation remains correct | After the Triton precision fix: all 9 contiguous points, 24/36 paged hybrid points (every 512- and 2,048-token point), and 9/9 packed points pass exact-token. The 12 failing points are all 128/32 hybrid, on one request and one token; see the open case below | Open (one case) |
+| Generation remains correct | Historical hybrid failures are described below. The 2026-09-30 default policy passes 31/31 repeated benchmark points, plus the all-block-size pinned-model regression; see final validation above | Done for validated corpus/default policies |
 | Memory-utilization effect is quantified | full L4 sweep below plus the allocator capacity experiment | Done |
 
 ### The prefix-002 mismatch is an exact tie, not a paged bug
@@ -600,7 +762,10 @@ The paged pool is preallocated (32,768 slots × 144 KiB per token = 4.5 GiB),
 so peak VRAM is not compared across modes; contiguous KV holds exactly the
 live tokens (for example 8,700 tokens ≈ 1.2 GiB at 2,048/128 batch 4).
 
-### Open case: `baseline-short-003`, output token 16
+### Historical open case: `baseline-short-003`, output index 16
+
+This means the seventeenth generated token. The new `sdpa_compat` policy
+addresses this case; the table below describes the older `accurate` policy.
 
 After the fix, every hybrid 128/32 point fails on the same request and token
 at every batch and block size: the reference emits " two" and the paged path
@@ -695,3 +860,27 @@ Satisfied: every configured block size passed exact-token validation on the
 L4; allocator randomization, controlled OOM, fragmented lookup, block release,
 and zero-active-request cleanup tests pass. Prefix caching can now build on
 immutable shared physical blocks without changing the attention interface.
+
+## 2026-10-07 packed SDPA exactness and FP8 autotune buckets
+
+**Packed SDPA is now exact.** `_sdpa_packed_prefill_attention` repeated the
+GQA K/V heads before calling SDPA, matching an older Transformers dispatch.
+Transformers 5.14 calls SDPA for an unpadded prompt with no mask,
+`is_causal=True`, and `enable_gqa=True`, which selects a different kernel. The
+backend now delegates each request to Transformers' own
+`sdpa_attention_forward`. On the L4, packed prefill of mixed lengths (128,
+512, 1024, 2048, 4096) produces KV bitwise identical to single-request HF
+prefill in every layer. `qwen3_packed_prefill(row_logits=True)` projects each
+final hidden state separately, because a multi-row `lm_head` GEMM rounds one
+bf16 step differently from the one-row projection.
+
+**FP8 autotuning moved out of timed requests.** The SM89 kernel's autotune key
+was the exact row count `M`. Continuous batching and flattened prefill keep
+producing new totals, and a staggered-arrival run measured 180 autotune
+searches inside the timed window (a 2048-token prefill took 7.8 s instead of
+0.5 s). The key is now the power-of-two bucket of `M` with
+`cache_results=True`, and `load_qwen_fp8(..., pretune_tokens=16384)` tunes
+every bucket at load (about 90 s once per machine, then ~0.4 s from the disk
+cache). The kernel's K reduction order does not depend on the tile config, so
+outputs are unchanged. Earlier sweep timings whose shapes were new to their
+warm-up may include autotune time.
