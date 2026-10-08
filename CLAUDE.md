@@ -21,6 +21,7 @@ MINILLM_RUN_MODEL_TESTS=1 .conda-env/bin/python -m pytest -q minillm_l4/tests  #
 - Benchmarks live only in `benchmarks/commands/` and write to dated, git-ignored `results/<name>_<date>/` directories (commands refuse non-empty output dirs). Most take `--config configs/workloads/<file>.yaml`; `run_showcase` (README benchmark set, ~30 min), `run_cuda_graphs`, `run_prefill_ttft`, `run_profile_decode`, and `run_kv_capacity` do not. `scripts/make_showcase_charts.py <showcase.json> docs/assets/showcase` regenerates the README charts.
 - `scripts/stream_generate.py` streams tokens with live TTFT/TPOT (`--mixed`, `--adaptive`, `--chunk-size`, `--arrival-interval-ms`, several `--prompt-length` values cycled across requests).
 - `scripts/check_policy_equivalence.py` (GPU) is the no-HF correctness gate for scheduling changes: whole-prompt, chunked, mixed, adaptive, and their CUDA Graph variants must emit identical tokens.
+- `run_vllm_compare` runs matched workloads through MiniLLM and vLLM (separate env; see its docstring) and writes `comparison.md`; results in `docs/phase_notes/vllm_comparison.md`.
 - `run_cuda_graphs` compares eager vs graph decode (decode, prefill, serving, overhead sections); `scripts/make_cuda_graph_charts.py <cuda_graphs.json> docs/assets/cuda_graphs` renders its charts.
 
 ## Architecture
