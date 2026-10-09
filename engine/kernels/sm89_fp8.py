@@ -1,15 +1,16 @@
 """SM89-tuned dynamic block-scaled FP8 linear for the NVIDIA L4.
 
 The checkpoint stores FP8 E4M3 weights and one inverse scale per 128x128
-weight block.  This kernel quantizes each 128-wide activation block at run
-time, executes the FP8 matrix product, applies both scales, and accumulates in
-FP32.  It deliberately implements only the checkpoint contract used by this
+weight block. Small calls quantize inside the GEMM; large calls quantize once
+and share FP8 activations across N tiles. Both paths apply scales and
+accumulate in FP32 in the same order. This implements the contract used by this
 project and delegates unsupported calls to Transformers.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -27,7 +28,86 @@ SUPPORTED_BLOCK_SIZE = (128, 128)
 # BLOCK_K=128, so the config only changes speed, never a row's bits; a forward
 # larger than any pre-tuned bucket would otherwise pay a multi-second search.
 MAX_M_BUCKET = 16384
+# Provisional crossover, to be revised from same-session L4 measurements.
+# Explicit path="fused" / "split" is available regardless of this threshold.
+SPLIT_M_THRESHOLD = 256
+QUANT_BLOCK_M = 16
 _original_fp8_linear: Callable[..., torch.Tensor] | None = None
+
+
+@dataclass(frozen=True)
+class FP8GemmConfig:
+    """CPU-readable config; forcing one bypasses only GEMM autotuning."""
+
+    block_m: int
+    block_n: int
+    num_warps: int
+    num_stages: int
+    group_m: int = 8
+    block_k: int = 128
+
+    @property
+    def kwargs(self) -> dict[str, int]:
+        return {
+            "BLOCK_M": self.block_m, "BLOCK_N": self.block_n,
+            "BLOCK_K": self.block_k, "GROUP_M": self.group_m,
+            "PIPELINE_STAGES": self.num_stages,
+        }
+
+    @property
+    def label(self) -> str:
+        return (
+            f"{self.block_m}x{self.block_n}x{self.block_k}"
+            f"/w{self.num_warps}/s{self.num_stages}/g{self.group_m}"
+        )
+
+    def launch_kwargs(self) -> dict[str, int]:
+        return {**self.kwargs, "num_warps": self.num_warps, "num_stages": self.num_stages}
+
+
+# Ada has a 99 KiB shared-memory CTA limit. Avoid a full Cartesian product
+# of tiles/stages. CPU-only Triton 3.7.1 compilation of aligned model shapes
+# uses 33--99 KiB for these configs (including pipelined scale loads).
+SPLIT_GEMM_CONFIGS = (
+    FP8GemmConfig(64, 64, 4, 3),
+    FP8GemmConfig(64, 64, 4, 4),
+    FP8GemmConfig(64, 64, 4, 5),
+    FP8GemmConfig(64, 128, 4, 3),
+    FP8GemmConfig(64, 128, 4, 4),
+    FP8GemmConfig(128, 64, 4, 3),
+    FP8GemmConfig(128, 64, 4, 4),
+    FP8GemmConfig(128, 128, 4, 3),
+    FP8GemmConfig(128, 128, 8, 3),
+    FP8GemmConfig(128, 128, 8, 4),
+    FP8GemmConfig(64, 256, 4, 3),
+    FP8GemmConfig(64, 256, 8, 3),
+    FP8GemmConfig(128, 256, 8, 3),
+    FP8GemmConfig(128, 128, 8, 3, group_m=16),
+)
+
+
+def m_bucket(rows: int) -> int:
+    """Ceiling power of two, capped at the last pre-tuned bucket."""
+
+    if rows < 0:
+        raise ValueError("rows must be nonnegative")
+    return min(1 << (max(1, rows) - 1).bit_length(), MAX_M_BUCKET)
+
+
+def select_fp8_path(rows: int, path: str = "auto") -> str:
+    """Resolve dispatch without touching CUDA; the threshold is inclusive."""
+
+    if path not in {"auto", "fused", "split"}:
+        raise ValueError(f"Unknown SM89 FP8 path: {path!r}")
+    if rows < 0:
+        raise ValueError("rows must be nonnegative")
+    return ("split" if rows >= SPLIT_M_THRESHOLD else "fused") if path == "auto" else path
+
+
+def pretune_row_buckets(max_tokens: int) -> tuple[int, ...]:
+    """Cover the ceiling bucket too, including a non-power-of-two limit."""
+
+    return tuple(1 << i for i in range(m_bucket(max(1, max_tokens)).bit_length()))
 
 
 def sm89_available(device: torch.device | str | None = None) -> bool:
@@ -172,11 +252,15 @@ if triton is not None:
         mask_n = offsets_n < N
         accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
+        # Widen only addresses: row * stride can exceed int32 on long prefills.
+        address_m = offsets_m.to(tl.int64)
+        address_n = offsets_n.to(tl.int64)
+        address_k = offsets_k.to(tl.int64)
         activation_ptrs = (
-            activation + offsets_m[:, None] * stride_am + offsets_k[None, :] * stride_ak
+            activation + address_m[:, None] * stride_am + address_k[None, :] * stride_ak
         )
-        weight_ptrs = weight + offsets_k[:, None] * stride_wk + offsets_n[None, :] * stride_wn
-        scale_ptrs = weight_scales + (offsets_n // 128) * stride_sn
+        weight_ptrs = weight + address_k[:, None] * stride_wk + address_n[None, :] * stride_wn
+        scale_ptrs = weight_scales + (address_n // 128) * stride_sn
 
         for k_block in range(0, tl.cdiv(K, BLOCK_K)):
             remaining_k = K - k_block * BLOCK_K
@@ -196,7 +280,7 @@ if triton is not None:
                 other=0.0,
             )
             weight_scale = tl.load(
-                scale_ptrs + k_block * stride_sk,
+                scale_ptrs + tl.cast(k_block, tl.int64) * stride_sk,
                 mask=mask_n,
                 other=1.0,
             )
@@ -205,15 +289,156 @@ if triton is not None:
                 * activation_scale[:, None]
                 * weight_scale[None, :]
             )
-            activation_ptrs += BLOCK_K * stride_ak
-            weight_ptrs += BLOCK_K * stride_wk
+            activation_ptrs += tl.cast(BLOCK_K, tl.int64) * stride_ak
+            weight_ptrs += tl.cast(BLOCK_K, tl.int64) * stride_wk
 
-        output_ptrs = output + offsets_m[:, None] * stride_om + offsets_n[None, :] * stride_on
+        output_ptrs = output + address_m[:, None] * stride_om + address_n[None, :] * stride_on
         tl.store(
             output_ptrs,
             accumulator.to(output.dtype.element_ty),
             mask=mask_m[:, None] & mask_n[None, :],
         )
+
+
+    @triton.jit
+    def _quantize_activation_kernel(
+        activation, activation_fp8, activation_scales,
+        M, K, stride_am, stride_ak, groups_k,
+        BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr,
+    ):
+        offsets_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+        k_block = tl.program_id(1)
+        offsets_k = k_block * BLOCK_K + tl.arange(0, BLOCK_K)
+        mask = (offsets_m[:, None] < M) & (offsets_k[None, :] < K)
+        address_m = offsets_m.to(tl.int64)
+        address_k = offsets_k.to(tl.int64)
+        activation_tile = tl.load(
+            activation + address_m[:, None] * stride_am + address_k[None, :] * stride_ak,
+            mask=mask, other=0.0,
+        ).to(tl.float32)
+        # Copy the fused arithmetic literally. In particular, store the raw
+        # scale (zero for a zero block), not the clamped division denominator.
+        activation_scale = tl.max(tl.abs(activation_tile), axis=1) / 448.0
+        quantized = (
+            activation_tile / tl.maximum(activation_scale[:, None], 1e-12)
+        ).to(tl.float8e4nv)
+        tl.store(
+            activation_fp8 + address_m[:, None] * K + address_k[None, :],
+            quantized, mask=mask,
+        )
+        tl.store(
+            activation_scales + address_m * groups_k + tl.cast(k_block, tl.int64),
+            activation_scale, mask=offsets_m < M,
+        )
+
+
+    @triton.autotune(
+        configs=[
+            triton.Config(c.kwargs, num_warps=c.num_warps, num_stages=c.num_stages)
+            for c in SPLIT_GEMM_CONFIGS
+        ],
+        key=["M_BUCKET", "N", "K"],
+        cache_results=True,
+    )
+    @triton.jit
+    def _fp8_split_gemm_kernel(
+        activation, weight, output, activation_scales, weight_scales,
+        M, N, K,
+        stride_am, stride_ak, stride_wn, stride_wk, stride_om, stride_on,
+        stride_asm, stride_ask, stride_sn, stride_sk, M_BUCKET,
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr,
+        PIPELINE_STAGES: tl.constexpr,
+    ):
+        pid_m, pid_n = _grouped_tile(
+            tl.program_id(0), tl.cdiv(M, BLOCK_M), tl.cdiv(N, BLOCK_N), GROUP_M,
+        )
+        offsets_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offsets_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        offsets_k = tl.arange(0, BLOCK_K)
+        mask_m = offsets_m < M
+        mask_n = offsets_n < N
+        accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        address_m = offsets_m.to(tl.int64)
+        address_n = offsets_n.to(tl.int64)
+        address_k = offsets_k.to(tl.int64)
+        activation_ptrs = (
+            activation + address_m[:, None] * stride_am + address_k[None, :] * stride_ak
+        )
+        weight_ptrs = weight + address_k[:, None] * stride_wk + address_n[None, :] * stride_wn
+        activation_scale_ptrs = activation_scales + address_m * stride_asm
+        scale_ptrs = weight_scales + (address_n // 128) * stride_sn
+        for k_block in tl.range(0, tl.cdiv(K, BLOCK_K), num_stages=PIPELINE_STAGES):
+            mask_k = offsets_k < K - k_block * BLOCK_K
+            activation_fp8 = tl.load(
+                activation_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0,
+            )
+            weight_tile = tl.load(
+                weight_ptrs, mask=mask_k[:, None] & mask_n[None, :], other=0.0,
+            )
+            activation_scale = tl.load(
+                activation_scale_ptrs + tl.cast(k_block, tl.int64) * stride_ask, mask=mask_m, other=0.0,
+            )
+            weight_scale = tl.load(
+                scale_ptrs + tl.cast(k_block, tl.int64) * stride_sk, mask=mask_n, other=1.0,
+            )
+            # Do not combine the two scales, accumulate a multi-block dot,
+            # use split-K, change BLOCK_K, or change floating-point fusion.
+            accumulator += (
+                tl.dot(activation_fp8, weight_tile)
+                * activation_scale[:, None]
+                * weight_scale[None, :]
+            )
+            activation_ptrs += tl.cast(BLOCK_K, tl.int64) * stride_ak
+            weight_ptrs += tl.cast(BLOCK_K, tl.int64) * stride_wk
+        tl.store(
+            output + address_m[:, None] * stride_om + address_n[None, :] * stride_on,
+            accumulator.to(output.dtype.element_ty),
+            mask=mask_m[:, None] & mask_n[None, :],
+        )
+
+
+def quantize_sm89_fp8_activation(input_2d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a 2D activation once, with raw fp32 scales per row/K block.
+
+    This is separate from linear for timing the quantizer and forcing GEMM
+    configs without requantizing the same input in the exactness sweep.
+    """
+
+    if input_2d.ndim != 2 or input_2d.dtype not in {torch.bfloat16, torch.float16}:
+        raise ValueError("Expected a 2D bf16/fp16 activation")
+    if not input_2d.is_cuda or not sm89_available(input_2d.device):
+        raise RuntimeError("Activation quantization requires SM89 CUDA and Triton")
+    m, k = input_2d.shape
+    if k == 0:
+        raise ValueError("Activation width must be positive")
+    groups_k = triton.cdiv(k, 128)
+    quantized = torch.empty((m, k), device=input_2d.device, dtype=torch.float8_e4m3fn)
+    scales = torch.empty((m, groups_k), device=input_2d.device, dtype=torch.float32)
+    if m:
+        _quantize_activation_kernel[(triton.cdiv(m, QUANT_BLOCK_M), groups_k)](
+            input_2d, quantized, scales, m, k,
+            input_2d.stride(0), input_2d.stride(1), groups_k,
+            BLOCK_M=QUANT_BLOCK_M, BLOCK_K=128, num_warps=4, num_stages=1,
+        )
+    return quantized, scales
+
+
+def _launch_split_gemm(activation, weight, output, activation_scales, weight_scales, config=None):
+    m, k = activation.shape
+    n = weight.shape[0]
+    grid = lambda meta: (triton.cdiv(m, meta["BLOCK_M"]) * triton.cdiv(n, meta["BLOCK_N"]),)
+    args = (
+        activation, weight, output, activation_scales, weight_scales, m, n, k,
+        *activation.stride(), *weight.stride(), *output.stride(),
+        *activation_scales.stride(), *weight_scales.stride(), m_bucket(m),
+    )
+    if config is None:
+        _fp8_split_gemm_kernel[grid](*args)
+    else:
+        # .fn is the undecorated JITFunction, so this runs exactly the given
+        # config without reading or populating the autotuner cache.
+        _fp8_split_gemm_kernel.fn[grid](*args, **config.launch_kwargs())
 
 
 def sm89_fp8_linear(
@@ -225,8 +450,19 @@ def sm89_fp8_linear(
     activation_scale: torch.Tensor | None = None,
     output_dtype: torch.dtype | None = None,
     allow_deepgemm: bool = True,
+    *,
+    path: str = "auto",
+    gemm_config: FP8GemmConfig | None = None,
 ) -> torch.Tensor:
-    """Transformers-compatible FP8 linear with a guarded fallback."""
+    """Transformers-compatible linear; explicit paths support bitwise A/B.
+
+    ``gemm_config`` requires ``path="split"`` and bypasses its autotuner.
+    Both paths preserve the fused floating-point arithmetic and BLOCK_K=128.
+    """
+
+    select_fp8_path(0, path)  # Reject typos even on the fallback path.
+    if gemm_config is not None and (path != "split" or gemm_config not in SPLIT_GEMM_CONFIGS):
+        raise ValueError("gemm_config must be a listed split config with path='split'")
 
     if not _supports_call(
         input, weight, weight_scale_inv, block_size, activation_scale
@@ -258,6 +494,15 @@ def sm89_fp8_linear(
     output = torch.empty(
         (m, n), device=input.device, dtype=output_dtype or input.dtype
     )
+    chosen_path = select_fp8_path(m, path)
+    if m == 0 or n == 0:
+        result = output.reshape(*input.shape[:-1], n)
+        return result if bias is None else result + bias
+    if chosen_path == "split":
+        quantized, activation_scales = quantize_sm89_fp8_activation(input_2d)
+        _launch_split_gemm(quantized, weight_2d, output, activation_scales, scales_2d, gemm_config)
+        result = output.reshape(*input.shape[:-1], n)
+        return result if bias is None else result + bias
     grid = lambda meta: (  # noqa: E731
         triton.cdiv(m, meta["BLOCK_M"]) * triton.cdiv(n, meta["BLOCK_N"]),
     )
@@ -277,16 +522,30 @@ def sm89_fp8_linear(
         output.stride(1),
         scales_2d.stride(0),
         scales_2d.stride(1),
-        min(1 << (m - 1).bit_length(), MAX_M_BUCKET),
+        m_bucket(m),
     )
     result = output.reshape(*input.shape[:-1], n)
     return result if bias is None else result + bias
 
 
 def pretune_sm89_fp8(model: Any, max_tokens: int = MAX_M_BUCKET) -> int:
-    """Autotune every power-of-two row bucket up to ``max_tokens`` for each
-    FP8 projection shape in ``model``, so no search happens inside a timed
-    request.  Results persist in the Triton cache; returns the bucket count.
+    """Warm both GEMM paths and the quantizer for every row bucket/shape.
+
+    Tune at power-of-two row counts through the capped ceiling bucket of
+    ``max_tokens``. At buckets >=16, also launch ``bucket - 1`` to compile
+    Triton's non-divisible-by-16 M specialization. Smaller buckets already
+    have only that specialization (M==1 stays separate). Each extra call
+    reuses the same M_BUCKET/N/K/dtype autotune key and selected config: one
+    compilation/launch per GEMM, never another search. Split calls also warm
+    the fixed-config quantizer; its M specializations are shared across
+    buckets. Reuse the bucket's activation buffer to limit warmup overhead.
+
+    In serving, N/K are fixed per model projection, and linear makes inputs,
+    weights and scales contiguous and allocates contiguous outputs. Thus all
+    strides (including ceil(K/128) scale strides) and quantizer groups_k are
+    fixed per shape; only M varies. No do_not_specialize is needed for these
+    integer args. Results persist in Triton's cache; returns shape/bucket
+    pairs, regardless of the number of specialization warmup calls.
     """
 
     shapes = {
@@ -299,14 +558,14 @@ def pretune_sm89_fp8(model: Any, max_tokens: int = MAX_M_BUCKET) -> int:
     for weight, scales, block in shapes:
         unique.setdefault(tuple(weight.shape), (weight, scales, block))
     dtype = next(p.dtype for p in model.parameters() if p.dtype in {torch.bfloat16, torch.float16})
-    buckets = [1 << i for i in range(max(1, int(max_tokens)).bit_length())]
+    buckets = pretune_row_buckets(int(max_tokens))
     with torch.inference_mode():
         for weight, scales, block in unique.values():
-            for rows in buckets:
-                sm89_fp8_linear(
-                    torch.zeros((rows, weight.shape[1]), dtype=dtype, device=weight.device),
-                    weight, scales, block_size=list(block),
-                )
+            for bucket in buckets:
+                activation = torch.zeros((bucket, weight.shape[1]), dtype=dtype, device=weight.device)
+                for rows in (bucket, bucket - 1) if bucket >= 16 else (bucket,):
+                    for path in ("fused", "split"):
+                        sm89_fp8_linear(activation[:rows], weight, scales, block_size=list(block), path=path)
     torch.cuda.synchronize()
     return len(unique) * len(buckets)
 

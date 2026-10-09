@@ -54,3 +54,24 @@ Ratios: time columns are MiniLLM / vLLM (above 1.00x means MiniLLM is slower); t
   mixed prompt+decode steps run eagerly (vLLM graphs them piecewise), one attention call per
   prompt chunk, and the per-layer prefix gather for continuation chunks.
 - All 393 measured requests produced identical greedy tokens in both engines.
+
+## After the split FP8 GEMM (2026-10-09)
+
+Profiling showed the FP8 GEMM was 81% of prefill GPU time (GPU ~98% busy, so CUDA Graphs
+for mixed steps would gain little). The fused kernel re-quantized activations inside the
+GEMM loop for every output tile; the split path quantizes once and uses 128-row tiles.
+Per-layer projections at 2,048 tokens: 7,163 -> 4,973 us (vLLM ~4,864 us). Outputs are
+bitwise identical to the fused kernel (468 exactness cases, every autotune config; policy
+gate 112/112). Same workloads; vLLM numbers from the run above:
+
+| Case | MiniLLM before | MiniLLM now | vLLM |
+|---|---|---|---|
+| Prefill 512 / 2,048 / 8,192 tokens | 77.5 / 354 / 1,680 ms | 63.4 / 287 / 1,379 ms | 69.5 / 259 / 1,314 ms |
+| Decode, 32 requests | 536 tok/s | 593 tok/s | 644 tok/s |
+| Serving 16 requests, TTFT p50 | 122 ms | 97 ms | 100 ms |
+| 6,144-token mix, output tok/s | 55 | 63 | 70 |
+| 64 requests every 50 ms, output tok/s | 406 | 461 | 489 |
+
+Heavy-load throughput is now 90-94% of vLLM (was 78-83%), with ~2x shorter worst decode
+pauses. Remaining: 128-token prefill is fixed per-forward overhead (50 vs 32 ms); q/k/v
+and gate/up still quantize the same input separately (merged projections would save ~6%).
