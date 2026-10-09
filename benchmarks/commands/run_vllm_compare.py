@@ -45,13 +45,44 @@ import statistics
 import sys
 import time
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterable, Sequence
 
 ROOT = Path(__file__).resolve().parents[3]
+MODEL_ID = "Qwen/Qwen3-4B-Instruct-2507-FP8"
+MODEL_REVISION = "8591804019c8b22094c3b5b4454e0edc05dffc98"
 MODEL_PATH = ("/home/ubuntu/.cache/huggingface/hub/models--Qwen--Qwen3-4B-Instruct-2507-FP8/"
-              "snapshots/8591804019c8b22094c3b5b4454e0edc05dffc98")
+              f"snapshots/{MODEL_REVISION}")
 MAX_IN_FLIGHT = 32
 MAX_MODEL_LEN = 8448
+
+
+def case_validity(entry: dict[str, Any], *extra_reasons: str) -> dict[str, Any]:
+    """Validate a case without discarding its measurements or diagnostics.
+
+    Kept standard-library-only so both engine environments and CPU tooling can
+    use the same completion and allocator-pressure rules.
+    """
+    reasons = list(extra_reasons)
+    if entry["completed"] != entry["expected"]:
+        reasons.append(f"completed {entry['completed']}/{entry['expected']} requests")
+    if entry.get("alloc_retries", 0) != 0:
+        reasons.append(f"alloc_retries={entry['alloc_retries']} (GPU memory pressure)")
+    if entry.get("valid") is False and entry.get("invalid_reason"):
+        reasons.extend(entry["invalid_reason"].split("; "))
+    elif entry.get("valid") is False and not reasons:
+        reasons.append("previously marked invalid")
+    reasons = list(dict.fromkeys(reasons))
+    return {"valid": not reasons, "invalid_reason": "; ".join(reasons) if reasons else None}
+
+
+def print_invalid_case(label: str, entry: dict[str, Any]) -> None:
+    if not entry["valid"]:
+        print(f"{label}: INVALID: {entry['invalid_reason']}", flush=True)
+
+
+def exit_if_invalid(entries: Iterable[dict[str, Any]]) -> None:
+    if any(entry.get("valid") is False for entry in entries):
+        raise SystemExit(1)
 
 
 def percentile(values: Sequence[float], q: float) -> float | None:
@@ -63,7 +94,7 @@ def percentile(values: Sequence[float], q: float) -> float | None:
     return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
 
 
-def summarize(runs: list[dict[str, Any]]) -> dict[str, Any]:
+def summarize(runs: list[dict[str, Any]], *, expected: int | None = None) -> dict[str, Any]:
     """Runs are {"duration_ms", "requests": [{ttft_ms, tpot_ms, max_gap_ms, tokens, token_ids}]}."""
 
     rows = [r for run in runs for r in run["requests"]]
@@ -72,14 +103,18 @@ def summarize(runs: list[dict[str, Any]]) -> dict[str, Any]:
     worst = [max((r["max_gap_ms"] for r in run["requests"] if r["max_gap_ms"] is not None), default=None)
              for run in runs]
     worst = [w for w in worst if w is not None]
-    return {
+    entry = {
         "ttft_p50_ms": percentile(ttft, 0.5), "ttft_p95_ms": percentile(ttft, 0.95),
         "tpot_p50_ms": percentile(tpot, 0.5), "tpot_p95_ms": percentile(tpot, 0.95),
         "worst_gap_ms": statistics.median(worst) if worst else None,
         "tokens_per_s": statistics.median(sum(r["tokens"] for r in run["requests"]) / (run["duration_ms"] / 1000)
                                           for run in runs),
-        "completed": sum(r["tokens"] == r["expected_tokens"] for r in rows), "expected": len(rows),
+        "completed": sum(r["tokens"] == r["expected_tokens"] and r.get("status", "completed") == "completed"
+                         for r in rows),
+        "expected": len(rows) if expected is None else expected,
     }
+    entry.update(case_validity(entry))
+    return entry
 
 
 # ----------------------------------------------------------------------------- workloads
@@ -172,16 +207,21 @@ def run_minillm(args) -> None:
                 rows.append({"id": record["request_id"], "ttft_ms": m["ttft_ms"], "tpot_ms": m["tpot_ms"],
                              "max_gap_ms": max(m["itl_ms"]) if m["itl_ms"] else None,
                              "tokens": len(outcome["generated_token_ids"]),
-                             "expected_tokens": m["requested_output_tokens"],
+                             "expected_tokens": m["requested_output_tokens"], "status": m["status"],
+                             "error": m.get("error"),
                              "token_ids": outcome["generated_token_ids"]})
             runs.append({"duration_ms": run["duration_ms"], "requests": rows})
-        entry = {**summarize(runs), "alloc_retries": torch.cuda.memory_stats().get("num_alloc_retries", 0) - retries,
+        entry = {**summarize(runs, expected=len(requests) * args.repetitions),
+                 "alloc_retries": torch.cuda.memory_stats().get("num_alloc_retries", 0) - retries,
                  "runs": runs}
+        entry.update(case_validity(entry))
         results["cases"][work["name"]] = entry
-        print(f"[minillm] {work['name']}: TTFT p50 {entry['ttft_p50_ms']:.1f} ms, TPOT p50 "
+        (args.output_dir / "minillm.json").write_text(json.dumps(results) + "\n")
+        print_invalid_case(f"[minillm] {work['name']}", entry)
+        print(f"[minillm] {work['name']}: TTFT p50 {entry['ttft_p50_ms'] or 0:.1f} ms, TPOT p50 "
               f"{entry['tpot_p50_ms'] or 0:.2f} ms, {entry['tokens_per_s']:.1f} tok/s, "
               f"{entry['completed']}/{entry['expected']} complete, retries {entry['alloc_retries']}", flush=True)
-        (args.output_dir / "minillm.json").write_text(json.dumps(results) + "\n")
+    exit_if_invalid(results["cases"].values())
 
 
 # ----------------------------------------------------------------------------- vLLM
@@ -201,18 +241,24 @@ async def _vllm_case(engine, work, label) -> dict[str, Any]:
                                 temperature=0.0, ignore_eos=True, detokenize=False,
                                 output_kind=RequestOutputKind.DELTA)
         tokens, times = [], []
-        async for output in engine.generate(TokensPrompt(prompt_token_ids=request["prompt_token_ids"]), params,
-                                            request_id=f"{label}-{request['id']}"):
-            delta = list(output.outputs[0].token_ids)
-            if delta:
-                now = time.perf_counter_ns()
-                tokens += delta
-                times += [now] * len(delta)
+        error = None
+        try:
+            async for output in engine.generate(TokensPrompt(prompt_token_ids=request["prompt_token_ids"]), params,
+                                                request_id=f"{label}-{request['id']}"):
+                delta = list(output.outputs[0].token_ids)
+                if delta:
+                    now = time.perf_counter_ns()
+                    tokens += delta
+                    times += [now] * len(delta)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
         gaps = [(b - a) / 1e6 for a, b in zip(times, times[1:])]
-        return {"id": request["id"], "ttft_ms": (times[0] - arrival) / 1e6,
+        return {"id": request["id"], "ttft_ms": (times[0] - arrival) / 1e6 if times else None,
                 "tpot_ms": (times[-1] - times[0]) / 1e6 / (len(times) - 1) if len(times) > 1 else None,
                 "max_gap_ms": max(gaps) if gaps else None, "tokens": len(tokens),
-                "expected_tokens": request["max_new_tokens"], "token_ids": tokens, "last_ns": times[-1]}
+                "expected_tokens": request["max_new_tokens"], "token_ids": tokens,
+                "status": "completed" if error is None and len(tokens) == request["max_new_tokens"] else "failed",
+                "error": error, "last_ns": times[-1] if times and error is None else time.perf_counter_ns()}
 
     rows = await asyncio.gather(*(one(r) for r in work["requests"]))
     duration = (max(r.pop("last_ns") for r in rows) - start) / 1e6
@@ -244,14 +290,16 @@ async def _run_vllm(args) -> None:
             for index in range(args.warmup_repetitions):
                 await _vllm_case(engine, work, f"warm{index}")
             runs = [await _vllm_case(engine, work, f"run{index}") for index in range(args.repetitions)]
-            entry = {**summarize(runs), "runs": runs}
+            entry = {**summarize(runs, expected=len(work["requests"]) * args.repetitions), "runs": runs}
             results["cases"][work["name"]] = entry
-            print(f"[vllm] {work['name']}: TTFT p50 {entry['ttft_p50_ms']:.1f} ms, TPOT p50 "
+            (args.output_dir / "vllm.json").write_text(json.dumps(results) + "\n")
+            print_invalid_case(f"[vllm] {work['name']}", entry)
+            print(f"[vllm] {work['name']}: TTFT p50 {entry['ttft_p50_ms'] or 0:.1f} ms, TPOT p50 "
                   f"{entry['tpot_p50_ms'] or 0:.2f} ms, {entry['tokens_per_s']:.1f} tok/s, "
                   f"{entry['completed']}/{entry['expected']} complete", flush=True)
-            (args.output_dir / "vllm.json").write_text(json.dumps(results) + "\n")
     finally:
         engine.shutdown()
+    exit_if_invalid(results["cases"].values())
 
 
 # ----------------------------------------------------------------------------- report
@@ -260,6 +308,19 @@ def report(args) -> None:
     mini = json.loads((args.output_dir / "minillm.json").read_text())
     vllm = json.loads((args.output_dir / "vllm.json").read_text())
     workloads = {w["name"]: w for w in json.loads((args.output_dir / "workloads.json").read_text())}
+    entries = []
+    for engine in (mini, vllm):
+        for name, entry in engine["cases"].items():
+            # Recheck legacy files too: their expected count may count only the
+            # rows returned by the runner, overlooking missing requests.
+            if name in workloads and "runs" in entry:
+                rows = [r for run in entry["runs"] for r in run["requests"]]
+                entry["completed"] = sum(r["tokens"] == r["expected_tokens"]
+                                         and r.get("status", "completed") == "completed" for r in rows)
+                entry["expected"] = max(entry["expected"], len(workloads[name]["requests"]) * len(entry["runs"]))
+            entry.update(case_validity(entry))
+            entries.append(entry)
+            print_invalid_case(f"[{engine['engine']}] {name}", entry)
 
     def fmt(value, unit=""):
         return "-" if value is None else f"{value:,.1f}{unit}"
@@ -286,13 +347,19 @@ def report(args) -> None:
         names = [n for n, w in workloads.items() if w["section"] == section and n in mini["cases"] and n in vllm["cases"]]
         if not names:
             continue
-        lines += [f"## {title}", "", "| Case | " + " | ".join(
-            f"{c[0]} (MiniLLM / vLLM / ratio)" for c in columns) + " |", "|---|" + "---|" * len(columns)]
+        lines += [f"## {title}", "", "| Case | Validity (MiniLLM / vLLM) | " + " | ".join(
+            f"{c[0]} (MiniLLM / vLLM / ratio)" for c in columns) + " |", "|---|---|" + "---|" * len(columns)]
         for name in names:
             ours, theirs = mini["cases"][name], vllm["cases"][name]
-            cells = [f"{fmt(ours[key], unit)} / {fmt(theirs[key], unit)} / {ratio(ours[key], theirs[key], low)}"
+            valid = ours["valid"] and theirs["valid"]
+            status = " / ".join("valid" if e["valid"] else f"**INVALID: {e['invalid_reason']}**"
+                                for e in (ours, theirs))
+            cells = [f"{fmt(ours[key], unit)} / {fmt(theirs[key], unit)} / "
+                     + (ratio(ours[key], theirs[key], low) if valid else "-")
                      for _, key, unit, low in columns]
-            lines.append(f"| {workloads[name]['label']} | " + " | ".join(cells) + " |")
+            lines.append(f"| {workloads[name]['label']} | {status} | " + " | ".join(cells) + " |")
+            if not valid or not ours["runs"] or not theirs["runs"]:
+                continue
             for a, b in zip(ours["runs"][0]["requests"], theirs["runs"][0]["requests"]):
                 common = next((i for i, (x, y) in enumerate(zip(a["token_ids"], b["token_ids"])) if x != y),
                               min(len(a["token_ids"]), len(b["token_ids"])))
@@ -306,10 +373,12 @@ def report(args) -> None:
                   + ("." if identical == len(agreement) else
                      f"; on average the first {statistics.mean(c / n for c, n, _ in agreement):.0%} of each "
                      "output matches (different FP8 kernels can flip near-tied greedy choices)."), ""]
-    lines += ["Ratios: time columns are MiniLLM / vLLM (above 1.00x means MiniLLM is slower); "
+    lines += ["Invalid cases retain raw metrics for diagnostics; ratios and output agreement exclude them.", "",
+              "Ratios: time columns are MiniLLM / vLLM (above 1.00x means MiniLLM is slower); "
               "tok/s columns are MiniLLM as a share of vLLM.", ""]
     (args.output_dir / "comparison.md").write_text("\n".join(lines))
     print("\n".join(lines))
+    exit_if_invalid(entries)
 
 
 def main() -> None:

@@ -19,17 +19,17 @@ from pathlib import Path
 
 import torch
 
-from minillm_l4.benchmarks.commands.run_showcase import metrics, paged, prompt
+from minillm_l4.benchmarks.commands.run_showcase import MODEL_ID, MODEL_REVISION, load_qwen_fp8, metrics, paged, prompt
+from minillm_l4.benchmarks.commands.run_vllm_compare import case_validity, exit_if_invalid, print_invalid_case
 from minillm_l4.benchmarks.core.harness import BenchmarkHarness
 from minillm_l4.benchmarks.core.schemas import HarnessConfig, RequestSpec, WorkloadSpec
-from minillm_l4.benchmarks.runners.huggingface_baseline import MODEL_ID, MODEL_REVISION, load_qwen_fp8
 
 SECTIONS = ("decode", "prefill", "serving", "overhead")
 BATCH_SIZES = (1, 2, 4, 8, 16, 32)
 PREFILL_LENGTHS = (128, 256, 512, 1024, 2048, 4096, 8192)
 
 
-def case_metrics(result, requests, scheduler_runs):
+def case_metrics(result, requests, scheduler_runs, *, expected_runs=None):
     """Showcase metrics plus decode-only rate and actual replay share.
 
     Decode throughput counts tokens after the first, divided by summed decode
@@ -37,7 +37,7 @@ def case_metrics(result, requests, scheduler_runs):
     It is emitted only when all decode steps are separate from prompt work.
     E2E throughput includes prompt work, arrivals, and completion/cleanup.
     """
-    entry = metrics(result, requests)
+    entry = metrics(result, requests, expected_runs=expected_runs)
     rates = []
     for summary in scheduler_runs:
         steps = [r for r in summary["execution_records"] if r["kind"] == "decode"]
@@ -147,11 +147,16 @@ def main(argv=None):
             torch.cuda.empty_cache()
 
         entry = {"engine": name, "label": name, "policy": policy, "mode": mode, **extra,
-                 **case_metrics(result, requests, scheduler_runs), **memory,
+                 **case_metrics(result, requests, scheduler_runs, expected_runs=3), **memory,
                  "graph_fallback_reasons": sorted({reason for s in scheduler_runs for reason in s["graph_fallback_steps_by_reason"]}),
                  "captured_buckets": overhead["captured_buckets"],
                  "capture_ms": overhead["capture_ms"],
                  "graph_pool_memory_bytes": overhead["graph_pool_memory_bytes"]}
+        reasons = []
+        if mode != "eager" and section != "prefill" and not entry["graph_replays"]:
+            reasons.append(f"no measured graph replays: {entry['graph_fallback_reasons']}")
+        entry.update(case_validity(entry, *reasons))
+        overhead.update({key: entry[key] for key in ("completed", "expected", "alloc_retries", "valid", "invalid_reason")})
         raw = result.to_dict()
         raw["cuda_graphs"] = {"metrics": entry, "warmup_scheduler": warmup_summary,
                               "measured_schedulers": scheduler_runs, "overhead": overhead}
@@ -160,14 +165,11 @@ def main(argv=None):
         if "overhead" in args.sections and mode != "eager":
             summary["sections"].setdefault("overhead", []).append(overhead)
         save_summary()
+        print_invalid_case(f"[{section}] {name}", entry)
         print(f"[{section}] {name}: TTFT {entry['ttft_p50_ms'] or 0:.1f} ms, "
               f"TPOT {entry['tpot_p50_ms'] or 0:.1f} ms, {entry['tokens_per_s']:.1f} tok/s, "
               f"GPU busy {entry['gpu_busy_percent']}, replay share {entry['graph_replay_share']:.1%}, "
               f"retries {entry['alloc_retries']}, peak {entry['peak_allocated_gib']:.2f} GiB", flush=True)
-        if entry["completed"] != entry["expected"]:
-            raise RuntimeError(f"{name}: incomplete requests; inspect saved case diagnostics")
-        if mode != "eager" and section != "prefill" and not entry["graph_replays"]:
-            raise RuntimeError(f"{name}: no measured graph replays: {entry['graph_fallback_reasons']}")
 
     if "decode" in args.sections:
         for length, batches in ((512, BATCH_SIZES), (4096, (8,))):
@@ -201,6 +203,7 @@ def main(argv=None):
             run("capture", f"b{batch}_graph", requests, mode="graph", batch=batch, prompt_tokens=512)
     save_summary()
     print(f"Summary: {args.output_dir / 'cuda_graphs.json'}")
+    exit_if_invalid(entry for entries in summary["sections"].values() for entry in entries)
 
 
 if __name__ == "__main__":

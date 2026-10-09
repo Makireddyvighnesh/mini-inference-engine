@@ -30,15 +30,22 @@ from pathlib import Path
 
 import torch
 
-from minillm_l4.benchmarks.commands.run_showcase import metrics, paged, prompt
+from minillm_l4.benchmarks.commands.run_showcase import MODEL_ID, MODEL_REVISION, load_qwen_fp8, metrics, paged, prompt
+from minillm_l4.benchmarks.commands.run_vllm_compare import case_validity, exit_if_invalid, print_invalid_case
 from minillm_l4.benchmarks.core.harness import BenchmarkHarness
 from minillm_l4.benchmarks.core.schemas import HarnessConfig, RequestSpec, WorkloadSpec
-from minillm_l4.benchmarks.runners.huggingface_baseline import MODEL_ID, MODEL_REVISION, load_qwen_fp8
-from minillm_l4.engine.kernels.fused import (
-    apply_rotary_pos_emb, install_fused_kernels, rms_norm, silu_mul, uninstall_fused_kernels,
-)
 
 SECTIONS = ("ops", "prefill", "decode", "serving")
+
+
+def install_fused_kernels(model):
+    from minillm_l4.engine.kernels.fused import install_fused_kernels as install
+    return install(model)
+
+
+def uninstall_fused_kernels(model):
+    from minillm_l4.engine.kernels.fused import uninstall_fused_kernels as uninstall
+    return uninstall(model)
 
 
 def _time_ms(fn, iterations=100):
@@ -60,6 +67,7 @@ def op_benchmarks(model):
     """Per-fusion timings with real Qwen3 weights; byte counts are per element estimates."""
 
     from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb as torch_rope
+    from minillm_l4.engine.kernels.fused import apply_rotary_pos_emb, rms_norm, silu_mul
 
     layer = model.model.layers[10]
     norm, q_norm = layer.post_attention_layernorm, layer.self_attn.q_norm
@@ -103,13 +111,13 @@ def op_benchmarks(model):
     return rows
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--sections", nargs="+", choices=SECTIONS, default=list(SECTIONS))
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--warmup-repetitions", type=int, default=1)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         raise FileExistsError(f"{args.output_dir} is not empty; choose a new dated directory")
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -146,13 +154,18 @@ def main():
             del runner
             gc.collect()
             torch.cuda.empty_cache()
-        entry = {"case": name, "fused": fused, **(extra or {}), **metrics(result, requests),
+        entry = {"case": name, "fused": fused, **(extra or {}),
+                 **metrics(result, requests, expected_runs=args.repetitions),
                  "alloc_retries": torch.cuda.memory_stats().get("num_alloc_retries", 0) - retries_before}
+        entry.update(case_validity(entry))
         summary["sections"].setdefault(section, []).append(entry)
+        raw = result.to_dict()
+        raw["case_metrics"] = entry
         (args.output_dir / f"{section}_{name}_{'fused' if fused else 'unfused'}.json").write_text(
-            json.dumps(result.to_dict(), default=str) + "\n")
+            json.dumps(raw, default=str) + "\n")
         save()
-        print(f"[{section}] {name} {'fused' if fused else 'unfused'}: TTFT p50 {entry['ttft_p50_ms']:,.1f} ms, "
+        print_invalid_case(f"[{section}] {name} {'fused' if fused else 'unfused'}", entry)
+        print(f"[{section}] {name} {'fused' if fused else 'unfused'}: TTFT p50 {entry['ttft_p50_ms'] or 0:,.1f} ms, "
               f"TPOT p50 {entry['tpot_p50_ms'] or 0:.2f} ms, {entry['tokens_per_s']:.1f} tok/s, "
               f"retries {entry['alloc_retries']}", flush=True)
 
@@ -193,6 +206,7 @@ def main():
 
     uninstall_fused_kernels(model)
     print(f"Summary: {args.output_dir / 'fused_kernels.json'}")
+    exit_if_invalid(entry for section, entries in summary["sections"].items() if section != "ops" for entry in entries)
 
 
 if __name__ == "__main__":

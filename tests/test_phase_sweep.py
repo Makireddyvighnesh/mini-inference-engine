@@ -4,6 +4,8 @@ from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
+import builtins
+import io
 import json
 import pytest
 import torch
@@ -27,6 +29,39 @@ def model():
 class Tokenizer:
     def encode(self, text, *, add_special_tokens=False):
         return [ord(c) % 30 + 1 for c in text]
+
+
+@pytest.fixture
+def reference_corpus(tmp_path, monkeypatch):
+    corpus = tmp_path / "references"
+    corpus.mkdir()
+    for bucket in ("short", "medium", "long"):
+        (corpus / f"{bucket}.json").write_text(json.dumps({
+            "model_id": command.MODEL_ID, "model_revision": command.MODEL_REVISION,
+            "requests": [{"request_id": f"fixture-{bucket}", "generated_token_ids": [1, 2]}],
+        }) + "\n")
+    real_corpus = command.REFERENCE_DIR
+    monkeypatch.setattr(command, "REFERENCE_DIR", corpus)
+
+    def hidden(path):
+        return isinstance(path, (str, Path)) and Path(path).absolute().is_relative_to(real_corpus.absolute())
+
+    # Emulate a checkout without the git-ignored corpus without touching results/.
+    for module in (builtins, io):
+        original_open = module.open
+
+        def guarded_open(path, *args, _open=original_open, **kwargs):
+            if hidden(path):
+                raise FileNotFoundError(path)
+            return _open(path, *args, **kwargs)
+
+        monkeypatch.setattr(module, "open", guarded_open)
+    original_exists = Path.exists
+    monkeypatch.setattr(Path, "exists", lambda path: False if hidden(path) else original_exists(path))
+    assert not real_corpus.exists()
+    with pytest.raises(FileNotFoundError):
+        (real_corpus / "short.json").read_text()
+    return corpus
 
 
 def test_plan_covers_all_requested_lengths_and_keeps_1048_literal():
@@ -139,7 +174,7 @@ def test_invalid_configuration_fails_before_loading_weights(argv):
         command.configuration(command.parse_args(argv))
 
 
-def test_cpu_end_to_end_saves_separate_phases_exact_reference_and_resume(tmp_path, monkeypatch):
+def test_cpu_end_to_end_saves_separate_phases_exact_reference_and_resume(tmp_path, monkeypatch, reference_corpus):
     config = command.configuration(command.parse_args(["--prompt-lengths", "4", "8", "--generation-lengths", "6", "--batch-sizes", "1", "2", "--repetitions", "1", "--warmup-repetitions", "0"]))
     config["model"]["device"] = "cpu"
     config["workloads"]["mixed_short_output_tokens"] = 2
@@ -155,6 +190,9 @@ def test_cpu_end_to_end_saves_separate_phases_exact_reference_and_resume(tmp_pat
     argv = ["--config", str(path), "--output-dir", str(output), "--markdown-output", str(report)]
     command.main(argv)
     manifest = json.loads((output / "phase_sweep_manifest.json").read_text())
+    for bucket in ("short", "medium", "long"):
+        copied = output / "source_snapshot/inputs/references" / f"{bucket}.json"
+        assert copied.read_bytes() == (reference_corpus / f"{bucket}.json").read_bytes()
     assert len(manifest["completed_cases"]) == 24
     assert manifest["status"] == "completed"
     assert all(c["status"] == "pass" for c in manifest["completed_cases"])

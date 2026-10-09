@@ -33,8 +33,25 @@ distribution rather than being treated as zero.
 ## Percentiles
 
 P50, P95, and P99 use a linearly interpolated percentile over the sorted
-observations. The raw observations remain in the request event and repetition
+observations, defined by `benchmarks/core/metrics.py::percentile`. For `n`
+observations and percentile `p` (0–100), the zero-based position is
+`(n - 1) * p / 100`; interpolate between the observations at its floor and
+ceiling. For example, P95 of `[10, 30]` is `29`, not `30`. Showcase summaries
+pool non-null request observations across measured runs, excluding warm-up.
+The raw observations remain in the request event and repetition
 records so summaries can be independently recomputed.
+
+## Case validity
+
+Showcase, fused-kernel, CUDA Graph, and vLLM comparison cases record `completed`
+and `expected` request counts, `valid`, and `invalid_reason`. A count mismatch
+or nonzero `alloc_retries` (where tracked) makes the case invalid. Expected
+counts come from the workload and measured repetition count. Failed requests
+remain in the raw records, including missing timings and partial outputs.
+Commands save invalid cases, print `INVALID` with the reason, and exit nonzero
+after all cases finish. The vLLM report flags invalid cases and excludes them
+from ratios and output agreement. CUDA Graph cases that require replay also
+reject missing measured graph replays.
 
 ## Timing boundaries
 

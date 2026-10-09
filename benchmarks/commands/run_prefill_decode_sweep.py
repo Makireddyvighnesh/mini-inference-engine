@@ -33,6 +33,9 @@ from .run_chunked_prefill import snapshot_sources
 from .run_concurrent_requests import PROJECT_ROOT
 
 
+REFERENCE_DIR = PROJECT_ROOT / "results/phase1/references_baseline"
+
+
 MODES = ("prefill", "isolated", "static", "continuous", "chunked_128", "chunked_256", "chunked_512",
          "mixed_512", "mixed_2048", "adaptive")
 # capped: batch size caps in-flight requests and sizes the page pool (original sweep).
@@ -273,7 +276,7 @@ def main(argv=None):
             "planned_cases": cases, "completed_cases": []}
         for case in cases:
             save_workload(build_workload(case, prompts, data), output / f"{case['key']}_workload.json")
-        manifest["provenance"] = snapshot_sources(output, data, PROJECT_ROOT / "results/phase1/references_baseline")
+        manifest["provenance"] = snapshot_sources(output, data, REFERENCE_DIR)
         target = output / "source_snapshot/inputs/prompts.json"
         shutil.copyfile(output / "prompts.json", target)
         manifest["provenance"]["sha256"]["inputs/prompts.json"] = hashlib.sha256(target.read_bytes()).hexdigest()

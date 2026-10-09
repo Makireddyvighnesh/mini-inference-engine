@@ -104,10 +104,10 @@ outputs; every policy may run all 16 at once)
 
 | Policy | TTFT median / P95 | Time per output token | Worst pause (median of runs) | Output tok/s | Peak memory |
 |---|---|---|---|---|---|
-| Static batching | 9.65 / 10.77 s | 136.7 ms | 143 ms | 72.4 | 7.4 GiB |
-| Continuous batching (dense KV) | 0.57 / 1.53 s | 176.4 ms | 1,399 ms | 83.9 | 10.8 GiB |
-| Continuous + paged KV | 0.20 / **0.38 s** | **68.9 ms** | 283 ms | **195.4** | 5.6 GiB |
-| Mixed batching + adaptive chunks | **0.15** / 0.44 s | 70.3 ms | **151 ms** | 186.4 | **5.5 GiB** |
+| Static batching | 9.65 / 10.72 s | 136.7 ms | 143 ms | 72.4 | 7.4 GiB |
+| Continuous batching (dense KV) | 0.57 / 1.51 s | 176.4 ms | 1,399 ms | 83.9 | 10.8 GiB |
+| Continuous + paged KV | 0.20 / **0.37 s** | **68.9 ms** | 283 ms | **195.4** | 5.6 GiB |
+| Mixed batching + adaptive chunks | **0.15** / 0.41 s | 70.3 ms | **151 ms** | 186.4 | **5.5 GiB** |
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/showcase/long-prompts-dark.svg">
@@ -122,7 +122,7 @@ outputs; every policy may run all 16 at once)
 | Whole-prompt prefill | 3.42 / 4.42 s | 3,260 ms | 41.7 |
 | Mixed batching, 512-token budget | **0.99** / 3.42 s | **158 ms** | 39.6 |
 | Mixed batching, 2048-token budget | 1.32 / **2.91 s** | 534 ms | **41.8** |
-| Mixed batching + adaptive chunks | 1.13 / 3.50 s | 170 ms | 39.7 |
+| Mixed batching + adaptive chunks | 1.13 / 3.48 s | 170 ms | 39.7 |
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/showcase/prefix-cache-dark.svg">
@@ -134,7 +134,7 @@ turns, one every 300 ms)
 
 | | TTFT median / P95 | Output tok/s |
 |---|---|---|
-| Off | 1,481 / 2,247 ms | 64.5 |
+| Off | 1,481 / 2,246 ms | 64.5 |
 | On | **114 / 424 ms** | **83.3** |
 
 <picture>

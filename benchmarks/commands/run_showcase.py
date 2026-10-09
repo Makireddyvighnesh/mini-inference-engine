@@ -36,21 +36,21 @@ from pathlib import Path
 import torch
 
 from minillm_l4.benchmarks.core.harness import BenchmarkHarness
+from minillm_l4.benchmarks.core.metrics import percentile
 from minillm_l4.benchmarks.core.schemas import HarnessConfig, RequestSpec, WorkloadSpec
 from minillm_l4.benchmarks.core.synthetic import SyntheticSample, exact_token_ids
-from minillm_l4.benchmarks.runners.chunked_prefill import ChunkedPrefillPagedRunner
-from minillm_l4.benchmarks.runners.concurrent_requests import StaticRequestTraceRunner
-from minillm_l4.benchmarks.runners.continuous_requests import ContinuousRequestTraceRunner
-from minillm_l4.benchmarks.runners.huggingface_baseline import (
-    MODEL_ID, MODEL_REVISION, HuggingFaceGreedyBatchRunner, load_qwen_fp8,
+from minillm_l4.benchmarks.commands.run_vllm_compare import (
+    MODEL_ID, MODEL_REVISION, case_validity, exit_if_invalid, print_invalid_case,
 )
-from minillm_l4.benchmarks.runners.kv_cache import KvCacheBatchRunner
-from minillm_l4.benchmarks.runners.manual_decode import ManualGreedyBatchRunner
-from minillm_l4.benchmarks.runners.paged_cuda_graph import PagedCudaGraphBatchRunner
-from minillm_l4.benchmarks.runners.paged_kv import PagedAttentionBatchRunner
 
 SECTIONS = ("single", "batch", "serving", "longmix", "prefix", "prefill")
 SEED_TEXT = "Explain how prefill, cached decoding, and batching affect language-model inference."
+
+
+def load_qwen_fp8(**options):
+    # Metrics and validity tooling must remain usable without engine imports.
+    from minillm_l4.benchmarks.runners.huggingface_baseline import load_qwen_fp8 as load
+    return load(**options)
 
 
 def prompt(tokenizer, length: int, tag: str) -> tuple[int, ...]:
@@ -64,13 +64,15 @@ def pages(requests, block=16) -> int:
 
 
 def paged(model, requests, **options):
+    from minillm_l4.benchmarks.runners.chunked_prefill import ChunkedPrefillPagedRunner
+
     return ChunkedPrefillPagedRunner(
         model, block_size=16, num_blocks=pages(requests), max_batch_size=len(requests), device="cuda",
         decode_backend="auto", decode_sdpa_compat=True,
         **{"enable_prefix": False, "max_prefill_tokens": 256, **options})
 
 
-def metrics(result, requests):
+def metrics(result, requests, *, expected_runs=None):
     rows = [record["metrics"] for run in result.runs for record in run["requests"]]
     # Worst pause per measured run, then the median across runs (a single max is noisy).
     run_worst = [max((max(r["metrics"]["itl_ms"]) for r in run["requests"] if r["metrics"].get("itl_ms")), default=None)
@@ -79,12 +81,11 @@ def metrics(result, requests):
     ttft = sorted(r["ttft_ms"] for r in rows if r["ttft_ms"] is not None)
     tpot = [r["tpot_ms"] for r in rows if r.get("tpot_ms") is not None]
     gaps = [max(r["itl_ms"]) for r in rows if r.get("itl_ms")]
-    pct = lambda values, q: values[min(len(values) - 1, math.ceil(q * len(values)) - 1)] if values else None
     runs = [run["summary"] for run in result.runs]
     gpu = [s["gpu_utilization_percent"].get("p50") for s in runs if s["gpu_utilization_percent"].get("count")]
-    return {
+    entry = {
         "ttft_p50_ms": statistics.median(ttft) if ttft else None,
-        "ttft_p95_ms": pct(ttft, 0.95),
+        "ttft_p95_ms": percentile(ttft, 95) if ttft else None,
         "tpot_p50_ms": statistics.median(tpot) if tpot else None,
         "worst_gap_ms": max(gaps) if gaps else None,
         "worst_gap_p50_ms": statistics.median(gaps) if gaps else None,
@@ -93,17 +94,19 @@ def metrics(result, requests):
         "duration_ms": statistics.median(s["duration_ms"] for s in runs),
         "gpu_util_p50": statistics.median(gpu) if gpu else None,
         "completed": sum(1 for r in rows if r["status"] == "completed"),
-        "expected": len(requests) * len(result.runs),
+        "expected": len(requests) * (len(result.runs) if expected_runs is None else expected_runs),
     }
+    entry.update(case_validity(entry))
+    return entry
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--sections", nargs="+", choices=SECTIONS, default=list(SECTIONS))
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--warmup-repetitions", type=int, default=1)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         raise FileExistsError(f"{args.output_dir} is not empty; choose a new dated directory")
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -137,19 +140,30 @@ def main():
             del runner
             gc.collect()
             torch.cuda.empty_cache()
-        entry = {"engine": name, "label": label or name, **(extra or {}), **metrics(result, requests),
+        entry = {"engine": name, "label": label or name, **(extra or {}),
+                 **metrics(result, requests, expected_runs=args.repetitions),
                  # Allocator retries mean the run hit GPU memory pressure (cache flush + retry).
                  "alloc_retries": torch.cuda.memory_stats().get("num_alloc_retries", 0) - retries_before,
                  "peak_allocated_gib": torch.cuda.max_memory_allocated() / 2**30}
+        entry.update(case_validity(entry))
         summary["sections"].setdefault(section, []).append(entry)
-        (args.output_dir / f"{section}_{name}.json").write_text(json.dumps(result.to_dict(), default=str) + "\n")
+        raw = result.to_dict()
+        raw["case_metrics"] = entry
+        (args.output_dir / f"{section}_{name}.json").write_text(json.dumps(raw, default=str) + "\n")
         (args.output_dir / "showcase.json").write_text(json.dumps(summary, indent=1) + "\n")
+        print_invalid_case(f"[{section}] {name}", entry)
         print(f"[{section}] {name}: retries {entry['alloc_retries']}, peak {entry['peak_allocated_gib']:.1f} GiB, "
-              f"TTFT p50 {entry['ttft_p50_ms']:,.0f} ms, TPOT p50 "
+              f"TTFT p50 {entry['ttft_p50_ms'] or 0:,.0f} ms, TPOT p50 "
               f"{entry['tpot_p50_ms'] or 0:,.1f} ms, {entry['tokens_per_s']:,.1f} tok/s, "
               f"{entry['completed']}/{entry['expected']} completed", flush=True)
 
     if "single" in args.sections or "batch" in args.sections:
+        from minillm_l4.benchmarks.runners.huggingface_baseline import HuggingFaceGreedyBatchRunner
+        from minillm_l4.benchmarks.runners.kv_cache import KvCacheBatchRunner
+        from minillm_l4.benchmarks.runners.manual_decode import ManualGreedyBatchRunner
+        from minillm_l4.benchmarks.runners.paged_cuda_graph import PagedCudaGraphBatchRunner
+        from minillm_l4.benchmarks.runners.paged_kv import PagedAttentionBatchRunner
+
         p512 = prompt(tok, 512, "decode")
         engines = {
             "hf_generate": ("HF generate()", lambda reqs: HuggingFaceGreedyBatchRunner(model, device="cuda")),
@@ -174,6 +188,9 @@ def main():
                         label=label, extra={"batch": batch, "family": name})
 
     if "serving" in args.sections:
+        from minillm_l4.benchmarks.runners.concurrent_requests import StaticRequestTraceRunner
+        from minillm_l4.benchmarks.runners.continuous_requests import ContinuousRequestTraceRunner
+
         # Prompts sized so dense KV fits without allocator retries; every policy may run
         # all 16 requests at once, so only the scheduling / KV layout differs.
         lengths = [128, 256, 512, 1024] * 4
@@ -222,6 +239,7 @@ def main():
                 label=f"{n} tokens", extra={"prompt_tokens": n})
 
     print(f"Summary: {args.output_dir / 'showcase.json'}")
+    exit_if_invalid(entry for entries in summary["sections"].values() for entry in entries)
 
 
 if __name__ == "__main__":
