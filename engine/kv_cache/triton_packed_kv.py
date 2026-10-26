@@ -26,6 +26,9 @@ if triton is not None:
         source_stride_head: tl.constexpr,
         source_stride_token: tl.constexpr,
         source_stride_dim: tl.constexpr,
+        value_source_stride_head: tl.constexpr,
+        value_source_stride_token: tl.constexpr,
+        value_source_stride_dim: tl.constexpr,
         table_stride_sequence: tl.constexpr,
         key_destination_stride_block: tl.constexpr,
         key_destination_stride_head: tl.constexpr,
@@ -73,8 +76,14 @@ if triton is not None:
             mask=dim_mask,
             other=0.0,
         )
+        # V has its own strides: it may be a column view of a merged q/k/v output.
+        value_offsets = (
+            kv_head * value_source_stride_head
+            + token_index * value_source_stride_token
+            + dim_offsets * value_source_stride_dim
+        )
         value_values = tl.load(
-            value_source_ptr + source_offsets,
+            value_source_ptr + value_offsets,
             mask=dim_mask,
             other=0.0,
         )
@@ -177,6 +186,9 @@ def triton_write_packed_kv(
         key_states.stride(1),
         key_states.stride(2),
         key_states.stride(3),
+        value_states.stride(1),
+        value_states.stride(2),
+        value_states.stride(3),
         block_tables.stride(0),
         key_blocks.stride(0),
         key_blocks.stride(1),
