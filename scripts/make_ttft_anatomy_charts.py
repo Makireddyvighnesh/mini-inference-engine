@@ -5,8 +5,8 @@
 
 Charts:
 * ttft-heatmap  - median TTFT for every burst size x prompt length;
-* ttft-anatomy  - mean TTFT split into compute / wait / gaps / memory queue,
-                  against a strictly serial FIFO reference;
+* ttft-anatomy  - average TTFT split into own work, waiting for other prompts,
+                  and waiting for memory;
 * ttft-timeline - per-request Gantt of two bursts: what each request is doing
                   from arrival to first token.
 """
@@ -23,8 +23,10 @@ from matplotlib.colors import LinearSegmentedColormap, LogNorm
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from make_showcase_charts import FONT, THEMES, figure, style  # noqa: E402
 
-PARTS = (("compute", "Own prefill steps", 0), ("gaps", "Gaps between its chunks", 1),
-         ("wait", "Admitted, waiting for first chunk", 2), ("queue", "Queued for KV memory", 3))
+# (label, keys summed, color slot): own work, waiting for other prompts, waiting for memory.
+PARTS = (("Its own prompt being processed", ("compute", "emit"), 0),
+         ("Waiting for other prompts", ("wait", "gaps"), 2),
+         ("Waiting for free memory", ("queue",), 3))
 SLOTS = {"light": ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"], "dark": ["#3987e5", "#d95926", "#199e70", "#c98500"]}
 RAMP = {"light": ["#cde2fb", "#86b6ef", "#3987e5", "#1c5cab", "#0d366b"],
         "dark": ["#0d366b", "#184f95", "#2a78d6", "#6da7ec", "#cde2fb"]}
@@ -67,13 +69,12 @@ def heatmap(data, t, theme):
     ax.tick_params(length=0)
     for side in ax.spines.values():
         side.set_visible(False)
-    ax.set_xlabel("Prompt tokens (every request in the burst)", color=t["ink2"], fontsize=9)
-    ax.set_ylabel("Requests arriving together", color=t["ink2"], fontsize=9)
+    ax.set_xlabel("Prompt length (tokens)", color=t["ink2"], fontsize=9)
+    ax.set_ylabel("Requests sent at once", color=t["ink2"], fontsize=9)
     fig.subplots_adjust(left=0.09, right=0.98, top=0.8, bottom=0.14)
-    heading(fig, t, "Time to first token: median request in a burst",
-            "All requests arrive at once; the engine has to prefill every prompt before the last one gets a token.")
-    footer(fig, t, f"* burst exceeds the KV pool ({data['kv_pool_tokens']:,} tokens), so some requests queue for memory. "
-                   "Mixed batching, adaptive chunks, CUDA Graphs; Qwen3-4B FP8 on one L4.")
+    heading(fig, t, "How long until the first token?",
+            "Typical (median) request. Darker = longer wait.")
+    footer(fig, t, "* not enough GPU memory for all requests at once, so some wait for memory. Qwen3-4B FP8 on one L4.")
     return fig
 
 
@@ -84,31 +85,23 @@ def anatomy(data, t, theme):
     colors = SLOTS[theme]
     for ax, length in zip(axes, lengths):
         style(ax, t, xgrid=False, ygrid=True)
-        single = case(data, 1, length)["ttft_mean_ms"]
         for x, b in enumerate(batches):
             c, bottom = case(data, b, length), 0.0
-            for key, _, slot in PARTS:
-                value = c["mean_ms"][key] + (c["mean_ms"]["emit"] if key == "compute" else 0.0)
-                ax.bar(x, max(value, 0) / 1000, bottom=bottom, width=0.7, color=colors[slot],
-                       edgecolor=t["surface"], lw=1)
-                bottom += max(value, 0) / 1000
-        ax.plot(range(len(batches)), [single * (b + 1) / 2 / 1000 for b in batches], color=t["ink"], lw=1.4, ls="--",
-                marker="o", ms=3, zorder=4)
+            for _, keys, slot in PARTS:
+                value = max(sum(c["mean_ms"][k] for k in keys), 0) / 1000
+                ax.bar(x, value, bottom=bottom, width=0.7, color=colors[slot], edgecolor=t["surface"], lw=1)
+                bottom += value
         ax.set_xticks(range(len(batches)), [str(b) for b in batches], fontsize=8.5)
         ax.set_title(f"{length:,}-token prompts", fontsize=10, color=t["ink"], loc="left")
-        ax.set_xlabel("requests in the burst", color=t["ink2"], fontsize=8.5)
+        ax.set_xlabel("requests sent at once", color=t["ink2"], fontsize=8.5)
         ax.set_ylim(0, None)
-    axes[0].set_ylabel("Mean time to first token (s)", color=t["ink2"], fontsize=9)
+    axes[0].set_ylabel("Average wait for the first token (s)", color=t["ink2"], fontsize=9)
     handles = [plt.Rectangle((0, 0), 1, 1, color=colors[slot]) for _, _, slot in PARTS]
-    handles.append(plt.Line2D([0], [0], color=t["ink"], lw=1.4, ls="--"))
-    labels = [label for _, label, _ in PARTS] + ["Serial FIFO: (B+1)/2 x single-request TTFT"]
-    fig.legend(handles, labels, loc="upper left", bbox_to_anchor=(0.01, 0.875), ncol=5, frameon=False, fontsize=8,
-               labelcolor=t["ink2"], handlelength=1.2, columnspacing=1.2)
+    fig.legend(handles, [label for label, _, _ in PARTS], loc="upper left", bbox_to_anchor=(0.01, 0.875), ncol=3,
+               frameon=False, fontsize=8.5, labelcolor=t["ink2"], handlelength=1.2, columnspacing=1.6)
     fig.subplots_adjust(left=0.06, right=0.99, top=0.76, bottom=0.14, wspace=0.22)
-    heading(fig, t, "Where time to first token goes",
-            "Mean over every request in the burst. Each panel has its own scale.")
-    footer(fig, t, "Below the dashed line: the engine overlaps prompts (several short prompts share one forward). "
-                   "On it: prompts are compute-bound and are served one after another.")
+    heading(fig, t, "Most of the wait is other people's prompts",
+            "Blue stays about the same; green grows with every extra request. Each panel has its own scale.")
     return fig
 
 
@@ -128,27 +121,25 @@ def timeline(data, t, theme):
             if adm - a > 0.005:
                 ax.barh(y, adm - a, left=a, height=0.7, color=colors[3])
             ax.barh(y, start - adm, left=adm, height=0.7, color=colors[2])
-            ax.barh(y, first - start, left=start, height=0.7, color=t["grid"])  # gaps background
+            ax.barh(y, first - start, left=start, height=0.7, color=colors[2])  # paused between chunks = waiting
             for begin, end, _ in tl["chunks"]:
                 ax.barh(y, (end - begin) / 1000, left=begin / 1000, height=0.7, color=colors[0], lw=0)
             ax.plot([first], [y], marker="|", ms=8, color=t["ink"], mew=1.6)
         ax.set_yticks([])
         ax.set_ylim(-0.7, len(rows) - 0.3)
         ax.set_xlim(0, None)
-        ax.set_xlabel("seconds since the burst arrived", color=t["ink2"], fontsize=8.5)
-        ax.set_ylabel("requests (sorted by first token)", color=t["ink2"], fontsize=8.5)
-        ax.set_title(f"{batch} x {length:,}-token prompts  (median TTFT {ms(c['ttft_p50_ms'])})", fontsize=10,
-                     color=t["ink"], loc="left")
+        ax.set_xlabel("seconds after the requests arrived", color=t["ink2"], fontsize=8.5)
+        ax.set_ylabel("one row per request", color=t["ink2"], fontsize=8.5)
+        ax.set_title(f"{batch} requests of {length:,} tokens", fontsize=10, color=t["ink"], loc="left")
     handles = [plt.Rectangle((0, 0), 1, 1, color=colors[i]) for i in (3, 2, 0)]
-    handles += [plt.Rectangle((0, 0), 1, 1, color=t["grid"]), plt.Line2D([0], [0], marker="|", ls="", ms=8, mew=1.6,
-                                                                        color=t["ink"])]
-    fig.legend(handles, ["Queued for KV memory", "Admitted, waiting", "Prefill chunk running",
-                         "Other work between its chunks", "First token"],
+    handles += [plt.Line2D([0], [0], marker="|", ls="", ms=8, mew=1.6, color=t["ink"])]
+    fig.legend(handles, ["Waiting for free memory", "Waiting for other prompts", "Its prompt being processed",
+                         "First token"],
                loc="upper left", bbox_to_anchor=(0.01, 0.885), ncol=5, frameon=False, fontsize=8,
                labelcolor=t["ink2"], handlelength=1.2)
     fig.subplots_adjust(left=0.04, right=0.99, top=0.8, bottom=0.1, wspace=0.12)
-    heading(fig, t, "A burst, request by request",
-            "Each row is one request from arrival to its first token (last measured run).")
+    heading(fig, t, "Requests are served one after another",
+            "Each row is one request, from the moment it arrives to its first token.")
     return fig
 
 

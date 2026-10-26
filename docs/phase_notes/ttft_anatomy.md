@@ -1,119 +1,101 @@
 # Q1: What happens between a request arriving and its first token?
 
-**Short answer.**
-- **A lone request:** its time to first token (TTFT) is almost entirely the prefill forward pass, 44 ms at 128 tokens and 1.4 s at 8,192. Everything around it (tokenizing, scheduling, admission, sampling) adds under 1%.
-- **A burst of requests:** TTFT becomes a queueing problem. The engine prefills prompts at a sustained **6–7k tokens/s**, so a request waits for every prompt ahead of it. The last request in a burst gets its first token after roughly (total prompt tokens in the burst) ÷ 6.5k tokens/s.
-- **When the burst's KV cache doesn't fit in memory,** requests also queue for memory. That wait can dwarf everything else: 15 s on average for 32 × 8,192 tokens.
+**Time to first token (TTFT)** is how long a user waits before the model starts answering.
 
-Measured on Qwen3-4B FP8 on one NVIDIA L4, 2026-10-26.
+## The short answer
 
-Engine setup: the recommended configuration (mixed batching, adaptive chunks, CUDA Graph decode, fused kernels, merged projections; prefix cache off). The KV pool is sized to free GPU memory: 83,840 tokens, 11.5 GiB.
+- **One request alone:** almost all of the wait is the GPU reading the prompt (the "prefill"). That takes 44 ms for a 128-token prompt and 1.4 s for an 8,192-token prompt. Everything else is tiny.
+- **Many requests at once:** the GPU reads one prompt at a time. Each request waits for the prompts ahead of it, so the wait is mostly *other people's prompts*.
+- **Too many long requests at once:** the GPU runs out of memory for them. New requests must wait until earlier ones finish. This can be the longest wait of all.
 
-Workload: B requests arrive together (B = 1 to 32); every prompt has the same length (128 to 8,192 tokens); each request generates 16 tokens. 1 warm-up and 3 measured runs per case.
+Setup: Qwen3-4B FP8 on one NVIDIA L4, with the engine's recommended settings. We sent 1 to 32 requests at the same moment, with prompts of 128 to 8,192 tokens.
 
-## The path of one request
+## The steps, in order
 
-```
-client ─► tokenize ─► arrival ─► admission ─► prefill chunk(s) ─► first token ─► detokenize ─► client
-          0.2–10 ms      queue for KV      wait for a      forward passes   sampled from    ~5 µs
-          (CPU)          pages / a slot    prefill slot    over the prompt  the last chunk
-```
+| Step | What happens | Time |
+|---|---|---|
+| 1. Tokenize | Turn the text into tokens | 0.2–10 ms |
+| 2. Wait for memory | Wait for GPU memory to hold this request | 0 if there is room |
+| 3. Wait for other prompts | Wait while the GPU works on other prompts | 0 if alone |
+| 4. Prefill | The GPU reads the whole prompt | 44 ms – 1.4 s |
+| 5. First token | Picked at the end of the prefill | ~0 |
+| 6. Detokenize | Turn the token back into text | ~0.005 ms |
 
-| Stage | What happens | Lone request | In a burst |
-|---|---|---|---|
-| Tokenize | Text → token IDs (CPU, HF tokenizer) | 0.2 ms (128 tokens) to 9.8 ms (8,192), about 1.2 µs per token | Same |
-| Queue for memory | Wait until KV pages for prompt + output are free | ~0.1 ms | 0 until the burst exceeds the pool, then seconds |
-| Wait for first chunk | Admitted, but other prompts' chunks run first | ~0.1 ms | Grows linearly with requests ahead |
-| Prefill | Forward passes over the prompt; K/V written into pages | 44 ms → 1.4 s | Similar per request, but shared with other rows |
-| Gaps | Steps running other work between this prompt's chunks | 0 | 0.4–0.7 s for 8,192-token prompts |
-| First token | Sampled from the last chunk's logits, in the same step | 0 | 0 |
-| Detokenize | One token → text | 5–9 µs | Same |
+When a request is alone, step 4 is more than 99% of the wait.
 
-## TTFT across burst size and prompt length
+## How long is the wait?
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="../assets/ttft_anatomy/ttft-heatmap-dark.svg">
-  <img alt="Median TTFT heatmap" src="../assets/ttft_anatomy/ttft-heatmap-light.svg">
+  <img alt="Median time to first token" src="../assets/ttft_anatomy/ttft-heatmap-light.svg">
 </picture>
 
-- **Down a column (more requests):** median TTFT roughly doubles each time the burst doubles. Each request waits for about half the burst ahead of it.
-- **Along a row (longer prompts):** TTFT grows with total prompt tokens.
-- **Starred cells** exceed the KV pool, so part of the burst waits for memory.
+Typical (median) wait:
 
-## Where the time goes
+| Requests at once | 128 tokens | 512 | 2,048 | 8,192 |
+|---|---|---|---|---|
+| 1 | 44 ms | 56 ms | 0.27 s | 1.4 s |
+| 8 | 97 ms | 0.35 s | 1.3 s | 7.8 s |
+| 32 | 0.37 s | 1.2 s | 5.0 s | 29 s |
+
+Two simple patterns:
+- **Double the requests, roughly double the wait.**
+- **Longer prompts mean longer waits.**
+
+## Where does the wait come from?
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="../assets/ttft_anatomy/ttft-anatomy-dark.svg">
-  <img alt="TTFT anatomy" src="../assets/ttft_anatomy/ttft-anatomy-light.svg">
+  <img alt="What the wait is made of" src="../assets/ttft_anatomy/ttft-anatomy-light.svg">
 </picture>
 
-The dashed line is a strictly serial queue: each prompt served alone, one after another, so the average request waits (B+1)/2 single-request TTFTs.
+- **Blue (its own prompt) stays about the same.** A 2,048-token prompt needs about 0.35 s of GPU work, whether 1 or 32 requests arrive.
+- **Green (waiting for other prompts) grows with every extra request.** With 32 requests of 2,048 tokens, the average request waits 4.7 s for others and only 0.35 s for itself.
+- **Yellow (waiting for memory) appears only with many long prompts.** The GPU has room for about 84,000 tokens of requests, roughly 10 prompts of 8,192 tokens. With 32 of them, 22 must wait for others to finish: an extra 15 s on average.
 
-1. **Short prompts are packed, and beat the serial line.** At 128 tokens, a lone prefill is memory-bound: most of its 44 ms is fixed cost, mainly the weight read and launches. Several short prompts share one forward and one weight read, so 32 requests average 0.39 s instead of 0.74 s serially (0.53×).
-2. **From about 512 tokens, prompts are compute-bound and served one after another.** Mean TTFT tracks (B+1)/2 × single TTFT, 1.05–1.13× the line at 1–4k tokens. Per-request compute stays flat (about 0.35 s at 2,048 tokens whatever the burst). All the growth is waiting: at 32 × 2,048, the average request waits 4.7 s for 0.35 s of its own compute.
-3. **One lone prompt runs faster than the sustained rate.** A single 512-token prompt runs at 8.7k tokens/s, but a burst settles at 6.5–7k. Two likely reasons:
-   - sustained load runs at the power-capped clock (see [GEMM peak](gemm_peak.md));
-   - the planner interleaves decode for requests that already have their first token.
-
-   That is why mid-length bursts sit slightly above the serial line (up to 1.39× at 512 tokens).
-4. **Long prompts get chunked, and chunking costs TTFT.** Alone, an 8,192-token prompt runs in about 8 chunks under the 400 ms idle step target. With other requests decoding, the planner switches to the 150 ms busy target: about 17 chunks, plus 0.4–0.7 s of gaps where other work runs. This deliberately trades TTFT for smooth decode latency for the requests already streaming, and it lowers the sustained rate to about 4.7k tokens/s.
-5. **Memory is the hard wall.** The pool holds about 10 requests of 8,192 + 16 tokens. At 32 × 8,192, 22 requests must wait for earlier ones to finish and free their pages: the memory queue averages 15.3 s of the 28.9 s median TTFT. 4,096-token bursts hit the same wall at 32 requests (2.4 s).
-
-## A burst, request by request
+## Requests are served one after another
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="../assets/ttft_anatomy/ttft-timeline-dark.svg">
-  <img alt="Per-request timeline of two bursts" src="../assets/ttft_anatomy/ttft-timeline-light.svg">
+  <img alt="Each request from arrival to first token" src="../assets/ttft_anatomy/ttft-timeline-light.svg">
 </picture>
 
-- **Left, 8 × 2,048 tokens:** a staircase. Every request is admitted at once (green: waiting), and prompts are prefilled one after another, each in 2–3 chunks (blue).
-- **Right, 32 × 8,192 tokens:** the top 22 requests first queue for memory (yellow) until earlier requests finish and free pages. Their prefill is split into many chunks, with other work (light gray) between them.
+- **Left (8 × 2,048 tokens):** a staircase. Each request waits (green) for the ones before it, then gets its turn (blue).
+- **Right (32 × 8,192 tokens):** the top requests first wait for memory (yellow), then for their turn.
 
-## Sustained prefill rate
+## Simple rule of thumb
 
-The last request's TTFT ≈ total burst tokens ÷ sustained prefill rate:
+The GPU reads about **6,500 prompt tokens per second** when it is busy. So:
 
-| Burst | Total tokens | Last first token | Rate |
-|---|---|---|---|
-| 32 × 128 | 4,096 | 0.72 s | 5.7k tokens/s |
-| 32 × 512 | 16,384 | 2.43 s | 6.7k |
-| 32 × 2,048 | 65,536 | 10.0 s | 6.6k |
-| 32 × 4,096 | 131,072 | 21.9 s | 6.0k |
-| 8 × 8,192 | 65,536 | 14.0 s | 4.7k |
+> **wait for the last request ≈ total prompt tokens of everyone ahead ÷ 6,500**
 
-## What this means
+Example: 32 requests × 2,048 tokens = 65,536 tokens. 65,536 ÷ 6,500 ≈ 10 s. Measured: 10.0 s.
 
-- **For one user, TTFT is a kernel problem.** Make prefill faster: our FP8 GEMM runs at about 87 of cuBLAS's 127 TFLOPS ([roofline](roofline.md)), and short prompts carry about 20 ms of fixed host and launch cost.
-- **For many users, TTFT is a queueing problem.** TTFT p95 ≈ the work ahead of you ÷ sustained prefill rate. The levers are:
-  - raise throughput (faster prefill, more GPUs);
-  - avoid redundant work (prefix caching for shared system prompts);
-  - schedule: shortest-prompt-first or SLO-aware ordering helps the median, and fair interleaving bounds the worst case;
-  - admission control (reject or shed load early instead of queueing for 50 s).
-- **The scheduler sets a TTFT vs decode-latency trade-off.** Long prompts chunked under a 150 ms step target keep other users' token streams smooth, but add 0.4–0.7 s to each long prompt's TTFT.
-- **KV memory caps how many requests run at once.** Past the pool, extra requests wait for whole requests to finish. A smaller KV footprint (FP8 KV cache, half the bytes) would roughly double the burst that fits.
-- **Host work is negligible** at this scale: tokenizing is about 1.2 µs per token, detokenizing one token about 5–9 µs.
+## Three details worth knowing
 
-## Method
+1. **Short prompts can share the GPU.** The GPU can read several 128-token prompts in one pass. So 32 short requests wait about half as long as they would one by one.
+2. **Long prompts are cut into pieces when others are already answering.** This keeps other users' answers flowing smoothly, but adds 0.4–0.7 s to a long prompt's wait.
+3. **The work outside the GPU is tiny.** Tokenizing takes about 1 ms per 1,000 tokens.
 
-- **Command** (about 20 minutes):
+## What would make it faster
 
-  ```bash
-  .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_ttft_anatomy --output-dir minillm_l4/results/ttft_anatomy_<date>
-  .conda-env/bin/python minillm_l4/scripts/make_ttft_anatomy_charts.py minillm_l4/results/ttft_anatomy_<date>/ttft_anatomy.json minillm_l4/docs/assets/ttft_anatomy
-  ```
-- **Components come from each request's recorded events:** arrival, admission, `prefill_chunk_start` / `prefill_chunk_end` for each chunk, and `first_token_ready`.
-  - queue = admission − arrival;
-  - wait = first chunk − admission;
-  - compute = the sum of its chunk steps;
-  - gaps = the time from first chunk to last chunk end, minus compute.
+- **For one user:** a faster prefill (faster matrix math on the GPU).
+- **For many users:**
+  - more prompt tokens per second (faster prefill, or more GPUs);
+  - reuse work for shared prompts (prefix caching);
+  - serve short prompts first;
+  - turn away extra requests early instead of making them wait a long time.
+- **For many long prompts:** use less memory per token (an 8-bit KV cache would fit about twice as many requests).
 
-  They add up to TTFT exactly.
-- **"Compute" is the full duration of each step that carried one of the request's chunks.** Those steps may also carry other requests' chunks or decode rows, so per-request compute in a burst is an upper bound on its own share.
-- **KV pool:** free GPU memory after loading, minus 4 GiB of headroom. No allocator retries in any case.
-- **Tokenizer costs:** HF tokenizer on CPU, median of 20, measured outside the engine.
+## How it was measured
 
-## Caveats
+```bash
+.conda-env/bin/python -m minillm_l4.benchmarks.commands.run_ttft_anatomy --output-dir minillm_l4/results/ttft_anatomy_<date>
+.conda-env/bin/python minillm_l4/scripts/make_ttft_anatomy_charts.py minillm_l4/results/ttft_anatomy_<date>/ttft_anatomy.json minillm_l4/docs/assets/ttft_anatomy
+```
 
-- **Burst arrivals are a stress case.** With requests arriving spread over time (a Poisson process), waits are shorter. That is Q15 (latency vs load).
-- **All prompts in a burst have the same length,** so "shortest remaining first" has nothing to reorder. Mixed lengths would favor short prompts.
-- **No server layer.** There is no HTTP/SSE in this engine; in a real server, request parsing and streaming add their own (small) costs.
+- **Requests and runs:** all requests arrive at the same moment, each prompt has the same length, and each request generates 16 tokens. Every case ran once to warm up and 3 times for real (about 20 minutes in total).
+- **Timing source:** the engine records a timestamp at each step: arrival, memory granted, each piece of the prompt, first token. The colored parts in the charts come straight from those timestamps and add up to the full wait.
+- **Engine settings:** mixed batching, adaptive chunk sizes, CUDA Graphs, fused kernels, merged projections, no prefix cache.
+- **GPU memory for requests:** whatever was free after loading the model, minus 4 GiB kept spare.
+- **Limits:** all requests arriving at once is a worst case; requests spread over time wait less (see Q15). There is no web server in this test, which would add a little more time.
