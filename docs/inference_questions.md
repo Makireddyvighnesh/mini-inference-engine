@@ -6,15 +6,14 @@ Each question has a goal, the experiment, the plot that answers it, and a status
 
 Status: `[ ]` not started · `[~]` partial data exists · `[x]` done
 
-**Progress (2026-10-26):** 5 done (Q2, Q5, Q7, Q9, Q22) · 13 partial · 5 not started (Q1, Q6, Q17, Q20, Q23).
+**Progress (2026-10-26):** 6 done (Q1, Q2, Q5, Q7, Q9, Q22) · 13 partial · 4 not started (Q6, Q17, Q20, Q23).
 
 ---
 
 ## A. Where the time goes
 
-### Q1. What happens between a request arriving and the first token leaving? `[ ]`
-- **Experiment:** split TTFT into queue wait, tokenization, admission, prefill forward pass, sampling and detokenization. Use short (128-token) and long (8k-token) prompts, on an idle and a busy engine.
-- **Plot:** a stacked bar of TTFT components for each case.
+### Q1. What happens between a request arriving and the first token leaving? `[x]`
+- **Answer:** `docs/phase_notes/ttft_anatomy.md` (`run_ttft_anatomy`, bursts of 1–32 × 128–8,192 tokens). A lone request's TTFT is almost all prefill (44 ms to 1.4 s). In a burst, TTFT is queueing at a sustained 6–7k prefill tokens/s, plus memory queueing once the burst's KV cache exceeds the pool.
 
 ### Q2. Is prefill compute-bound and decode memory-bound? `[x]`
 - **Answer:** `docs/phase_notes/roofline.md` (`run_roofline`). Decode sits on the bandwidth line at 2–13 FLOP/B; prefill becomes compute-bound at about 300 tokens (FP8 ridge ≈ 552 FLOP/B, power-capped). GEMM level: `gemm_peak.md`.

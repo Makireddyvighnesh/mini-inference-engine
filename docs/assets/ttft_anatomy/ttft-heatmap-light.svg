@@ -1,0 +1,274 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
+  "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="662.4pt" height="360pt" viewBox="0 0 662.4 360" xmlns="http://www.w3.org/2000/svg" version="1.1">
+ <metadata>
+  <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+   <cc:Work>
+    <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
+    <dc:date>2026-10-26T11:15:14.583598</dc:date>
+    <dc:format>image/svg+xml</dc:format>
+    <dc:creator>
+     <cc:Agent>
+      <dc:title>Matplotlib v3.11.1, https://matplotlib.org/</dc:title>
+     </cc:Agent>
+    </dc:creator>
+   </cc:Work>
+  </rdf:RDF>
+ </metadata>
+ <defs>
+  <style type="text/css">*{stroke-linejoin: round; stroke-linecap: butt}</style>
+ </defs>
+ <g id="figure_1">
+  <g id="patch_1">
+   <path d="M 0 360 
+L 662.4 360 
+L 662.4 0 
+L 0 0 
+z
+" style="fill: #fcfcfb"/>
+  </g>
+  <g id="axes_1">
+   <g id="patch_2">
+    <path d="M 59.616 309.6 
+L 649.152 309.6 
+L 649.152 72 
+L 59.616 72 
+z
+" style="fill: #ffffff"/>
+   </g>
+   <g clip-path="url(#p8b6cc30a59)">
+    <image xlink:href="data:image/png;base64,
+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" id="imageb90b5b707e" transform="scale(1 -1) translate(0 -237.6)" x="59.76" y="-72" width="589.68" height="237.6"/>
+   </g>
+   <g id="matplotlib.axis_1">
+    <g id="xtick_1">
+     <g id="line2d_1"/>
+     <g id="text_1">
+      <text style="font-size: 9px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #52514e" x="101.725714" y="319.937891" transform="rotate(-0 101.725714 319.937891)">128</text>
+     </g>
+    </g>
+    <g id="xtick_2">
+     <g id="line2d_2"/>
+     <g id="text_2">
+      <text style="font-size: 9px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #52514e" x="185.945143" y="319.937891" transform="rotate(-0 185.945143 319.937891)">256</text>
+     </g>
+    </g>
+    <g id="xtick_3">
+     <g id="line2d_3"/>
+     <g id="text_3">
+      <text style="font-size: 9px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #52514e" x="270.164571" y="319.937891" transform="rotate(-0 270.164571 319.937891)">512</text>
+     </g>
+    </g>
+    <g id="xtick_4">
+     <g id="line2d_4"/>
+     <g id="text_4">
+      <text style="font-size: 9px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #52514e" x="354.384" y="319.937891" transform="rotate(-0 354.384 319.937891)">1,024</text>
+     </g>
+    </g>
+    <g id="xtick_5">
+     <g id="line2d_5"/>
+     <g id="text_5">
+      <text style="font-size: 9px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #52514e" x="438.603429" y="319.937891" transform="rotate(-0 438.603429 319.937891)">2,048</text>
+     </g>
+    </g>
+    <g id="xtick_6">
+     <g id="line2d_6"/>
+     <g id="text_6">
+      <text style="font-size: 9px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #52514e" x="522.822857" y="319.937891" transform="rotate(-0 522.822857 319.937891)">4,096</text>
+     </g>
+    </g>
+    <g id="xtick_7">
+     <g id="line2d_7"/>
+     <g id="text_7">
+      <text style="font-size: 9px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #52514e" x="607.042286" y="319.937891" transform="rotate(-0 607.042286 319.937891)">8,192</text>
+     </g>
+    </g>
+    <g id="text_8">
+     <text style="font-size: 9px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #52514e" x="354.384" y="332.938594" transform="rotate(-0 354.384 332.938594)">Prompt tokens (every request in the burst)</text>
+    </g>
+   </g>
+   <g id="matplotlib.axis_2">
+    <g id="ytick_1">
+     <g id="line2d_8"/>
+     <g id="text_9">
+      <text style="font-size: 9px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: end; fill: #52514e" x="56.116" y="293.218945" transform="rotate(-0 56.116 293.218945)">1</text>
+     </g>
+    </g>
+    <g id="ytick_2">
+     <g id="line2d_9"/>
+     <g id="text_10">
+      <text style="font-size: 9px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: end; fill: #52514e" x="56.116" y="253.618945" transform="rotate(-0 56.116 253.618945)">2</text>
+     </g>
+    </g>
+    <g id="ytick_3">
+     <g id="line2d_10"/>
+     <g id="text_11">
+      <text style="font-size: 9px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: end; fill: #52514e" x="56.116" y="214.018945" transform="rotate(-0 56.116 214.018945)">4</text>
+     </g>
+    </g>
+    <g id="ytick_4">
+     <g id="line2d_11"/>
+     <g id="text_12">
+      <text style="font-size: 9px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: end; fill: #52514e" x="56.116" y="174.418945" transform="rotate(-0 56.116 174.418945)">8</text>
+     </g>
+    </g>
+    <g id="ytick_5">
+     <g id="line2d_12"/>
+     <g id="text_13">
+      <text style="font-size: 9px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: end; fill: #52514e" x="56.116" y="134.818945" transform="rotate(-0 56.116 134.818945)">16</text>
+     </g>
+    </g>
+    <g id="ytick_6">
+     <g id="line2d_13"/>
+     <g id="text_14">
+      <text style="font-size: 9px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: end; fill: #52514e" x="56.116" y="95.218945" transform="rotate(-0 56.116 95.218945)">32</text>
+     </g>
+    </g>
+    <g id="text_15">
+     <text style="font-size: 9px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #52514e" x="38.501391" y="190.8" transform="rotate(-90 38.501391 190.8)">Requests arriving together</text>
+    </g>
+   </g>
+   <g id="text_16">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #0b0b0b" x="101.725714" y="292.008008" transform="rotate(-0 101.725714 292.008008)">44 ms</text>
+   </g>
+   <g id="text_17">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #0b0b0b" x="185.945143" y="292.008008" transform="rotate(-0 185.945143 292.008008)">52 ms</text>
+   </g>
+   <g id="text_18">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #0b0b0b" x="270.164571" y="292.008008" transform="rotate(-0 270.164571 292.008008)">56 ms</text>
+   </g>
+   <g id="text_19">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #0b0b0b" x="354.384" y="292.008008" transform="rotate(-0 354.384 292.008008)">131 ms</text>
+   </g>
+   <g id="text_20">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #0b0b0b" x="438.603429" y="292.008008" transform="rotate(-0 438.603429 292.008008)">273 ms</text>
+   </g>
+   <g id="text_21">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #0b0b0b" x="522.822857" y="292.008008" transform="rotate(-0 522.822857 292.008008)">607 ms</text>
+   </g>
+   <g id="text_22">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #0b0b0b" x="607.042286" y="292.008008" transform="rotate(-0 607.042286 292.008008)">1.4 s</text>
+   </g>
+   <g id="text_23">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #0b0b0b" x="101.725714" y="252.408008" transform="rotate(-0 101.725714 252.408008)">59 ms</text>
+   </g>
+   <g id="text_24">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #0b0b0b" x="185.945143" y="252.408008" transform="rotate(-0 185.945143 252.408008)">61 ms</text>
+   </g>
+   <g id="text_25">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #0b0b0b" x="270.164571" y="252.408008" transform="rotate(-0 270.164571 252.408008)">121 ms</text>
+   </g>
+   <g id="text_26">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #0b0b0b" x="354.384" y="252.408008" transform="rotate(-0 354.384 252.408008)">240 ms</text>
+   </g>
+   <g id="text_27">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #0b0b0b" x="438.603429" y="252.408008" transform="rotate(-0 438.603429 252.408008)">470 ms</text>
+   </g>
+   <g id="text_28">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #0b0b0b" x="522.822857" y="252.408008" transform="rotate(-0 522.822857 252.408008)">995 ms</text>
+   </g>
+   <g id="text_29">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #ffffff" x="607.042286" y="252.408008" transform="rotate(-0 607.042286 252.408008)">2.4 s</text>
+   </g>
+   <g id="text_30">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #0b0b0b" x="101.725714" y="212.808008" transform="rotate(-0 101.725714 212.808008)">71 ms</text>
+   </g>
+   <g id="text_31">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #0b0b0b" x="185.945143" y="212.808008" transform="rotate(-0 185.945143 212.808008)">88 ms</text>
+   </g>
+   <g id="text_32">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #0b0b0b" x="270.164571" y="212.808008" transform="rotate(-0 270.164571 212.808008)">221 ms</text>
+   </g>
+   <g id="text_33">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #0b0b0b" x="354.384" y="212.808008" transform="rotate(-0 354.384 212.808008)">365 ms</text>
+   </g>
+   <g id="text_34">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #0b0b0b" x="438.603429" y="212.808008" transform="rotate(-0 438.603429 212.808008)">733 ms</text>
+   </g>
+   <g id="text_35">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #ffffff" x="522.822857" y="212.808008" transform="rotate(-0 522.822857 212.808008)">1.7 s</text>
+   </g>
+   <g id="text_36">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #ffffff" x="607.042286" y="212.808008" transform="rotate(-0 607.042286 212.808008)">4.2 s</text>
+   </g>
+   <g id="text_37">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #0b0b0b" x="101.725714" y="173.208008" transform="rotate(-0 101.725714 173.208008)">97 ms</text>
+   </g>
+   <g id="text_38">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #0b0b0b" x="185.945143" y="173.208008" transform="rotate(-0 185.945143 173.208008)">209 ms</text>
+   </g>
+   <g id="text_39">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #0b0b0b" x="270.164571" y="173.208008" transform="rotate(-0 270.164571 173.208008)">346 ms</text>
+   </g>
+   <g id="text_40">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #0b0b0b" x="354.384" y="173.208008" transform="rotate(-0 354.384 173.208008)">647 ms</text>
+   </g>
+   <g id="text_41">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #0b0b0b" x="438.603429" y="173.208008" transform="rotate(-0 438.603429 173.208008)">1.3 s</text>
+   </g>
+   <g id="text_42">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #ffffff" x="522.822857" y="173.208008" transform="rotate(-0 522.822857 173.208008)">3.0 s</text>
+   </g>
+   <g id="text_43">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #ffffff" x="607.042286" y="173.208008" transform="rotate(-0 607.042286 173.208008)">7.8 s</text>
+   </g>
+   <g id="text_44">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #0b0b0b" x="101.725714" y="133.608008" transform="rotate(-0 101.725714 133.608008)">233 ms</text>
+   </g>
+   <g id="text_45">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #0b0b0b" x="185.945143" y="133.608008" transform="rotate(-0 185.945143 133.608008)">349 ms</text>
+   </g>
+   <g id="text_46">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #0b0b0b" x="270.164571" y="133.608008" transform="rotate(-0 270.164571 133.608008)">641 ms</text>
+   </g>
+   <g id="text_47">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #0b0b0b" x="354.384" y="133.608008" transform="rotate(-0 354.384 133.608008)">1.2 s</text>
+   </g>
+   <g id="text_48">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #ffffff" x="438.603429" y="133.608008" transform="rotate(-0 438.603429 133.608008)">2.5 s</text>
+   </g>
+   <g id="text_49">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #ffffff" x="522.822857" y="133.608008" transform="rotate(-0 522.822857 133.608008)">5.8 s</text>
+   </g>
+   <g id="text_50">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #ffffff" x="607.042286" y="133.608008" transform="rotate(-0 607.042286 133.608008)">14.8 s *</text>
+   </g>
+   <g id="text_51">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #0b0b0b" x="101.725714" y="94.008008" transform="rotate(-0 101.725714 94.008008)">369 ms</text>
+   </g>
+   <g id="text_52">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #0b0b0b" x="185.945143" y="94.008008" transform="rotate(-0 185.945143 94.008008)">635 ms</text>
+   </g>
+   <g id="text_53">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #0b0b0b" x="270.164571" y="94.008008" transform="rotate(-0 270.164571 94.008008)">1.2 s</text>
+   </g>
+   <g id="text_54">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #ffffff" x="354.384" y="94.008008" transform="rotate(-0 354.384 94.008008)">2.4 s</text>
+   </g>
+   <g id="text_55">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #ffffff" x="438.603429" y="94.008008" transform="rotate(-0 438.603429 94.008008)">5.0 s</text>
+   </g>
+   <g id="text_56">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #ffffff" x="522.822857" y="94.008008" transform="rotate(-0 522.822857 94.008008)">11.2 s *</text>
+   </g>
+   <g id="text_57">
+    <text style="font-size: 8.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: middle; fill: #ffffff" x="607.042286" y="94.008008" transform="rotate(-0 607.042286 94.008008)">28.9 s *</text>
+   </g>
+  </g>
+  <g id="text_58">
+   <text style="font-weight: 700; font-size: 13px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: start; fill: #0b0b0b" x="6.624" y="18.877969" transform="rotate(-0 6.624 18.877969)">Time to first token: median request in a burst</text>
+  </g>
+  <g id="text_59">
+   <text style="font-size: 9.5px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: start; fill: #52514e" x="6.624" y="37.818516" transform="rotate(-0 6.624 37.818516)">All requests arrive at once; the engine has to prefill every prompt before the last one gets a token.</text>
+  </g>
+  <g id="text_60">
+   <text style="font-size: 8px; font-family: 'system-ui', '-apple-system', 'Segoe UI', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Arial', 'Helvetica', 'Avant Garde', sans-serif; text-anchor: start; fill: #898781" x="6.624" y="352.678125" transform="rotate(-0 6.624 352.678125)">* burst exceeds the KV pool (83,840 tokens), so some requests queue for memory. Mixed batching, adaptive chunks, CUDA Graphs; Qwen3-4B FP8 on one L4.</text>
+  </g>
+ </g>
+ <defs>
+  <clipPath id="p8b6cc30a59">
+   <rect x="59.616" y="72" width="589.536" height="237.6"/>
+  </clipPath>
+ </defs>
+</svg>
