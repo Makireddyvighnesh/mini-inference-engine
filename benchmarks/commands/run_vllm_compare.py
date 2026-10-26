@@ -165,11 +165,13 @@ def run_minillm(args) -> None:
     from minillm_l4.benchmarks.runners.chunked_prefill import ChunkedPrefillPagedRunner
     from minillm_l4.benchmarks.runners.huggingface_baseline import MODEL_ID, MODEL_REVISION, load_qwen_fp8
     from minillm_l4.engine.kernels.fused import install_fused_kernels
+    from minillm_l4.engine.kernels.merged_projections import install_merged_projections
 
     bundle = load_qwen_fp8(fp8_kernel_path="sm89", local_files_only=True)
     model = bundle.model
     if not install_fused_kernels(model):
         raise RuntimeError("fused kernels unavailable")
+    install_merged_projections(model)
     workloads = build_workloads(bundle.tokenizer)
     if args.sections:
         workloads = [w for w in workloads if w["section"] in args.sections]

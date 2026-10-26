@@ -28,6 +28,9 @@ from minillm_l4.benchmarks.core.synthetic import SyntheticSample, exact_token_id
 from minillm_l4.benchmarks.runners.chunked_prefill import ChunkedPrefillPagedRunner  # noqa: E402
 from minillm_l4.benchmarks.runners.huggingface_baseline import load_qwen_fp8  # noqa: E402
 from minillm_l4.engine.kernels.fused import install_fused_kernels, uninstall_fused_kernels  # noqa: E402
+from minillm_l4.engine.kernels.merged_projections import (  # noqa: E402
+    install_merged_projections, uninstall_merged_projections,
+)
 
 LENGTHS = (128, 8192, 600, 2048, 4097, 1000, 3000, 256)
 OUTPUT_TOKENS = 64
@@ -52,6 +55,15 @@ POLICIES = {
     "whole_graph_fused": dict(prefill_chunk_size=None, cuda_graphs=True, fused=True),
     "adaptive_graph_fused": dict(prefill_chunk_size=None, mixed_batch=True, adaptive_chunking=True,
                                  cuda_graphs=True, fused=True),
+    # One q/k/v GEMM and one gate/up GEMM per layer (engine/kernels/merged_projections.py).
+    "adaptive_merged": dict(prefill_chunk_size=None, mixed_batch=True, adaptive_chunking=True, merged=True),
+    "whole_fused_merged": dict(prefill_chunk_size=None, fused=True, merged=True),
+    "chunked_256_fused_merged": dict(prefill_chunk_size=256, max_prefill_tokens=256, fused=True, merged=True),
+    "adaptive_fused_merged": dict(prefill_chunk_size=None, mixed_batch=True, adaptive_chunking=True,
+                                  fused=True, merged=True),
+    "whole_graph_fused_merged": dict(prefill_chunk_size=None, cuda_graphs=True, fused=True, merged=True),
+    "adaptive_graph_fused_merged": dict(prefill_chunk_size=None, mixed_batch=True, adaptive_chunking=True,
+                                        cuda_graphs=True, fused=True, merged=True),
 }
 
 
@@ -75,6 +87,10 @@ def main() -> int:
             raise RuntimeError("fused kernels unavailable")
         if not fused:
             uninstall_fused_kernels(bundle.model)
+        if options.pop("merged", False):
+            install_merged_projections(bundle.model)
+        else:
+            uninstall_merged_projections(bundle.model)
         runner = ChunkedPrefillPagedRunner(
             bundle.model, block_size=16, num_blocks=blocks, max_batch_size=len(requests),
             device="cuda", decode_backend="auto", decode_sdpa_compat=True, enable_prefix=False,

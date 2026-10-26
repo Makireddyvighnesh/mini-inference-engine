@@ -10,6 +10,7 @@ from torch import nn
 
 from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
 
+from ..kernels.merged_projections import project_qkv
 from .mixed import MixedBatchMetadata
 from .packed import PackedSequenceMetadata
 from .decode_metadata import validate_decode_metadata
@@ -118,25 +119,10 @@ class PagedQwen3Attention(nn.Module):
                 )
 
             total_tokens = int(hidden_states.shape[0])
-            query_states = self.inner.q_norm(
-                self.inner.q_proj(hidden_states).view(
-                    total_tokens,
-                    -1,
-                    self.head_dim,
-                )
-            )
-            key_states = self.inner.k_norm(
-                self.inner.k_proj(hidden_states).view(
-                    total_tokens,
-                    -1,
-                    self.head_dim,
-                )
-            )
-            value_states = self.inner.v_proj(hidden_states).view(
-                total_tokens,
-                -1,
-                self.head_dim,
-            )
+            query_states, key_states, value_states = project_qkv(self.inner, hidden_states)
+            query_states = self.inner.q_norm(query_states.view(total_tokens, -1, self.head_dim))
+            key_states = self.inner.k_norm(key_states.view(total_tokens, -1, self.head_dim))
+            value_states = value_states.view(total_tokens, -1, self.head_dim)
 
             # Keep a synthetic batch dimension for the shared RoPE helper,
             # then flatten back to [total_tokens, heads, head_dim] for the
@@ -204,13 +190,10 @@ class PagedQwen3Attention(nn.Module):
 
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
-        query_states = self.inner.q_norm(
-            self.inner.q_proj(hidden_states).view(hidden_shape)
-        ).transpose(1, 2)
-        key_states = self.inner.k_norm(
-            self.inner.k_proj(hidden_states).view(hidden_shape)
-        ).transpose(1, 2)
-        value_states = self.inner.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        query_states, key_states, value_states = project_qkv(self.inner, hidden_states)
+        query_states = self.inner.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
+        key_states = self.inner.k_norm(key_states.view(hidden_shape)).transpose(1, 2)
+        value_states = value_states.view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(
@@ -258,9 +241,10 @@ class PagedQwen3Attention(nn.Module):
         if hidden_states.ndim != 2 or int(hidden_states.shape[0]) != metadata.total_tokens:
             raise ValueError("mixed attention expects flat hidden states covering the metadata")
         total = metadata.total_tokens
-        query = self.inner.q_norm(self.inner.q_proj(hidden_states).view(total, -1, self.head_dim))
-        key = self.inner.k_norm(self.inner.k_proj(hidden_states).view(total, -1, self.head_dim))
-        value = self.inner.v_proj(hidden_states).view(total, -1, self.head_dim)
+        query, key, value = project_qkv(self.inner, hidden_states)
+        query = self.inner.q_norm(query.view(total, -1, self.head_dim))
+        key = self.inner.k_norm(key.view(total, -1, self.head_dim))
+        value = value.view(total, -1, self.head_dim)
         # [tokens, heads, dim] -> [1, heads, tokens, dim] for the shared RoPE helper.
         query = query.permute(1, 0, 2).unsqueeze(0)
         key = key.permute(1, 0, 2).unsqueeze(0)

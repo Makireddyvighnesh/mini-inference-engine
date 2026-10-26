@@ -44,6 +44,14 @@ Prefix reuse is not supported in mixed mode. Design, capture-safety audit, and r
 
 **Fused kernels.** `engine/kernels/fused.py::install_fused_kernels(model)` routes Qwen3's RMSNorms, MLP SiLU-multiply, post-attention residual add + norm, and RoPE through bit-exact Triton kernels (reversible with `uninstall_fused_kernels`; RoPE is patched process-wide in Transformers' Qwen3 module and `qwen3_paged`). Measured: prefill -10 to -23%, eager decode -20%, graph decode -6 to -8%; see `docs/phase_notes/fused_kernels.md`.
 
+**Merged projections.** `engine/kernels/merged_projections.py::install_merged_projections(model)` runs q/k/v as one FP8 GEMM (N=6144) and gate/up as one (N=19456).
+- It is bitwise equal to the separate calls: split points are multiples of 128 and every config uses `BLOCK_K=128`.
+- The original weights become views of the merged storage.
+- q/k/v and gate/up come back as column views, so every consumer must honor strides. The fused RMSNorm and SiLU-mul do, and the packed K/V writer takes separate V strides; it once silently read V with K's strides.
+- Attention merges apply in the paged paths (`project_qkv`); MLP merges apply only with `install_fused_kernels`.
+- The merged shapes are pre-tuned at install.
+- Gains: eager decode −11 to −17%, graph decode +2 to +4%, short prefill −13%, large prefill −1 to −2%. See `docs/phase_notes/gemm_peak.md`.
+
 **Benchmark harness.** `benchmarks/core/` defines request/workload schemas and records per-request events (arrival, admission, prefill, every token, completion) against one run clock; `metrics.py` derives TTFT/TPOT/ITL/E2E from those events (definitions in `docs/metric_definitions.md`). Each backend in `benchmarks/runners/` emits the same events, so any two runners are directly comparable. `docs/phase_notes/` holds per-step design, measurements, and known limits.
 
 ## Exactness rules

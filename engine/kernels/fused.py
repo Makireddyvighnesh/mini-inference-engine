@@ -88,11 +88,12 @@ if triton is not None:
 
     @triton.jit
     def _rms_norm_kernel(x_ptr, residual_ptr, residual_out_ptr, weight_ptr, out_ptr,
-                         x_row_stride, out_row_stride, n_cols, eps,
+                         x_outer_stride, x_head_stride, heads, out_row_stride, n_cols, eps,
                          HAS_RESIDUAL: tl.constexpr, BW: tl.constexpr, K: tl.constexpr):
         row = tl.program_id(0)
         lane = tl.arange(0, BW)
-        x_row = row * x_row_stride
+        # Row r of a [R, heads, n_cols] view (heads == 1 for plain 2-D rows).
+        x_row = (row // heads).to(tl.int64) * x_outer_stride + (row % heads).to(tl.int64) * x_head_stride
         res_row = row * n_cols
         n_vec = n_cols // 4
         quad = tl.arange(0, 4)
@@ -123,11 +124,14 @@ if triton is not None:
             tl.store(out_ptr + row * out_row_stride + col, (weight * normed).to(tl.bfloat16), mask=mask)
 
     @triton.jit
-    def _silu_mul_kernel(gate_ptr, up_ptr, out_ptr, n_elements, BLOCK: tl.constexpr):
+    def _silu_mul_kernel(gate_ptr, up_ptr, out_ptr, n_elements, n_cols, in_row_stride, BLOCK: tl.constexpr):
         offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         mask = offsets < n_elements
-        gate = tl.load(gate_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-        up = tl.load(up_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        # Inputs may be column views of one merged gate/up output (row stride > n_cols).
+        row = offsets // n_cols
+        in_offsets = row.to(tl.int64) * in_row_stride + (offsets - row * n_cols)
+        gate = tl.load(gate_ptr + in_offsets, mask=mask, other=0.0).to(tl.float32)
+        up = tl.load(up_ptr + in_offsets, mask=mask, other=0.0).to(tl.float32)
         # PyTorch: silu in fp32 (x / (1 + exp(-x))), rounded to bf16, then a bf16 multiply.
         silu = _round_bf16(libdevice.div_rn(gate, 1.0 + libdevice.exp(-gate)))
         tl.store(out_ptr + offsets, (silu * up).to(tl.bfloat16), mask=mask)
@@ -165,23 +169,32 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float,
     n_cols = int(x.shape[-1])
     if n_cols % 4 or n_cols < 128:
         raise ValueError("rms_norm reproduces PyTorch's vectorized reduction: width must be a multiple of 4, >= 128")
-    rows = x.reshape(-1, n_cols)
-    if rows.stride(-1) != 1:
-        rows = rows.contiguous()
-    num_rows = rows.shape[0]
+    try:
+        rows = x.view(-1, n_cols)
+        outer, head_stride, heads = rows.stride(0), 0, 1
+        if rows.stride(-1) != 1:
+            raise RuntimeError
+    except RuntimeError:
+        # Per-head rows of a [..., heads, n_cols] view, e.g. q/k columns of a merged
+        # q/k/v output: read through (outer, head) strides instead of copying.
+        rows = x.reshape(-1, int(x.shape[-2]), n_cols) if x.dim() > 2 else x.contiguous().unsqueeze(1)
+        if rows.stride(-1) != 1:
+            rows = rows.contiguous()
+        outer, head_stride, heads = rows.stride(0), rows.stride(1), int(rows.shape[1])
+    num_rows = rows.numel() // n_cols
     bw = _torch_reduce_block_width(num_rows, n_cols)
     k = triton.cdiv(n_cols // 4, bw)
     out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
     out_rows = out.view(-1, n_cols)
     warps = max(1, min(8, bw // 32))
     if residual is None:
-        _rms_norm_kernel[(num_rows,)](rows, rows, rows, weight, out_rows, rows.stride(0), n_cols,
+        _rms_norm_kernel[(num_rows,)](rows, rows, rows, weight, out_rows, outer, head_stride, heads, n_cols,
                                       n_cols, eps, HAS_RESIDUAL=False, BW=bw, K=k, num_warps=warps)
         return out
     residual_rows = residual.reshape(-1, n_cols).contiguous()
     summed = torch.empty(x.shape, dtype=x.dtype, device=x.device)
     _rms_norm_kernel[(num_rows,)](rows, residual_rows, summed.view(-1, n_cols), weight, out_rows,
-                                  rows.stride(0), n_cols, n_cols, eps,
+                                  outer, head_stride, heads, n_cols, n_cols, eps,
                                   HAS_RESIDUAL=True, BW=bw, K=k, num_warps=warps)
     return out, summed
 
@@ -204,11 +217,18 @@ def _torch_reduce_block_width(num_rows: int, n_cols: int) -> int:
 def silu_mul(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     """``F.silu(gate) * up`` in one pass."""
 
-    gate, up = gate.contiguous(), up.contiguous()
-    out = torch.empty_like(gate)
+    n_cols = int(gate.shape[-1])
+    try:
+        gate_rows, up_rows = gate.view(-1, n_cols), up.view(-1, n_cols)
+        if gate_rows.stride() != up_rows.stride() or gate_rows.stride(-1) != 1:
+            raise RuntimeError
+    except RuntimeError:
+        gate_rows, up_rows = gate.contiguous().view(-1, n_cols), up.contiguous().view(-1, n_cols)
+    out = torch.empty(gate.shape, dtype=gate.dtype, device=gate.device)
     n = gate.numel()
     block = 2048 if n >= 1 << 20 else 512  # small decode tensors need more programs
-    _silu_mul_kernel[(triton.cdiv(n, block),)](gate, up, out, n, BLOCK=block, num_warps=8 if block == 2048 else 4)
+    _silu_mul_kernel[(triton.cdiv(n, block),)](gate_rows, up_rows, out, n, n_cols, gate_rows.stride(0),
+                                               BLOCK=block, num_warps=8 if block == 2048 else 4)
     return out
 
 
@@ -258,7 +278,9 @@ def _norm_forward(self, hidden_states):
 
 
 def _mlp_forward(self, x):
-    return self.down_proj(silu_mul(self.gate_proj(x), self.up_proj(x)))
+    from minillm_l4.engine.kernels.merged_projections import project_gate_up
+
+    return self.down_proj(silu_mul(*project_gate_up(self, x)))
 
 
 def _decoder_forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_values=None,
@@ -314,6 +336,14 @@ def warm_fused_kernels(model: Any) -> None:
             q, k = (torch.zeros(1, seq, h, head_dim, dtype=torch.bfloat16, device=device).transpose(1, 2) for h in heads)
             cos = torch.zeros(1, seq, head_dim, dtype=torch.bfloat16, device=device)
             apply_rotary_pos_emb(q, k, cos, cos)
+        # q/k norms over column views of a merged q/k/v output (per-head rows, strided);
+        # the head count is a specialized integer and one row vs more picks the thread count.
+        weight = torch.ones(head_dim, dtype=torch.bfloat16, device=device)
+        merged_width = (heads[0] + 2 * heads[1]) * head_dim
+        for rows in (1, 2) if head_dim % 4 == 0 and head_dim >= 128 else ():
+            qkv = torch.zeros(rows, merged_width, dtype=torch.bfloat16, device=device)
+            for start, h in ((0, heads[0]), (heads[0] * head_dim, heads[1])):
+                rms_norm(qkv[:, start:start + h * head_dim].view(rows, h, head_dim), weight, 1e-6)
     torch.cuda.synchronize(device)
 
 

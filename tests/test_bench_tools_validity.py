@@ -281,6 +281,7 @@ def test_minillm_comparison_saves_all_cases_before_exit(tmp_path, monkeypatch, c
     stub_module(monkeypatch, "minillm_l4.benchmarks.runners.chunked_prefill",
                 ChunkedPrefillPagedRunner=lambda model, **options: run_showcase.paged(model, (), **options))
     stub_module(monkeypatch, "minillm_l4.engine.kernels.fused", install_fused_kernels=lambda model: True)
+    stub_module(monkeypatch, "minillm_l4.engine.kernels.merged_projections", install_merged_projections=lambda model: 0)
     base_harness = run_showcase.BenchmarkHarness
 
     class Harness(base_harness):

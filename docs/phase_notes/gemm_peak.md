@@ -73,7 +73,45 @@ The chart below shows one decoder layer's seven projections (q, k, v, o, gate, u
   - cuBLAS FP8 levels off near 120 TFLOPS.
   - Ours reaches 85 TFLOPS at M=1024 and 78 TFLOPS at M=8192.
   - BF16 levels off near 65 TFLOPS.
-- **The k/v projections (N=1024) are our weakest shape.** Ours reaches 51 TFLOPS at M=2048, versus 101 for cuBLAS: a narrow N gives too few tiles to fill 58 SMs. Merging q/k/v into one GEMM (N=6144) should fix most of this.
+- **The k/v projections (N=1024) are our weakest shape.** Ours reaches 51 TFLOPS at M=2048, versus 101 for cuBLAS: a narrow N gives too few tiles to fill 58 SMs. Merged projections (below) address this.
+
+## Merged projections
+
+`engine/kernels/merged_projections.py::install_merged_projections(model)` concatenates each layer's q/k/v weights (N=4096+1024+1024) and gate/up weights (N=2×9728), along with their 128×128 block scales. One GEMM then replaces three (or two).
+
+- **Exactness.** Every split point is a multiple of 128, and every SM89 config uses `BLOCK_K=128`, so each output column is computed with the same arithmetic as before. The merged outputs are bitwise equal to the separate calls (`tests/test_merged_projections.py`).
+- **No copies.** q/k/v and gate/up are returned as column views.
+  - The fused RMSNorm reads per-head rows through two strides, and SiLU-mul reads through a row stride.
+  - The original modules' weights become views of the merged storage, so no extra memory is used.
+- **A latent bug this exposed:** the packed K/V page writer (`triton_packed_kv.py`) read V with K's strides. That was harmless while both were contiguous, but it broke the first time V was a view: the gate showed mismatches at output token 0. V now has its own strides, with a regression test (`tests/test_triton_packed_kv.py`).
+- **Gate:** 160/160 outputs identical across 20 policies, including six merged ones.
+
+GEMM time per layer (separate → merged, µs; same session, `do_bench` median):
+
+| Rows (M) | q+k+v | gate+up |
+|---|---|---|
+| 1–64 (decode) | 121–134 → 97–100 | 295–301 → 290–298 |
+| 2048 | 749 → 700 | 2306 → 2182 |
+| 8192 | 3444 → 3021 | 9936 → 9420 |
+
+End to end. Fused kernels are on in both arms, merged off/on alternate in one session, with 1 warm-up and 3 measured runs per arm, repeated twice. The two repeats agreed within 1%.
+
+| Case | Separate | Merged | Change |
+|---|---|---|---|
+| Prefill 128 tokens (TTFT) | 52.7 ms | 46.0 ms | −13% |
+| Prefill 512 | 72.0 ms | 69.0 ms | −4% |
+| Prefill 2048 | 255.3 ms | 253.6 ms | −1% (noise level) |
+| Prefill 8192 | 1341 ms | 1315 ms | −2% |
+| Decode batch 1, eager (TPOT) | 51.9 ms | 43.0 ms | −17% |
+| Decode batch 32, eager | 56.6 ms | 50.2 ms | −11% |
+| Decode batch 1, CUDA Graph | 20.8 ms | 20.5 ms | −2% |
+| Decode batch 32, CUDA Graph | 605 tok/s | 626 tok/s | +3.5% |
+
+What drives these gains:
+- **Eager decode gains most.** It is host-bound, and merging removes three projection launches (with their activation quantization) per layer, 108 per step.
+- **Large prefill gains least.** At 2048 tokens the GEMM saving (≈6 ms over 36 layers in isolation) mostly disappears end to end, because those steps are power-capped. Fewer, larger kernels draw the same 72 W.
+
+`run_vllm_compare` installs merged projections next to the fused kernels.
 
 ## Caveats
 

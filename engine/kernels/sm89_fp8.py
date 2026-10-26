@@ -554,10 +554,16 @@ def pretune_sm89_fp8(model: Any, max_tokens: int = MAX_M_BUCKET) -> int:
         if getattr(getattr(module, "weight", None), "dtype", None) == torch.float8_e4m3fn
         and isinstance(getattr(module, "weight_scale_inv", None), torch.Tensor)
     }
+    dtype = next(p.dtype for p in model.parameters() if p.dtype in {torch.bfloat16, torch.float16})
+    return pretune_sm89_fp8_shapes(shapes, dtype, max_tokens)
+
+
+def pretune_sm89_fp8_shapes(shapes: Any, dtype: torch.dtype, max_tokens: int = MAX_M_BUCKET) -> int:
+    """``pretune_sm89_fp8`` for explicit ``(weight, scales, block_size)`` triples."""
+
     unique = {}
     for weight, scales, block in shapes:
-        unique.setdefault(tuple(weight.shape), (weight, scales, block))
-    dtype = next(p.dtype for p in model.parameters() if p.dtype in {torch.bfloat16, torch.float16})
+        unique.setdefault(tuple(weight.shape), (weight, scales, tuple(block)))
     buckets = pretune_row_buckets(int(max_tokens))
     with torch.inference_mode():
         for weight, scales, block in unique.values():

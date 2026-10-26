@@ -117,3 +117,29 @@ def test_warmup_compiles_every_variant_serving_can_hit():
         gate = torch.zeros(seq * batch, 9728, dtype=torch.bfloat16, device="cuda")
         silu_mul(gate, gate)
     assert compiled() == before
+
+
+@pytest.mark.parametrize("rows", [1, 2, 7, 2048])
+def test_rms_norm_on_merged_qkv_views_bitwise(rows):
+    # q/k columns of one merged q/k/v output: per-head rows read through strides.
+    torch.manual_seed(rows)
+    qkv = (torch.randn(rows, 6144, device="cuda") * 5).to(torch.bfloat16)
+    norm = Qwen3RMSNorm(128, eps=1e-6).cuda().to(torch.bfloat16)
+    norm.weight.data = (torch.rand(128, device="cuda") * 2).to(torch.bfloat16)
+    for start, heads in ((0, 32), (4096, 8)):
+        view = qkv[:, start:start + heads * 128].view(rows, heads, 128)
+        expected = norm(view.contiguous())
+        assert torch.equal(rms_norm(view, norm.weight, norm.variance_epsilon), expected)
+        assert torch.equal(norm(view), expected)  # unfused PyTorch on the view, too
+        batched = qkv[:, start:start + heads * 128].view(1, rows, heads, 128)  # [B, T, H, D] layout
+        assert torch.equal(rms_norm(batched, norm.weight, norm.variance_epsilon), expected.view(1, rows, heads, 128))
+
+
+@pytest.mark.parametrize("rows", [1, 7, 2048])
+def test_silu_mul_on_merged_gate_up_views_bitwise(rows):
+    torch.manual_seed(rows)
+    gate_up = (torch.randn(rows, 2 * 9728, device="cuda") * 6).to(torch.bfloat16)
+    gate, up = gate_up.split([9728, 9728], dim=-1)
+    out = silu_mul(gate, up)
+    assert out.is_contiguous()
+    assert torch.equal(out, torch.nn.functional.silu(gate.contiguous()) * up.contiguous())
