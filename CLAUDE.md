@@ -22,6 +22,7 @@ MINILLM_RUN_MODEL_TESTS=1 .conda-env/bin/python -m pytest -q minillm_l4/tests  #
 - `scripts/stream_generate.py` streams tokens with live TTFT/TPOT (`--mixed`, `--adaptive`, `--chunk-size`, `--arrival-interval-ms`, several `--prompt-length` values cycled across requests).
 - `scripts/check_policy_equivalence.py` (GPU) is the no-HF correctness gate for scheduling changes: whole-prompt, chunked, mixed, adaptive, and their CUDA Graph variants must emit identical tokens.
 - `run_vllm_compare` runs matched workloads through MiniLLM and vLLM (separate env; see its docstring) and writes `comparison.md`; results in `docs/phase_notes/vllm_comparison.md`.
+- `run_gemm_peak` measures GEMM TFLOPS per precision (FP32, TF32, FP16, BF16, FP8, INT8 via cuBLAS, plus our FP8 kernel) and copy bandwidth against the L4 datasheet, recording SM clock and power per case (the 72 W cap sets the real ceiling); `scripts/make_gemm_peak_charts.py` renders its charts; results in `docs/phase_notes/gemm_peak.md`.
 - `run_cuda_graphs` compares eager vs graph decode (decode, prefill, serving, overhead sections); `scripts/make_cuda_graph_charts.py <cuda_graphs.json> docs/assets/cuda_graphs` renders its charts.
 
 ## Architecture
