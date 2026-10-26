@@ -6,6 +6,8 @@ Each question has a goal, the experiment, the plot that answers it, and a status
 
 Status: `[ ]` not started · `[~]` partial data exists · `[x]` done
 
+**Progress (2026-10-26):** 5 done (Q2, Q5, Q7, Q9, Q22) · 13 partial · 5 not started (Q1, Q6, Q17, Q20, Q23).
+
 ---
 
 ## A. Where the time goes
@@ -14,20 +16,20 @@ Status: `[ ]` not started · `[~]` partial data exists · `[x]` done
 - **Experiment:** split TTFT into queue wait, tokenization, admission, prefill forward pass, sampling and detokenization. Use short (128-token) and long (8k-token) prompts, on an idle and a busy engine.
 - **Plot:** a stacked bar of TTFT components for each case.
 
-### Q2. Is prefill compute-bound and decode memory-bound? `[~]`
-- **Done (GEMM level):** `run_gemm_peak` covers all precisions against the datasheet, plus the projection roofline. See `docs/phase_notes/gemm_peak.md`. Still to do: the full prefill and decode steps (attention included) on the roofline.
-- **Experiment:** measure achieved TFLOPS and GB/s for prefill (128 to 16k tokens) and decode (batch 1 to 64).
-- **Plot:** a roofline with the L4 compute and bandwidth limits, and one point per case.
+### Q2. Is prefill compute-bound and decode memory-bound? `[x]`
+- **Answer:** `docs/phase_notes/roofline.md` (`run_roofline`). Decode sits on the bandwidth line at 2–13 FLOP/B; prefill becomes compute-bound at about 300 tokens (FP8 ridge ≈ 552 FLOP/B, power-capped). GEMM level: `gemm_peak.md`.
 
 ### Q3. How do prefill latency and decode speed scale? `[~]`
 - **Experiment:** prompt length vs prefill ms; decode batch size vs tok/s and ms per token.
 - **Plot:** two line charts. Mark where decode saturates.
 
 ### Q4. Profile a step: compute, memory bandwidth, or kernel-launch overhead? `[~]`
+- **Done (decode):** `run_decode_breakdown` covers batch 1–8 × context 128–1024. See `docs/phase_notes/decode_breakdown.md`. Still to do: prefill and mixed steps.
 - **Experiment:** use Nsight / torch profiler to split time into GEMM, attention, norm/RoPE/SiLU, sampling, Python overhead and GPU idle. Do this for prefill, decode and mixed steps.
 - **Plot:** stacked bars per step type.
 
-### Q5. The GPU sits at ~40% utilization under load. Debug it. `[~]`
+### Q5. The GPU sits at ~40% utilization under load. Debug it. `[x]`
+- **Answer:** eager decode spends about 50% of each step on CPU launches (571 kernels at about 40 µs each); CUDA Graphs remove it. See `docs/phase_notes/decode_breakdown.md`.
 - **Experiment:** decode GPU-busy % with eager execution vs CUDA Graphs. Count syncs and launches per step.
 - **Plot:** GPU busy % and ms per token, before and after each fix.
 
@@ -39,15 +41,18 @@ Status: `[ ]` not started · `[~]` partial data exists · `[x]` done
 - **Experiment:** compare naive attention, PyTorch SDPA and our Triton/Flash path. Sweep context length from 512 to 32k, for prefill and decode. Check that outputs match.
 - **Plot:** latency vs context length and peak memory vs context length.
 
-### Q7. Fused RMSNorm (and SiLU-mul, RoPE) vs PyTorch. `[~]`
+### Q7. Fused RMSNorm (and SiLU-mul, RoPE) vs PyTorch. `[x]`
+- **Answer:** `docs/phase_notes/fused_kernels.md` (`run_fused_kernels`): bitwise-equal kernels, prefill −10 to −23%, eager decode −20%.
 - **Experiment:** benchmark each fused kernel against the PyTorch ops across row counts. Confirm bitwise-equal output.
 - **Plot:** speedup vs rows, plus the end-to-end gain per step.
 
 ### Q8. Quantization: BF16 vs FP8. What do we gain and what do we lose? `[~]`
+- **Done:** GEMM speed FP8 ≈ 2× BF16, for decode and prefill (`gemm_peak.md`). Still to do: end-to-end BF16 model run and quality loss.
 - **Experiment:** compare speed (prefill and decode), weight memory, and free KV capacity. Measure quality as perplexity and token agreement on a fixed prompt set. INT8/INT4 are optional extras.
 - **Plot:** grouped bars for speed and memory, and a table for quality.
 
-### Q9. What do CUDA Graphs do for decode? `[~]`
+### Q9. What do CUDA Graphs do for decode? `[x]`
+- **Answer:** `docs/phase_notes/cuda_graphs.md`, plus `docs/phase_notes/decode_breakdown.md` (eager 41–47 ms → graph 20–26 ms per step; removes about 22–28 ms of CPU launch time).
 - **Experiment:** decode ms per token with and without graphs, at batch sizes 1 to 64.
 - **Plot:** a line chart with two series.
 
@@ -55,7 +60,8 @@ Status: `[ ]` not started · `[~]` partial data exists · `[x]` done
 
 ## C. Memory and KV cache
 
-### Q10. Size the KV cache: formula, checked against measured numbers. `[ ]`
+### Q10. Size the KV cache: formula, checked against measured numbers. `[~]`
+- **Done:** 144 KiB per token for Qwen3-4B (`decode_breakdown.md`). Still to do: the 70B worked example and max concurrent requests vs context.
 - **Experiment:** derive KV bytes/token from layers × KV heads × head_dim × 2 × dtype bytes, accounting for GQA. Compare with measured Qwen3-4B KV usage. Then work the paper example: a Llama-style 70B model, 32K context, 100 users, in FP16 vs FP8.
 - **Plot:** a table, plus max concurrent requests vs context length on the L4.
 
