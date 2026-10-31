@@ -6,7 +6,7 @@ Each question has a goal, the experiment, the plot that answers it, and a status
 
 Status: `[ ]` not started · `[~]` partial data exists · `[x]` done
 
-**Progress (2026-10-26):** 6 done (Q1, Q2, Q5, Q7, Q9, Q22) · 13 partial · 4 not started (Q6, Q17, Q20, Q23).
+**Progress (2026-10-30):** 7 done (Q1, Q2, Q5, Q6, Q7, Q9, Q22) · 13 partial · 3 not started (Q17, Q20, Q23).
 
 ---
 
@@ -36,7 +36,8 @@ Status: `[ ]` not started · `[~]` partial data exists · `[x]` done
 
 ## B. Kernels
 
-### Q6. Why is FlashAttention faster when the math is the same? `[ ]`
+### Q6. Why is FlashAttention faster when the math is the same? `[x]`
+- **Done:** `run_attention_compare`, 512–32k tokens, prefill and decode. See `docs/phase_notes/attention_compare.md`.
 - **Experiment:** compare naive attention, PyTorch SDPA and our Triton/Flash path. Sweep context length from 512 to 32k, for prefill and decode. Check that outputs match.
 - **Plot:** latency vs context length and peak memory vs context length.
 
