@@ -391,11 +391,12 @@ def packed_paged_attention(
         "auto",
         "torch",
         "triton",
+        "triton_flash",
         "sdpa",
         "sdpa_math",
     }:
         raise ValueError(
-            "backend must be auto, torch, triton, sdpa, or sdpa_math"
+            "backend must be auto, torch, triton, triton_flash, sdpa, or sdpa_math"
         )
     if not isinstance(query, torch.Tensor) or query.ndim != 3:
         raise ValueError("query must have shape [tokens, heads, head_dim]")
@@ -431,6 +432,22 @@ def packed_paged_attention(
     if (prefill_key_states is None) != (prefill_value_states is None):
         raise ValueError(
             "prefill_key_states and prefill_value_states must be supplied together"
+        )
+    if backend == "triton_flash":
+        # Tiled FlashAttention-style kernel over the pages (already written for
+        # this layer). Faster, but not bitwise equal to the SDPA path.
+        from .triton_flash_prefill import triton_flash_prefill_attention
+
+        cu_seqlens = metadata.cu_seqlens.to(dtype=torch.int32)
+        return triton_flash_prefill_attention(
+            query.contiguous(),
+            key_blocks,
+            value_blocks,
+            block_tables,
+            cu_seqlens,
+            cu_seqlens[1:] - cu_seqlens[:-1],
+            max_query_len=max(int(length) for length in metadata.sequence_lengths),
+            scale=attention_scale,
         )
     if backend in {"sdpa", "sdpa_math"}:
         if prefill_key_states is None or prefill_value_states is None:

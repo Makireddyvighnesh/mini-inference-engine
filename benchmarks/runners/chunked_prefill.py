@@ -72,6 +72,7 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
     def __init__(self, model: Any, *, prefill_chunk_size: int | None = 128,
                  batched_prefill: bool = True, mixed_batch: bool = False,
                  packed_prefill_token_limit: int | None = None,
+                 packed_attention_backend: str = "sdpa",
                  adaptive_chunking: bool = False, planner: AdaptiveChunkPlanner | None = None,
                  cuda_graphs: bool = False,
                  graph_batch_sizes: Sequence[int] = DEFAULT_GRAPH_BATCH_SIZES,
@@ -85,6 +86,11 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
             or prefill_chunk_size < 1
         ):
             raise ValueError("prefill_chunk_size must be positive or None")
+        if packed_attention_backend not in {"sdpa", "triton_flash"}:
+            raise ValueError("packed_attention_backend must be sdpa or triton_flash")
+        # Whole-prompt packed prefill only. "triton_flash" is faster but not
+        # bitwise equal to SDPA, so it is opt-in.
+        self.packed_attention_backend = packed_attention_backend
         if not isinstance(cuda_graphs, bool) or not isinstance(graph_mixed_decode, bool):
             raise ValueError("cuda_graphs and graph_mixed_decode must be booleans")
         self.graph_batch_sizes = validate_graph_batch_sizes(graph_batch_sizes)
@@ -489,7 +495,7 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
                 PackedSequenceMetadata.from_lengths(owners, lengths, device=self.device),
                 paged_kv_cache=self.cache,
                 block_tables=self.cache.block_table_tensor(owners, device=self.device).to(dtype=torch.int32),
-                attention_backend="sdpa",
+                attention_backend=self.packed_attention_backend,
                 row_logits=True,
             )
             next_tokens = output.logits.argmax(dim=-1, keepdim=True).detach()
