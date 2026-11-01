@@ -90,6 +90,7 @@ Status: `[ ]` not started · `[~]` partial data exists · `[x]` done
 - **Plot:** load-latency curves for P50/P95 TTFT and ITL.
 
 ### Q16. A long prompt stalls short chats. Fix TTFT with chunked prefill and scheduling. `[~]`
+- **Done (decode pauses):** `run_chunked_vs_standard`, one 2k/8k/16k prompt arriving among 8 generating chat users: standard vs 512-token chunks vs adaptive. See `docs/phase_notes/chunked_vs_standard.md`. Still to do: TTFT of new short chats arriving during the long prompt, and a decode-first policy.
 - **Experiment:** one 8k–16k prompt arrives among short chats. Compare prefill-first, decode-first, fixed 2048-token chunks (vLLM style) and our adaptive planner. Measure chat TTFT and worst decode pause.
 - **Plot:** a timeline of decode stalls, plus a TTFT vs worst-pause scatter per policy.
 
