@@ -10,9 +10,16 @@ Prefill (one prompt of N tokens, causal):
 * sdpa_efficient- PyTorch SDPA memory-efficient backend (xFormers style; it has
                   no GQA support, so it gets K/V pre-copied to 32 heads);
 * sdpa_flash    - PyTorch SDPA FlashAttention-2 backend (the engine's prefill);
-* triton_packed - our Triton packed-prefill kernel over paged K/V: online
+* triton_packed - our first Triton prefill kernel over paged K/V: online
                   softmax (no N x N matrix) but one program per query row, so
-                  it re-reads K/V for every row (no query tiling).
+                  it re-reads K/V for every row (no query tiling);
+* triton_flash  - our tiled kernel over paged K/V (triton_flash_prefill):
+                  query tiles on tensor cores, GQA heads packed per program.
+
+Packed (several prompts in one prefill, as the engine's whole-prompt policy
+runs them): the engine's SDPA path calls FlashAttention once per request in a
+Python loop; triton_flash handles every request in one launch. Timed eager,
+launch costs included, since that is how the engine runs it.
 
 Decode (batch 8, one new token per request, attending N cached tokens):
 * naive, sdpa_math, sdpa_flash, triton_paged (engine decode kernel
@@ -152,6 +159,64 @@ def prefill_triton(q, k, v):
     return lambda: triton_packed_prefill_attention(flat_q, kp, vp, seq, pos, tables, scale=SCALE).transpose(0, 1)[None]
 
 
+def prefill_triton_flash(q, k, v):
+    from minillm_l4.engine.kv_cache.triton_flash_prefill import triton_flash_prefill_attention
+
+    n = q.shape[2]
+    kp, tables = to_pages(k)
+    vp, _ = to_pages(v)
+    cu = torch.tensor([0, n], device=q.device, dtype=torch.int32)
+    lengths = torch.tensor([n], device=q.device, dtype=torch.int32)
+    flat_q = q[0].transpose(0, 1).contiguous()
+    return lambda: triton_flash_prefill_attention(flat_q, kp, vp, tables, cu, lengths, max_query_len=n,
+                                                  scale=SCALE).transpose(0, 1)[None]
+
+
+def packed_cases(label, lengths, dev, dt):
+    """Several prompts in one prefill: per-request FlashAttention loop vs one triton_flash launch."""
+
+    from minillm_l4.engine.kv_cache.triton_flash_prefill import triton_flash_prefill_attention
+
+    qs = [torch.randn(1, HEADS, n, DIM, device=dev, dtype=dt) for n in lengths]
+    ks = [torch.randn(1, KV_HEADS, n, DIM, device=dev, dtype=dt) for n in lengths]
+    vs = [torch.randn_like(k) for k in ks]
+    kpages, vpages = [to_pages(k)[0] for k in ks], [to_pages(v)[0] for v in vs]
+    tables = torch.zeros(len(lengths), max(p.shape[0] for p in kpages), device=dev, dtype=torch.int32)
+    first = 0
+    for row, pages in enumerate(kpages):
+        tables[row, :pages.shape[0]] = torch.arange(first, first + pages.shape[0], device=dev, dtype=torch.int32)
+        first += pages.shape[0]
+    kp, vp = torch.cat(kpages), torch.cat(vpages)
+    flat_q = torch.cat([q[0].transpose(0, 1) for q in qs]).contiguous()
+    cu = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], device=dev, dtype=torch.int32)
+    lens = torch.tensor(lengths, device=dev, dtype=torch.int32)
+
+    def flash_loop():
+        with sdpa_kernel([SDPBackend.FLASH_ATTENTION]):
+            return [F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=SCALE, enable_gqa=True)
+                    for q, k, v in zip(qs, ks, vs)]
+
+    def ours():
+        return triton_flash_prefill_attention(flat_q, kp, vp, tables, cu, lens, max_query_len=max(lengths),
+                                              scale=SCALE)
+
+    reference = flash_loop()
+    out = ours()
+    error = max((out[int(cu[i]):int(cu[i + 1])].float() - reference[i][0].transpose(0, 1).float()).abs().max().item()
+                for i in range(len(lengths)))
+    flops = sum(2 * HEADS * DIM * n * n for n in lengths)
+    cases = []
+    for name, fn, err in (("sdpa_flash_loop", flash_loop, 0.0), ("triton_flash", ours, error)):
+        ms = timed(fn, decode=False)
+        cases.append({"stage": "packed", "backend": name, "label": label, "tokens": sum(lengths),
+                      "requests": len(lengths), "status": "ok", "ms": ms, "tflops": flops / (ms / 1000) / 1e12,
+                      "extra_memory_bytes": extra_memory(fn), "max_abs_error": err})
+    return cases
+
+
+PACKED = (("32 x 128", (128,) * 32), ("32 x 512", (512,) * 32), ("8 x 2048", (2048,) * 8))
+
+
 def prefill_reference(q, k, v, rows=512):
     n = q.shape[2]
     k32, v32 = repeat_kv(k).float(), repeat_kv(v).float()
@@ -205,7 +270,8 @@ def decode_reference(q, k, v):
 
 PREFILL = (("naive", prefill_naive, False), ("sdpa_math", prefill_sdpa(SDPBackend.MATH), False),
            ("sdpa_efficient", prefill_efficient, True),
-           ("sdpa_flash", prefill_sdpa(SDPBackend.FLASH_ATTENTION), False), ("triton_packed", prefill_triton, True))
+           ("sdpa_flash", prefill_sdpa(SDPBackend.FLASH_ATTENTION), False), ("triton_packed", prefill_triton, True),
+           ("triton_flash", prefill_triton_flash, True))
 DECODE = (("naive", decode_naive, False), ("sdpa_math", decode_sdpa(SDPBackend.MATH), False),
           ("sdpa_flash", decode_sdpa(SDPBackend.FLASH_ATTENTION), False),
           ("triton_paged", decode_triton(1), True), ("triton_split8", decode_triton(8), True))
@@ -273,6 +339,11 @@ def main(argv=None) -> int:
         for name, impl, built in DECODE:
             save(run_case("decode", name, impl, built, q, k, v, reference, flops))
         del q, k, v, reference
+        gc.collect()
+        torch.cuda.empty_cache()
+    for label, lengths in PACKED:
+        for case in packed_cases(label, lengths, dev, dt):
+            save(case)
         gc.collect()
         torch.cuda.empty_cache()
     print(f"wrote {args.output_dir / 'attention_compare.json'}")
