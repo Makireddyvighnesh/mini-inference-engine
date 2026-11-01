@@ -18,8 +18,11 @@ Prefill (one prompt of N tokens, causal):
 
 Packed (several prompts in one prefill, as the engine's whole-prompt policy
 runs them): the engine's SDPA path calls FlashAttention once per request in a
-Python loop; triton_flash handles every request in one launch. Timed eager,
-launch costs included, since that is how the engine runs it.
+Python loop (sdpa_flash_loop); flash_varlen is PyTorch's FlashAttention-2 varlen
+kernel (the same code as flash_attn_varlen_func: one launch, dense K/V);
+triton_flash handles every request in one launch over paged K/V. Timed eager,
+launch costs included, since that is how the engine runs it; the three methods
+are interleaved round by round so GPU clock drift hits them equally.
 
 Decode (batch 8, one new token per request, attending N cached tokens):
 * naive, sdpa_math, sdpa_flash, triton_paged (engine decode kernel
@@ -62,6 +65,7 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--sizes", nargs="+", type=int, default=list(SIZES))
+    parser.add_argument("--packed-only", action="store_true", help="run only the packed section")
     args = parser.parse_args(argv)
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         parser.error(f"output directory is not empty: {args.output_dir}")
@@ -90,6 +94,24 @@ def timed(fn, decode: bool) -> float:
         torch.cuda.synchronize()
         samples.append(start.elapsed_time(end) / inner)
     return sorted(samples)[len(samples) // 2]
+
+
+def interleaved(fns: dict, rounds: int = 21) -> dict:
+    """Median ms per fn, timing them in turn each round (clock drift hits all equally)."""
+
+    for fn in fns.values():
+        fn()
+    torch.cuda.synchronize()
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    samples = {name: [] for name in fns}
+    for _ in range(rounds):
+        for name, fn in fns.items():
+            start.record()
+            fn()
+            end.record()
+            torch.cuda.synchronize()
+            samples[name].append(start.elapsed_time(end))
+    return {name: sorted(xs)[len(xs) // 2] for name, xs in samples.items()}
 
 
 def extra_memory(fn) -> int:
@@ -196,18 +218,33 @@ def packed_cases(label, lengths, dev, dt):
             return [F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=SCALE, enable_gqa=True)
                     for q, k, v in zip(qs, ks, vs)]
 
+    flat_k = torch.cat([k[0].transpose(0, 1) for k in ks]).contiguous()
+    flat_v = torch.cat([v[0].transpose(0, 1) for v in vs]).contiguous()
+
+    def flash_varlen():
+        # PyTorch's FlashAttention-2 varlen kernel (same code as flash_attn_varlen_func), dense K/V.
+        from torch.nn.attention.varlen import varlen_attn
+
+        return varlen_attn(flat_q, flat_k, flat_v, cu, cu, max(lengths), max(lengths), window_size=(-1, 0),
+                           enable_gqa=True, scale=SCALE)
+
     def ours():
         return triton_flash_prefill_attention(flat_q, kp, vp, tables, cu, lens, max_query_len=max(lengths),
                                               scale=SCALE)
 
     reference = flash_loop()
-    out = ours()
-    error = max((out[int(cu[i]):int(cu[i + 1])].float() - reference[i][0].transpose(0, 1).float()).abs().max().item()
-                for i in range(len(lengths)))
+    errors = {}
+    for name, fn in (("flash_varlen", flash_varlen), ("triton_flash", ours)):
+        out = fn()
+        errors[name] = max((out[int(cu[i]):int(cu[i + 1])].float() - reference[i][0].transpose(0, 1).float())
+                           .abs().max().item() for i in range(len(lengths)))
     flops = sum(2 * HEADS * DIM * n * n for n in lengths)
     cases = []
-    for name, fn, err in (("sdpa_flash_loop", flash_loop, 0.0), ("triton_flash", ours, error)):
-        ms = timed(fn, decode=False)
+    methods = (("sdpa_flash_loop", flash_loop, 0.0), ("flash_varlen", flash_varlen, errors["flash_varlen"]),
+               ("triton_flash", ours, errors["triton_flash"]))
+    times = interleaved({name: fn for name, fn, _ in methods})
+    for name, fn, err in methods:
+        ms = times[name]
         cases.append({"stage": "packed", "backend": name, "label": label, "tokens": sum(lengths),
                       "requests": len(lengths), "status": "ok", "ms": ms, "tflops": flops / (ms / 1000) / 1e12,
                       "extra_memory_bytes": extra_memory(fn), "max_abs_error": err})
@@ -321,7 +358,7 @@ def main(argv=None) -> int:
         args.output_dir.mkdir(parents=True, exist_ok=True)
         (args.output_dir / "attention_compare.json").write_text(json.dumps(result, indent=1) + "\n")
 
-    for n in args.sizes:
+    for n in [] if args.packed_only else args.sizes:
         q = torch.randn(1, HEADS, n, DIM, device=dev, dtype=dt)
         k = torch.randn(1, KV_HEADS, n, DIM, device=dev, dtype=dt)
         v = torch.randn(1, KV_HEADS, n, DIM, device=dev, dtype=dt)

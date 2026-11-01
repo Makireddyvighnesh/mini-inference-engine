@@ -226,7 +226,7 @@ Naive attention writes a score table with one number per pair of tokens to memor
 </picture>
 
 - **One prompt:** the same speed as PyTorch's FlashAttention from 4k to 16k tokens, 4–5% faster at 32k, 8–16% slower below 2k.
-- **Many prompts at once:** 12–40% less time, because all prompts go in one launch instead of one call per prompt.
+- **Many prompts at once:** 9–39% less time than the engine's one-call-per-prompt loop, because all prompts go in one launch. FlashAttention's own one-launch (varlen) kernel gets the same gain; we tie it.
 - **End to end:** time to first token 4–10% lower.
 
 What made it fast:

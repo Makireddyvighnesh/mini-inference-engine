@@ -16,7 +16,7 @@ All methods below compute the same thing: `softmax(Q·Kᵀ / √d) · V`. The ou
 - **FlashAttention never writes the table.** It works on small tiles in fast on-chip memory and keeps a running softmax. It needs only room for the output, and the GPU spends its time on math.
 - **Our Triton kernel uses the same tricks and matches FlashAttention:**
   - one long prompt: the same speed from 4k to 16k tokens and **4–5% less time at 32k**; 8–16% slower below 2k;
-  - many prompts at once (how the engine prefills): **12–40% less time**, because we handle all prompts in one launch;
+  - many prompts at once (how the engine prefills): **9–39% less time than the engine's one-call-per-prompt loop**, because we handle all prompts in one launch. FlashAttention's own varlen kernel (also one launch) gets the same gain: we tie it (3% slower to 6% faster);
   - end to end in the engine: **time to first token 4–10% lower**.
 - **Our first kernel shows why tiling matters.** It skips the score table too (same small memory), but works on one token at a time, so it is about 110× slower than FlashAttention.
 - **Decode:** FlashAttention and our kernel are equally fast (5.0 ms at 32k). Naive is 9× and standard SDPA 30× slower, because they copy the whole KV cache first.
@@ -55,13 +55,18 @@ One prompt, one layer:
   <img alt="Attention time for packed prompts: FlashAttention loop vs our kernel" src="../assets/attention/attention-packed-light.svg">
 </picture>
 
-The engine prefills waiting prompts together. Its default (SDPA) path then calls FlashAttention **once per prompt**. Our kernel handles **every prompt in one launch**, so the GPU stays full and there is only one launch cost:
+The engine prefills waiting prompts together. Its default (SDPA) path then calls FlashAttention **once per prompt**: many small launches, and each one alone is too small to fill the GPU. A **one-launch (varlen) kernel** puts every prompt in one grid, with `cu_seqlens` marking where each prompt starts. We compare both one-launch kernels against the loop: PyTorch's FlashAttention-2 varlen kernel (`torch.nn.attention.varlen.varlen_attn`, the same code as `flash_attn_varlen_func`) and ours.
 
-| Prompts | FlashAttention, one call per prompt | **Our Triton kernel, one launch** | |
+| Prompts | FlashAttention, one call per prompt | FlashAttention varlen, one launch | **Our Triton kernel, one launch** |
 |---|---|---|---|
-| 32 × 128 tokens | 0.66 ms | **0.40 ms** | 40% less time |
-| 32 × 512 tokens | 2.0 ms | **1.4 ms** | 28% less time |
-| 8 × 2,048 tokens | 4.6 ms | **4.1 ms** | 12% less time |
+| 32 × 128 tokens | 0.67 ms | 0.40 ms (−40%) | 0.41 ms (−39%) |
+| 32 × 512 tokens | 2.7 ms | 1.8 ms (−34%) | **1.7 ms (−38%)** |
+| 8 × 2,048 tokens | 5.7 ms | 5.2 ms (−9%) | 5.2 ms (−9%) |
+
+- **The win over the loop comes from one launch, not from a better kernel.** FlashAttention varlen gets the same gain.
+- **Against FlashAttention varlen we tie:** 3% slower at 32 × 128, 6% faster at 32 × 512, equal at 8 × 2,048 (same result in two runs). Ours also reads K/V straight from the paged cache; varlen here reads one contiguous K/V buffer.
+- **The gain shrinks for longer prompts,** because one long prompt already fills the GPU by itself.
+- Timing: the three methods run in turn each round (21 rounds, median), so GPU clock drift hits all of them equally.
 
 **In the full engine** (whole-prompt policy, all 36 layers, `packed_attention_backend="triton_flash"`), time to first token drops 4–10% on bursts from 32 × 128 to 1 × 16,384 tokens. The gain is smaller than above because the FP8 matrix multiplies take most of the prefill time.
 
@@ -145,7 +150,7 @@ Yes. Every output was compared with an FP32 reference:
 ```
 
 - **Setup:** one attention layer at Qwen3-4B shapes (32 query heads, 8 KV heads, head size 128, bf16), random inputs, no model loaded, the whole L4 free (22 GB). NVIDIA L4, PyTorch 2.13, Triton 3.7, 2026-11-01.
-- **Timing:** median of 3–7 runs after a warm-up, with CUDA events. Short decode cases repeat the call many times inside each run. The packed section times one whole batch, launch costs included, as the engine runs it.
+- **Timing:** median of 3–7 runs after a warm-up, with CUDA events. Short decode cases repeat the call many times inside each run. The packed section times one whole batch, launch costs included, as the engine runs it, with the three methods interleaved round by round (21 rounds, median); results in `results/attention_varlen_20261101`.
 - **Extra memory:** peak GPU memory during the call minus memory in use before it (inputs excluded). In the charts, an X marks out of memory, drawn at the would-be value (4× the previous size).
 - **Methods:**
   - The memory-efficient SDPA kernel has no grouped-KV support, so it got K/V already copied to 32 heads (copy not timed).

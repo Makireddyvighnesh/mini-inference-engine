@@ -12,8 +12,8 @@ show our first prefill kernel (one token per program) as a gray dashed line.
                       FlashAttention at the longest context;
 * attention-memory  - extra memory vs context, against the L4's memory;
 * attention-decode  - the same two panels for decode (8 requests);
-* attention-packed  - several prompts in one prefill: the engine's
-                      per-request FlashAttention loop vs one launch of ours.
+* attention-packed  - several prompts in one prefill (Flash loop, Flash varlen, ours):
+                      the engine's per-request loop vs one-launch kernels.
 """
 
 from __future__ import annotations
@@ -214,38 +214,42 @@ def memory_chart(data, t):
 
 
 def packed_chart(data, t):
-    """Several prompts in one prefill: grouped bars, Flash loop vs ours, per workload."""
+    """Several prompts in one prefill: Flash loop vs Flash varlen vs ours, per workload."""
 
     cases = [c for c in data["cases"] if c["stage"] == "packed"]
     labels = list(dict.fromkeys(c["label"] for c in cases))
-    fig, ax = plt.subplots(figsize=(11.5, 4.2), facecolor=t["surface"])
+    fig, ax = plt.subplots(figsize=(11.5, 4.8), facecolor=t["surface"])
     style(ax, t, xgrid=True, ygrid=False)
-    entries = (("FlashAttention, one call per prompt (engine today)", "sdpa_flash_loop", 0),
-               ("Our Triton kernel, all prompts in one launch", "triton_flash", 3))
+    entries = (("FlashAttention, one call per prompt (engine's SDPA path)", "sdpa_flash_loop", 0),
+               ("FlashAttention varlen, one launch", "flash_varlen", 1),
+               ("Our Triton kernel, one launch", "triton_flash", 3))
+    entries = tuple(e for e in entries if any(c["backend"] == e[1] for c in cases))
+    offsets = (0.26, 0.0, -0.26) if len(entries) == 3 else (0.19, -0.19)
     top = max(c["ms"] for c in cases)
     for group, label in enumerate(reversed(labels)):
-        flash = next(c["ms"] for c in cases if c["label"] == label and c["backend"] == "sdpa_flash_loop")
-        for offset, (_, backend, slot) in zip((0.19, -0.19), entries):
+        loop = next(c["ms"] for c in cases if c["label"] == label and c["backend"] == "sdpa_flash_loop")
+        for offset, (_, backend, slot) in zip(offsets, entries):
             case = next(c for c in cases if c["label"] == label and c["backend"] == backend)
             y = group + offset
-            ax.barh(y, case["ms"], height=0.34, color=t["series"][slot], zorder=3)
-            note = "" if backend == "sdpa_flash_loop" else f"  ·  {vs_flash(case['ms'] / flash)}"
+            ax.barh(y, case["ms"], height=0.24 if len(entries) == 3 else 0.34, color=t["series"][slot], zorder=3)
+            note = "" if backend == "sdpa_flash_loop" else f"  ·  {(1 - case['ms'] / loop) * 100:.0f}% less than the loop"
             ax.text(case["ms"] + top * 0.01, y, ms_text(case["ms"]) + note, va="center", fontsize=8.5,
                     color=t["ink"])
         ax.text(-0.01, group, f"{label} tokens", transform=ax.get_yaxis_transform(), ha="right", va="center",
                 fontsize=9, color=t["ink"])
     ax.set_yticks([])
-    ax.set_xlim(0, top * 1.45)
+    ax.set_xlim(0, top * 1.55)
     ax.spines["left"].set_visible(False)
     ax.set_xlabel("attention time for the whole batch, one layer (ms)", color=t["ink2"], fontsize=8.5)
     handles = [plt.Rectangle((0, 0), 1, 1, color=t["series"][slot]) for *_, slot in entries]
-    fig.legend(handles, [e[0] for e in entries], loc="upper left", bbox_to_anchor=(0.005, 0.86), ncol=2,
+    fig.legend(handles, [e[0] for e in entries], loc="upper left", bbox_to_anchor=(0.005, 0.87), ncol=3,
                frameon=False, fontsize=8.5, labelcolor=t["ink2"], handlelength=1.2, columnspacing=1.8)
-    fig.text(0.01, 0.975, "Many prompts at once: our kernel beats FlashAttention", ha="left", va="top",
-             fontsize=13, fontweight="bold", color=t["ink"])
-    fig.text(0.01, 0.91, "Prompts prefilled together, as the engine's whole-prompt policy does. Timed as the engine "
-             "runs it, launch costs included.", ha="left", va="top", fontsize=9.5, color=t["ink2"])
-    fig.subplots_adjust(left=0.12, right=0.985, top=0.74, bottom=0.13)
+    fig.text(0.01, 0.975, "Many prompts at once: one launch beats a loop; our kernel ties FlashAttention varlen",
+             ha="left", va="top", fontsize=13, fontweight="bold", color=t["ink"])
+    fig.text(0.01, 0.915, "Prompts prefilled together, as the engine's whole-prompt policy does. Launch costs "
+             "included; the three methods are timed in turn each round.", ha="left", va="top", fontsize=9.5,
+             color=t["ink2"])
+    fig.subplots_adjust(left=0.12, right=0.985, top=0.76, bottom=0.12)
     return fig
 
 
