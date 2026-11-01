@@ -53,6 +53,28 @@ Median of 3 runs:
 | 16k | Chunked 512 | 218 ms | 205 ms | 272 | 4.64 s | 11.01 s |
 | 16k | Adaptive | **159 ms** | 145 ms | 392 | 5.73 s | 11.59 s |
 
+**What the engine was doing.** While the long prompt is read, 9 requests are active: **8 decoding + 1 prefilling**. Each step's work:
+
+| Long prompt | Policy | Steps with prompt work | Prompt tokens per step (min / median / max) | Decode tokens in those steps |
+|---|---|---|---|---|
+| 2k | Standard | 1 | 2,048 | 0 (decode waits) |
+| 2k | Chunked 512 | 5 | 32 / 504 / 504 | 8 |
+| 2k | Adaptive | 3 | 320 / 816 / 912 | 8 |
+| 8k | Standard | 1 | 8,192 | 0 |
+| 8k | Chunked 512 | 17 | 128 / 504 / 504 | 8 |
+| 8k | Adaptive | 15 | 192 / 512 / 912 | 8 |
+| 16k | Standard | 1 | 16,384 | 0 |
+| 16k | Chunked 512 | 33 | 256 / 504 / 504 | 8 |
+| 16k | Adaptive | 48 | 144 / 288 / 944 | 8 |
+
+- **Standard** runs the whole prompt as one step with no decode tokens, then goes back to decode-only steps.
+- **Chunked 512:**
+  - every step has 8 decode tokens and 504 prompt tokens (512 in total);
+  - the last chunk is whatever is left (32, 128 or 256 tokens).
+- **Adaptive:**
+  - starts with big chunks (800–950 tokens) and makes them smaller as the prompt's earlier part grows;
+  - at 16k the median chunk is only 288 tokens, so it needs 48 steps instead of 33.
+
 - **The typical wait doesn't change:** 23 ms per token for all policies, because most steps have no prompt work.
 - **The worst wait is what changes.** Standard grows with the prompt (279 ms → 3.4 s). Adaptive stays at about 160 ms whatever the prompt size.
 - **"16 chat tokens" with standard** are just the 2 tokens each user got at the edges of the freeze; in between, nothing.
@@ -131,6 +153,16 @@ The test above has one long prompt and identical chat users. Real traffic is mes
 | First token, medium prompts: median / p90 | **432 ms / 1.5 s** | 661 ms / 3.5 s | 638 ms / 2.7 s |
 | First token, the 2 long prompts (median) | **2.7 s** | 8.7 s | 6.8 s |
 | Throughput | **244 tok/s** | 218 tok/s | 230 tok/s |
+
+**How busy the engine was** (sampled every 50 ms, last run):
+
+| Policy | Requests decoding: average / peak | Requests waiting for their first token (queued or prefilling): average / peak |
+|---|---|---|
+| Standard | 15.8 / 30 | 1.1 / 7 |
+| Chunked 512 | 16.3 / 26 | 0.9 / 4 |
+| Adaptive | 15.7 / 26 | 0.8 / 5 |
+
+About 16 requests were decoding at any moment, up to 26–30 at the busiest point. Standard had up to 7 requests waiting for a first token at once: the short prompts stuck behind a long one.
 
 What it shows:
 
