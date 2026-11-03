@@ -40,7 +40,7 @@ def main():
     bundle = load_qwen_fp8(fp8_kernel_path="sm89")
     model = bundle.model
     workload = build_hf_workload(
-        bundle.tokenizer, project / "data/synthetic/workloads_v1.jsonl",
+        bundle.tokenizer, project / "benchmarks/data/synthetic/workloads_v1.jsonl",
         bucket_name="diagnostic", prompt_tokens=args.prompt_tokens,
         output_tokens=args.output_tokens, count=4, seed=17,
     )

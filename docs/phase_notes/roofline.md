@@ -92,7 +92,7 @@ Attention (FlashAttention, BF16) becomes compute-bound past about 1,000 tokens a
 
   ```bash
   .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_roofline --output-dir minillm_l4/results/roofline_<date>
-  .conda-env/bin/python minillm_l4/scripts/make_roofline_charts.py minillm_l4/results/roofline_<date>/roofline.json minillm_l4/docs/assets/roofline
+  .conda-env/bin/python minillm_l4/benchmarks/charts/make_roofline_charts.py minillm_l4/results/roofline_<date>/roofline.json minillm_l4/docs/assets/roofline
   ```
 - **Timing:** prefill TTFT p50 (one request) and decode step p50 (CUDA Graphs, 64 tokens). 1 warm-up and 3 measured runs, before any profiler session.
 - **GPU time per category:** `torch.profiler` kernel time, grouped by kernel name. A prefill is one prompt + 1 token run. A decode step is the difference of a (prompt + 17) and a (prompt + 1) run, divided by 16.

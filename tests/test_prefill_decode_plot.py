@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from minillm_l4.benchmarks.plots.prefill_decode import (
+from minillm_l4.benchmarks.charts.prefill_decode import (
     load_context_metrics,
     validate_context_comparison,
 )

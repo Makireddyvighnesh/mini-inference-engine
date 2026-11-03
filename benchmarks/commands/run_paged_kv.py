@@ -32,11 +32,11 @@ from minillm_l4.benchmarks.runners.paged_kv import (
 from minillm_l4.benchmarks.runners.packed_paged import (
     PackedPagedPrefillBatchRunner,
 )
-from minillm_l4.configs.loader import load_yaml_config
+from minillm_l4.benchmarks.configs.loader import load_yaml_config
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CONFIG = PROJECT_ROOT / "configs/workloads/qwen3_fp8_paged.yaml"
+DEFAULT_CONFIG = PROJECT_ROOT / "benchmarks/configs/workloads/qwen3_fp8_paged.yaml"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "results/paged_kv"
 DEFAULT_REFERENCE_DIR = PROJECT_ROOT / "results/phase1/references_baseline"
 

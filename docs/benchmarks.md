@@ -341,7 +341,7 @@ turns, one every 300 ms)
 
 Deeper studies (prompt lengths 128-8192 with batch sizes 1-16, decode
 interference per arriving prompt, chunk-size sweeps) are in
-[../benchmark_results/](../benchmark_results/README.md).
+[archive/](archive/README.md).
 
 </details>
 
@@ -355,13 +355,13 @@ Run from the repository root that contains `minillm_l4/`:
     --output-dir minillm_l4/results/showcase_$(date +%Y%m%d)
 
 # README charts (light and dark SVG)
-.conda-env/bin/python minillm_l4/scripts/make_showcase_charts.py \
+.conda-env/bin/python minillm_l4/benchmarks/charts/make_showcase_charts.py \
     minillm_l4/results/showcase_<date>/showcase.json minillm_l4/assets/showcase
 
 # Eager vs CUDA Graph comparison, and its charts
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_cuda_graphs \
     --output-dir minillm_l4/results/cuda_graphs_$(date +%Y%m%d)
-.conda-env/bin/python minillm_l4/scripts/make_cuda_graph_charts.py \
+.conda-env/bin/python minillm_l4/benchmarks/charts/make_cuda_graph_charts.py \
     minillm_l4/results/cuda_graphs_<date>/cuda_graphs.json minillm_l4/assets/cuda_graphs
 
 # Unfused vs fused kernels (per op and end to end)
@@ -373,7 +373,7 @@ Run from the repository root that contains `minillm_l4/`:
     --output-dir minillm_l4/results/chunked_vs_standard_$(date +%Y%m%d)
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_chunked_vs_standard --workload mixed \
     --output-dir minillm_l4/results/chunked_vs_standard_mixed_$(date +%Y%m%d)
-.conda-env/bin/python minillm_l4/scripts/make_chunked_vs_standard_charts.py \
+.conda-env/bin/python minillm_l4/benchmarks/charts/make_chunked_vs_standard_charts.py \
     minillm_l4/results/chunked_vs_standard_<date>/chunked_vs_standard.json minillm_l4/assets/chunked_vs_standard
 
 # Attention: naive vs SDPA vs FlashAttention vs our kernels

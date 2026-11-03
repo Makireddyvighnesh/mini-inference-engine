@@ -10,7 +10,7 @@ Command (about 12 minutes):
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_decode_breakdown --output-dir minillm_l4/results/decode_breakdown_<date>
-.conda-env/bin/python minillm_l4/scripts/make_decode_breakdown_charts.py minillm_l4/results/decode_breakdown_<date>/decode_breakdown.json minillm_l4/docs/assets/decode_breakdown
+.conda-env/bin/python minillm_l4/benchmarks/charts/make_decode_breakdown_charts.py minillm_l4/results/decode_breakdown_<date>/decode_breakdown.json minillm_l4/docs/assets/decode_breakdown
 ```
 
 Method:

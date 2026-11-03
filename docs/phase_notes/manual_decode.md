@@ -31,7 +31,7 @@ backends use the same request, workload, event, and result contracts.
   - Loads the pinned Qwen checkpoint from YAML configuration.
   - Runs the manual backend matrix.
   - Checks outputs against the Phase 1 reference corpus.
-- minillm_l4/configs/workloads/qwen3_fp8_manual.yaml
+- minillm_l4/benchmarks/configs/workloads/qwen3_fp8_manual.yaml
   - Pins the Qwen model, native FP8 path, workload shapes, and manual runner.
 
 ## Architecture
@@ -95,7 +95,7 @@ Phase 1 re-run (`results/phase1_20260926`):
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_manual_decode \
-  --config minillm_l4/configs/workloads/qwen3_fp8_manual.yaml \
+  --config minillm_l4/benchmarks/configs/workloads/qwen3_fp8_manual.yaml \
   --output-dir minillm_l4/results/manual_decode_20260926
 ```
 

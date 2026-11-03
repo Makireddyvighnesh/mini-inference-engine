@@ -95,7 +95,7 @@ def main() -> None:
     )
     workload = build_hf_workload(
         bundle.tokenizer,
-        PROJECT_ROOT / "data/synthetic/workloads_v1.jsonl",
+        PROJECT_ROOT / "benchmarks/data/synthetic/workloads_v1.jsonl",
         bucket_name=bucket[0],
         prompt_tokens=bucket[1],
         output_tokens=args.output_tokens,

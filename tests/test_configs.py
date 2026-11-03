@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from minillm_l4.configs import load_yaml_config
+from minillm_l4.benchmarks.configs import load_yaml_config
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -23,7 +23,7 @@ def test_project_workload_configs_are_yaml_and_validate() -> None:
         ("qwen3_fp8_phase_sweep.yaml", 8),
     )
     for filename, expected_phase in configurations:
-        path = PROJECT_ROOT / "configs" / "workloads" / filename
+        path = PROJECT_ROOT / "benchmarks" / "configs" / "workloads" / filename
         payload = load_yaml_config(path, expected_phase=expected_phase)
         assert payload["project"] == "MiniLLM-L4"
         assert payload["phase"] == expected_phase
@@ -31,7 +31,7 @@ def test_project_workload_configs_are_yaml_and_validate() -> None:
 
 def test_kv_cache_config_selects_both_reference_paths() -> None:
     payload = load_yaml_config(
-        PROJECT_ROOT / "configs/workloads/qwen3_fp8_kv_cache.yaml",
+        PROJECT_ROOT / "benchmarks/configs/workloads/qwen3_fp8_kv_cache.yaml",
         expected_phase=3,
     )
 
@@ -41,7 +41,7 @@ def test_kv_cache_config_selects_both_reference_paths() -> None:
 
 def test_continuous_config_selects_iteration_scheduler() -> None:
     payload = load_yaml_config(
-        PROJECT_ROOT / "configs/workloads/qwen3_fp8_continuous.yaml",
+        PROJECT_ROOT / "benchmarks/configs/workloads/qwen3_fp8_continuous.yaml",
         expected_phase=5,
     )
 
@@ -52,7 +52,7 @@ def test_continuous_config_selects_iteration_scheduler() -> None:
 
 def test_stress_configs_define_capacity_matrices() -> None:
     payload = load_yaml_config(
-        PROJECT_ROOT / "configs/workloads/qwen3_fp8_stress.yaml",
+        PROJECT_ROOT / "benchmarks/configs/workloads/qwen3_fp8_stress.yaml",
         expected_phase=5,
     )
     assert payload["stress"]["concurrency"]["max_batch_sizes"] == [1, 2, 4, 8, 16]
@@ -71,7 +71,7 @@ def test_stress_configs_define_capacity_matrices() -> None:
 
 def test_paged_config_selects_fixed_block_storage() -> None:
     payload = load_yaml_config(
-        PROJECT_ROOT / "configs/workloads/qwen3_fp8_paged.yaml",
+        PROJECT_ROOT / "benchmarks/configs/workloads/qwen3_fp8_paged.yaml",
         expected_phase=6,
     )
 
@@ -85,7 +85,7 @@ def test_paged_config_selects_fixed_block_storage() -> None:
 
 def test_long_context_paged_config_covers_both_extended_prompt_buckets() -> None:
     payload = load_yaml_config(
-        PROJECT_ROOT / "configs/workloads/qwen3_fp8_long_context.yaml",
+        PROJECT_ROOT / "benchmarks/configs/workloads/qwen3_fp8_long_context.yaml",
         expected_phase=6,
     )
 

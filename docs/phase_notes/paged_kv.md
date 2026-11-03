@@ -207,7 +207,7 @@ no-padding prefill against independent greedy generation.
 ## Benchmark configuration
 
 The reproducible configuration is
-`configs/workloads/qwen3_fp8_paged.yaml`. It pins the Qwen3 FP8 model and
+`benchmarks/configs/workloads/qwen3_fp8_paged.yaml`. It pins the Qwen3 FP8 model and
 sweeps block sizes 8, 16, 32, and 64 while holding total physical capacity at
 32,768 token slots. The default compares the contiguous runner with optimized
 prefill plus direct paged decode over 128-, 512-, and 2,048-token prompts and
@@ -219,7 +219,7 @@ Run it on the L4 with:
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_paged_kv \
-  --config minillm_l4/configs/workloads/qwen3_fp8_paged.yaml \
+  --config minillm_l4/benchmarks/configs/workloads/qwen3_fp8_paged.yaml \
   --workload all \
   --output-dir minillm_l4/results/paged_kv
 ```
@@ -460,7 +460,7 @@ the result JSON:
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_paged_kv \
-  --config minillm_l4/configs/workloads/qwen3_fp8_paged.yaml \
+  --config minillm_l4/benchmarks/configs/workloads/qwen3_fp8_paged.yaml \
   --workload short \
   --modes paged_packed \
   --block-sizes 32 \
@@ -598,7 +598,7 @@ Reproduction:
 ```bash
 MINILLM_RUN_MODEL_TESTS=1 .conda-env/bin/python -m pytest minillm_l4/tests -q
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_paged_kv \
-  --config minillm_l4/configs/workloads/qwen3_fp8_paged.yaml \
+  --config minillm_l4/benchmarks/configs/workloads/qwen3_fp8_paged.yaml \
   --workload all --modes contiguous paged_hybrid paged_graph \
   --block-sizes 16 --batch-sizes 1 2 4 --graph-prefill-backend dense \
   --repetitions 3 --warmup-repetitions 1 \
@@ -730,10 +730,10 @@ points pass.
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_paged_kv \
-  --config minillm_l4/configs/workloads/qwen3_fp8_paged.yaml \
+  --config minillm_l4/benchmarks/configs/workloads/qwen3_fp8_paged.yaml \
   --workload all --output-dir minillm_l4/results/paged_kv_20260928_fp32qk
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_paged_kv \
-  --config minillm_l4/configs/workloads/qwen3_fp8_paged.yaml \
+  --config minillm_l4/benchmarks/configs/workloads/qwen3_fp8_paged.yaml \
   --workload all --modes paged_packed --block-sizes 16 \
   --output-dir minillm_l4/results/paged_packed_20260928_fp32qk
 ```

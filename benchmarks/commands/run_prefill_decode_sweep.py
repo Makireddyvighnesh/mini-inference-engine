@@ -27,7 +27,7 @@ from minillm_l4.benchmarks.runners.chunked_prefill import ChunkedPrefillPagedRun
 from minillm_l4.benchmarks.runners.huggingface_baseline import MODEL_ID, MODEL_REVISION, load_qwen_fp8
 from minillm_l4.benchmarks.runners.manual_decode import ManualGreedyBatchRunner
 from minillm_l4.benchmarks.runners.phase_sweep import MeteredRunner, StaticPagedBatchRunner, StaticPagedTraceRunner
-from minillm_l4.configs.loader import load_yaml_config
+from minillm_l4.benchmarks.configs.loader import load_yaml_config
 from minillm_l4.engine.generation.huggingface import transformers_greedy_generate
 from .run_chunked_prefill import snapshot_sources
 from .run_concurrent_requests import PROJECT_ROOT
@@ -48,7 +48,7 @@ ADMISSION_POLICIES = ("capped", "resource")
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "configs/workloads/qwen3_fp8_phase_sweep.yaml")
+    parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "benchmarks/configs/workloads/qwen3_fp8_phase_sweep.yaml")
     parser.add_argument("--prompt-lengths", type=int, nargs="+")
     parser.add_argument("--generation-lengths", type=int, nargs="+")
     parser.add_argument("--batch-sizes", type=int, nargs="+")

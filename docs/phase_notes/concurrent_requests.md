@@ -22,7 +22,7 @@ batching a clear static baseline.
   lifecycle events, KV cleanup, padding accounting, and reference validation.
 - `benchmarks/commands/run_concurrent_requests.py`: reproducible uniform/mixed
   workloads and maximum-batch-size sweeps.
-- `configs/workloads/qwen3_fp8_concurrent.yaml`: pinned model, workload,
+- `benchmarks/configs/workloads/qwen3_fp8_concurrent.yaml`: pinned model, workload,
   scheduler, repetition, and telemetry settings.
 
 ## Architecture
@@ -94,7 +94,7 @@ check across three measured traces.
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_concurrent_requests \
-  --config minillm_l4/configs/workloads/qwen3_fp8_concurrent.yaml \
+  --config minillm_l4/benchmarks/configs/workloads/qwen3_fp8_concurrent.yaml \
   --workload mixed \
   --max-batch-sizes 1 2 4 \
   --count-per-bucket 1 \

@@ -30,7 +30,7 @@ from minillm_l4.engine.kv_cache.paged import PagedKvAllocator, PagedKvOutOfMemor
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_OUTPUT = PROJECT_ROOT / "results/kv_capacity/kv_capacity.json"
-# Prompt/output shapes from configs/workloads/qwen3_fp8_paged.yaml.
+# Prompt/output shapes from benchmarks/configs/workloads/qwen3_fp8_paged.yaml.
 PHASE6_SHAPES: tuple[tuple[int, int], ...] = ((128, 32), (512, 64), (2048, 128))
 
 

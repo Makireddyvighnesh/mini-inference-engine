@@ -30,7 +30,7 @@ capacity methodology and raw-result locations are recorded in
   - Reuses the Phase 4 workload materialization and Phase 1 reference corpus.
   - Writes raw results, event JSONL, scheduler summaries, and a checkpointed
     manifest.
-- `configs/workloads/qwen3_fp8_continuous.yaml`
+- `benchmarks/configs/workloads/qwen3_fp8_continuous.yaml`
   - Pins the Qwen revision, arrival pattern, prefill budget, wait window,
     repetitions, and telemetry policy.
 
@@ -101,7 +101,7 @@ stress cases also matched exact reference token prefixes.
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_continuous_requests \
-  --config minillm_l4/configs/workloads/qwen3_fp8_continuous.yaml \
+  --config minillm_l4/benchmarks/configs/workloads/qwen3_fp8_continuous.yaml \
   --workload all \
   --max-batch-sizes 1 2 4 \
   --reference-dir minillm_l4/results/phase1/references_baseline \
@@ -118,7 +118,7 @@ Run the capacity matrix with:
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_capacity_stress \
-  --config minillm_l4/configs/workloads/qwen3_fp8_stress.yaml \
+  --config minillm_l4/benchmarks/configs/workloads/qwen3_fp8_stress.yaml \
   --scenario all \
   --output-dir minillm_l4/results/capacity_stress
 ```
@@ -132,7 +132,7 @@ while changing only the arrival policy, for example:
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_continuous_requests \
-  --config minillm_l4/configs/workloads/qwen3_fp8_continuous.yaml \
+  --config minillm_l4/benchmarks/configs/workloads/qwen3_fp8_continuous.yaml \
   --workload mixed \
   --arrival-pattern poisson \
   --arrival-rate-per-second 40 \

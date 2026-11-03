@@ -33,7 +33,7 @@ the default behavior of the earlier Phase 7 runner is preserved.
 ## Benchmark
 
 The YAML configuration is
-[`qwen3_fp8_chunked.yaml`](../../configs/workloads/qwen3_fp8_chunked.yaml).
+[`qwen3_fp8_chunked.yaml`](../../benchmarks/configs/workloads/qwen3_fp8_chunked.yaml).
 It pins the Qwen3 FP8 revision and `sm89` projections, uses four short requests
 and a separate six-request mixed trace, and compares the unchunked control
 against chunk sizes 128 and 256. All cases share arrivals, output limits,
@@ -56,7 +56,7 @@ oversized whole prompt when decoding is idle, matching the earlier admission
 rule. Positive chunk sizes always respect the budget, even when idle.
 
 Default output paths are unique UTC-dated directories in `results/` and
-Markdown reports in `benchmark_results/`. Existing nonempty output directories
+Markdown reports in `docs/archive/`. Existing nonempty output directories
 and existing report files are rejected. Each run saves resolved configuration,
 model/environment identity, JSON results, raw JSONL events, scheduler records,
 and latency/throughput/telemetry summaries. `source_snapshot/` includes the
@@ -145,7 +145,7 @@ This satisfies the Phase 8 checkpoint for the saved corpus and default
 setting or establish production tail-latency guarantees. The remaining
 numerical mismatch is retained as follow-up work.
 
-Full results: [Phase 8 measurements](../../benchmark_results/phase_08_chunked_prefill_20261003.md).
+Full results: [Phase 8 measurements](../archive/phase_08_chunked_prefill_20261003.md).
 Raw JSON, events, source snapshot, and configuration are in
 `results/phase8_chunked_prefill_final_20261003/`.
 
@@ -163,7 +163,7 @@ rises from 64.98 to 136.20 ms. This confirms the earlier checkpoint's
 throughput/TTFT benefit and token-gap trade-off. The extended sweep is deferred,
 with its existing raw results preserved.
 
-Results: [focused Phase 8 confirmation](../../benchmark_results/phase_08_focused_20261004.md).
+Results: [focused Phase 8 confirmation](../archive/phase_08_focused_20261004.md).
 Raw evidence: `results/phase8_focused_20261004/`.
 
 ## 2026-10-05 expanded-corpus limits
@@ -186,7 +186,7 @@ The earlier checkpoint remains scoped to its original corpus.
 Passing comparisons show chunking benefits at active limits 4/8, but losses
 at lower concurrency with long prompts, as well as increased P95 token gaps.
 Full analysis and fresh replay evidence:
-[extended sweep interpretation](../../benchmark_results/prefill_decode_analysis_20261005.md).
+[extended sweep interpretation](../archive/prefill_decode_analysis_20261005.md).
 
 ## 2026-10-07 resource admission, flattened prefill, and mixed batching
 
@@ -313,8 +313,8 @@ Transformers forward plus page copy.
 ### Results
 
 Prefill-only TTFT (`benchmarks/commands/run_prefill_ttft.py`, 3 measured runs;
-full tables in `benchmark_results/prefill_ttft_20261007.md` and
-`benchmark_results/adaptive_chunking_20261007.md`):
+full tables in `docs/archive/prefill_ttft_20261007.md` and
+`docs/archive/adaptive_chunking_20261007.md`):
 
 | Prompt tokens (one prompt) | 128 | 256 | 512 | 1024 | 2048 | 4096 | 8192 |
 |---|---|---|---|---|---|---|---|

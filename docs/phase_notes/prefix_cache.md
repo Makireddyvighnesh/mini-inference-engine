@@ -49,7 +49,7 @@ empty prefix cache; the first shared-prefix request is therefore cold.
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_prefix_trace \
-  --config minillm_l4/configs/workloads/qwen3_fp8_prefix.yaml \
+  --config minillm_l4/benchmarks/configs/workloads/qwen3_fp8_prefix.yaml \
   --output-dir minillm_l4/results/prefix_cache/continuous
 ```
 
@@ -198,7 +198,7 @@ New tests: `test_attach_counts_hits_only_when_the_request_is_admitted`,
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_prefix_trace \
-  --config minillm_l4/configs/workloads/qwen3_fp8_prefix.yaml \
+  --config minillm_l4/benchmarks/configs/workloads/qwen3_fp8_prefix.yaml \
   --output-dir minillm_l4/results/prefix_trace_20260929
 ```
 

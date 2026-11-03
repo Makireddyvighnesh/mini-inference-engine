@@ -91,7 +91,7 @@ Example: 32 requests × 2,048 tokens = 65,536 tokens. 65,536 ÷ 6,500 ≈ 10 s. 
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_ttft_anatomy --output-dir minillm_l4/results/ttft_anatomy_<date>
-.conda-env/bin/python minillm_l4/scripts/make_ttft_anatomy_charts.py minillm_l4/results/ttft_anatomy_<date>/ttft_anatomy.json minillm_l4/docs/assets/ttft_anatomy
+.conda-env/bin/python minillm_l4/benchmarks/charts/make_ttft_anatomy_charts.py minillm_l4/results/ttft_anatomy_<date>/ttft_anatomy.json minillm_l4/docs/assets/ttft_anatomy
 ```
 
 - **Requests and runs:** all requests arrive at the same moment, each prompt has the same length, and each request generates 16 tokens. Every case ran once to warm up and 3 times for real (about 20 minutes in total).

@@ -187,10 +187,10 @@ This is one run of one random trace, so small differences (a few percent) are wi
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_chunked_vs_standard --output-dir minillm_l4/results/chunked_vs_standard_<date>
-.conda-env/bin/python minillm_l4/scripts/make_chunked_vs_standard_charts.py minillm_l4/results/chunked_vs_standard_<date>/chunked_vs_standard.json minillm_l4/docs/assets/chunked_vs_standard
+.conda-env/bin/python minillm_l4/benchmarks/charts/make_chunked_vs_standard_charts.py minillm_l4/results/chunked_vs_standard_<date>/chunked_vs_standard.json minillm_l4/docs/assets/chunked_vs_standard
 # real-world mix
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_chunked_vs_standard --workload mixed --output-dir minillm_l4/results/chunked_vs_standard_mixed_<date>
-.conda-env/bin/python minillm_l4/scripts/make_chunked_vs_standard_charts.py minillm_l4/results/chunked_vs_standard_mixed_<date>/chunked_vs_standard.json minillm_l4/docs/assets/chunked_vs_standard
+.conda-env/bin/python minillm_l4/benchmarks/charts/make_chunked_vs_standard_charts.py minillm_l4/results/chunked_vs_standard_mixed_<date>/chunked_vs_standard.json minillm_l4/docs/assets/chunked_vs_standard
 ```
 
 - **Model and settings:** Qwen3-4B FP8 on one NVIDIA L4, 2026-11-01. CUDA Graph decode, fused kernels and merged projections for every policy; no prefix cache; no HF reference check.

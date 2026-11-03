@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from minillm_l4.benchmarks.plots.concurrency_stress import load_stress_metrics
+from minillm_l4.benchmarks.charts.concurrency_stress import load_stress_metrics
 
 
 def _entry(batch_size: int, *, correctness: str = "pass") -> dict:

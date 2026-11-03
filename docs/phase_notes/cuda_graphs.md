@@ -161,7 +161,7 @@ cd /home/ubuntu/STT/LLMPerfLab
 MINILLM_RUN_MODEL_TESTS=1 .conda-env/bin/python -m pytest -q minillm_l4/tests
 .conda-env/bin/python minillm_l4/scripts/check_policy_equivalence.py
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_cuda_graphs --output-dir minillm_l4/results/cuda_graphs_20261008_review
-.conda-env/bin/python minillm_l4/scripts/make_cuda_graph_charts.py minillm_l4/results/cuda_graphs_20261008_review/cuda_graphs.json minillm_l4/docs/assets/cuda_graphs
+.conda-env/bin/python minillm_l4/benchmarks/charts/make_cuda_graph_charts.py minillm_l4/results/cuda_graphs_20261008_review/cuda_graphs.json minillm_l4/docs/assets/cuda_graphs
 ```
 
 The CUDA-only scheduler tests compare tiny-model eager/graph outputs, page
@@ -233,7 +233,7 @@ occurs; it should show comparable prefill timing honestly.
 | **`engine/kv_cache/qwen3_paged.py`** | **Engine change:** opt-in `paged_decode_graph` flag removes graph-only allocator-ID/reservation lookups and requires capture-safe writer/attention contracts. Default false leaves eager validation, ownership checks, writers, and kernel math unchanged. |
 | `scripts/check_policy_equivalence.py` | Required graph variants, both split orders, complete-output and actual-replay checks. |
 | `benchmarks/commands/run_cuda_graphs.py` | Matched one-session workload matrix, raw/aggregate JSON, telemetry, runner cleanup. |
-| `scripts/make_cuda_graph_charts.py` | Light/dark comparison SVGs using showcase style. |
+| `benchmarks/charts/make_cuda_graph_charts.py` | Light/dark comparison SVGs using showcase style. |
 | `tests/test_serving_cuda_graphs.py` | CPU bucket/packing/option/fallback/split/cleanup tests and CUDA-only scheduler exactness tests. |
 | `tests/test_cuda_graph_benchmark.py` | Metric definitions, benchmark case matrix/export/cleanup, CPU refusal, and SVG smoke checks. |
 | `docs/phase_notes/cuda_graphs.md` | Design, safety audit, commands, reporting definitions, and reviewer results placeholders. |

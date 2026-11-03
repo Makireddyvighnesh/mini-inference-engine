@@ -107,7 +107,7 @@ minillm_l4/
 ```
 
 The deterministic synthetic workload is versioned under
-`data/synthetic/workloads_v1.jsonl`. Model weights remain in the Hugging Face
+`benchmarks/data/synthetic/workloads_v1.jsonl`. Model weights remain in the Hugging Face
 cache and are never copied into the project.
 
 Project configuration is YAML. Generated benchmark results and event streams
@@ -131,7 +131,7 @@ Compare chunked and unchunked prefill on identical scheduled traffic:
 ```
 
 This command uses the existing exact-token references and saves dated raw
-results, a source snapshot, and a Markdown report under `benchmark_results/`.
+results, a source snapshot, and a Markdown report under `docs/archive/`.
 See the [chunked-prefill note](phase_notes/chunked_prefill.md) for scheduling
 behavior, timing boundaries, correctness gates, and validation limits.
 
@@ -145,7 +145,7 @@ Run the harness fixture:
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_harness \
-  --config minillm_l4/configs/workloads/minillm_l4_harness.yaml \
+  --config minillm_l4/benchmarks/configs/workloads/minillm_l4_harness.yaml \
   --output-dir minillm_l4/results/phase0
 ```
 
@@ -153,7 +153,7 @@ Run the full Hugging Face baseline matrix on the L4:
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_hf_baseline \
-  --config minillm_l4/configs/workloads/qwen3_fp8_baseline.yaml \
+  --config minillm_l4/benchmarks/configs/workloads/qwen3_fp8_baseline.yaml \
   --output-dir minillm_l4/results/phase1
 ```
 
@@ -181,13 +181,13 @@ baseline results, and current limits.
 
 Run the manual decoder against the Phase 1 reference corpus:
 
-    .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_manual_decode --config minillm_l4/configs/workloads/qwen3_fp8_manual.yaml --output-dir minillm_l4/results/manual_decode
+    .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_manual_decode --config minillm_l4/benchmarks/configs/workloads/qwen3_fp8_manual.yaml --output-dir minillm_l4/results/manual_decode
 
 Compare contiguous KV reuse with full-prefix recomputation:
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_kv_cache \
-  --config minillm_l4/configs/workloads/qwen3_fp8_kv_cache.yaml \
+  --config minillm_l4/benchmarks/configs/workloads/qwen3_fp8_kv_cache.yaml \
   --workload short \
   --output-dir minillm_l4/results/kv_cache
 ```
@@ -196,7 +196,7 @@ Run staggered uniform and mixed request traces:
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_concurrent_requests \
-  --config minillm_l4/configs/workloads/qwen3_fp8_concurrent.yaml \
+  --config minillm_l4/benchmarks/configs/workloads/qwen3_fp8_concurrent.yaml \
   --workload all \
   --max-batch-sizes 1 2 4 \
   --output-dir minillm_l4/results/concurrent_requests
@@ -206,7 +206,7 @@ Run the Phase 5 continuous-batching comparison:
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_continuous_requests \
-  --config minillm_l4/configs/workloads/qwen3_fp8_continuous.yaml \
+  --config minillm_l4/benchmarks/configs/workloads/qwen3_fp8_continuous.yaml \
   --workload all \
   --max-batch-sizes 1 2 4 \
   --output-dir minillm_l4/results/continuous_requests
@@ -216,7 +216,7 @@ Run the Phase 6 contiguous-versus-paged sweep on a CUDA-enabled L4:
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_paged_kv \
-  --config minillm_l4/configs/workloads/qwen3_fp8_paged.yaml \
+  --config minillm_l4/benchmarks/configs/workloads/qwen3_fp8_paged.yaml \
   --workload all \
   --output-dir minillm_l4/results/paged_kv
 ```
@@ -276,7 +276,7 @@ For a packed-prefill smoke test on the L4:
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_paged_kv \
-  --config minillm_l4/configs/workloads/qwen3_fp8_paged.yaml \
+  --config minillm_l4/benchmarks/configs/workloads/qwen3_fp8_paged.yaml \
   --workload short \
   --modes paged_packed \
   --block-sizes 32 \
@@ -300,7 +300,7 @@ For a focused batch-1 graph comparison:
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_paged_kv \
-  --config minillm_l4/configs/workloads/qwen3_fp8_paged.yaml \
+  --config minillm_l4/benchmarks/configs/workloads/qwen3_fp8_paged.yaml \
   --workload short \
   --modes paged_packed paged_graph \
   --block-sizes 32 \
@@ -322,7 +322,7 @@ For a quick correctness-focused run:
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_continuous_requests \
-  --config minillm_l4/configs/workloads/qwen3_fp8_continuous.yaml \
+  --config minillm_l4/benchmarks/configs/workloads/qwen3_fp8_continuous.yaml \
   --workload mixed \
   --max-batch-sizes 2 \
   --count-per-bucket 1 \
@@ -336,7 +336,7 @@ Plot prefill and decode latency over 128, 512, and 2,048-token prompts:
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_manual_decode \
-  --config minillm_l4/configs/workloads/qwen3_fp8_manual.yaml \
+  --config minillm_l4/benchmarks/configs/workloads/qwen3_fp8_manual.yaml \
   --workload all \
   --batch-sizes 1 \
   --count 1 \
@@ -346,7 +346,7 @@ Plot prefill and decode latency over 128, 512, and 2,048-token prompts:
   --reference-dir minillm_l4/results/phase1/references_baseline \
   --output-dir minillm_l4/results/manual_context_fixed
 
-.conda-env/bin/python -m minillm_l4.benchmarks.plots.prefill_decode \
+.conda-env/bin/python -m minillm_l4.benchmarks.charts.prefill_decode \
   --manifest minillm_l4/results/manual_context_fixed/manual_manifest.json \
   --batch-size 1 \
   --output minillm_l4/results/figures/prefill_decode_context.png
@@ -359,7 +359,7 @@ Run the larger Phase 4 static-batching stress test and generate its report:
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_concurrent_requests \
-  --config minillm_l4/configs/workloads/qwen3_fp8_concurrent.yaml \
+  --config minillm_l4/benchmarks/configs/workloads/qwen3_fp8_concurrent.yaml \
   --workload mixed \
   --max-batch-sizes 4 8 16 \
   --count-per-bucket 4 \
@@ -370,7 +370,7 @@ Run the larger Phase 4 static-batching stress test and generate its report:
   --output-dir minillm_l4/results/stress_batch_final \
   --no-system-telemetry
 
-.conda-env/bin/python -m minillm_l4.benchmarks.plots.concurrency_stress \
+.conda-env/bin/python -m minillm_l4.benchmarks.charts.concurrency_stress \
   --manifest minillm_l4/results/stress_batch_final/concurrent_manifest.json \
   --workload mixed \
   --output minillm_l4/results/figures/concurrency_stress_final.png

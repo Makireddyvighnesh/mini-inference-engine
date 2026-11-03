@@ -41,7 +41,7 @@ def _tokens(result):
 def real_model():
     bundle = load_qwen_fp8(fp8_kernel_path="sm89")
     workload = build_hf_workload(
-        bundle.tokenizer, Path(__file__).resolve().parents[1] / "data/synthetic/workloads_v1.jsonl",
+        bundle.tokenizer, Path(__file__).resolve().parents[1] / "benchmarks/data/synthetic/workloads_v1.jsonl",
         bucket_name="short", prompt_tokens=128, output_tokens=32, count=4, seed=17,
     )
     reference = _harness().run_batched(

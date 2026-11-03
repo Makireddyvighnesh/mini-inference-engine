@@ -9,7 +9,7 @@ from minillm_l4.benchmarks.core.harness import BenchmarkHarness
 from minillm_l4.benchmarks.core.schemas import HarnessConfig, RequestSpec, WorkloadSpec
 from minillm_l4.benchmarks.runners.continuous_prefix import ContinuousPrefixPagedRunner
 from minillm_l4.benchmarks.commands.run_prefix_trace import build_shared_prefix_workload
-from minillm_l4.configs.loader import load_yaml_config
+from minillm_l4.benchmarks.configs.loader import load_yaml_config
 from minillm_l4.engine.generation.manual import manual_greedy_generate
 from minillm_l4.engine.scheduler import ContinuousBatchScheduler, ScheduledRequest
 
@@ -174,7 +174,7 @@ def test_shared_prefix_workload_is_deterministic_and_respects_reuse_rate() -> No
 def test_prefix_benchmark_yaml_loads() -> None:
     from pathlib import Path
 
-    config = Path(__file__).resolve().parents[1] / "configs/workloads/qwen3_fp8_prefix.yaml"
+    config = Path(__file__).resolve().parents[1] / "benchmarks/configs/workloads/qwen3_fp8_prefix.yaml"
     payload = load_yaml_config(config, expected_phase=7)
     assert payload["workload"]["reuse_rates"] == [0.0, 0.5, 1.0]
 

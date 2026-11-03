@@ -32,7 +32,7 @@ this phase.
 - `minillm_l4/benchmarks/core/harness.py`
   - Adds `run_batched()` while preserving the original sequential `run()` API.
   - Keeps request-level metric definitions identical across Phase 0 and Phase 1.
-- `minillm_l4/configs/workloads/qwen3_fp8_baseline.yaml`
+- `minillm_l4/benchmarks/configs/workloads/qwen3_fp8_baseline.yaml`
   - Pins the model, revision, native FP8 precision, workload shapes, batch
     sizes, warm-up count, repetitions, and telemetry settings.
 - `minillm_l4/tests/test_hf_baseline.py`
@@ -65,7 +65,7 @@ Command:
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_hf_baseline \
-  --config minillm_l4/configs/workloads/qwen3_fp8_baseline.yaml \
+  --config minillm_l4/benchmarks/configs/workloads/qwen3_fp8_baseline.yaml \
   --output-dir minillm_l4/results/phase1
 ```
 
@@ -159,7 +159,7 @@ only with this reference-default change):
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_hf_baseline \
-  --config minillm_l4/configs/workloads/qwen3_fp8_baseline.yaml \
+  --config minillm_l4/benchmarks/configs/workloads/qwen3_fp8_baseline.yaml \
   --output-dir minillm_l4/results/phase1_20260926
 ```
 

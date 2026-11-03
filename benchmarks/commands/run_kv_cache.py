@@ -24,11 +24,11 @@ from minillm_l4.benchmarks.runners.kv_cache import (
     KvCacheBatchRunner,
     write_kv_result,
 )
-from minillm_l4.configs.loader import load_yaml_config
+from minillm_l4.benchmarks.configs.loader import load_yaml_config
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CONFIG = PROJECT_ROOT / "configs/workloads/qwen3_fp8_kv_cache.yaml"
+DEFAULT_CONFIG = PROJECT_ROOT / "benchmarks/configs/workloads/qwen3_fp8_kv_cache.yaml"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "results/kv_cache"
 DEFAULT_REFERENCE_DIR = PROJECT_ROOT / "results/phase1/references_baseline"
 

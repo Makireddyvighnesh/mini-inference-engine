@@ -6,7 +6,7 @@ Command (about 8 minutes, no model download):
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_gemm_peak --output-dir minillm_l4/results/gemm_peak_<date>
-.conda-env/bin/python minillm_l4/scripts/make_gemm_peak_charts.py minillm_l4/results/gemm_peak_<date>/gemm_peak.json minillm_l4/docs/assets/gemm_peak
+.conda-env/bin/python minillm_l4/benchmarks/charts/make_gemm_peak_charts.py minillm_l4/results/gemm_peak_<date>/gemm_peak.json minillm_l4/docs/assets/gemm_peak
 ```
 
 Setup:

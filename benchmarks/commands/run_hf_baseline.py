@@ -19,11 +19,11 @@ from ..runners.huggingface_baseline import (
     verify_or_write_reference,
     write_baseline_result,
 )
-from minillm_l4.configs.loader import load_yaml_config
+from minillm_l4.benchmarks.configs.loader import load_yaml_config
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CONFIG = PROJECT_ROOT / "configs/workloads/qwen3_fp8_baseline.yaml"
+DEFAULT_CONFIG = PROJECT_ROOT / "benchmarks/configs/workloads/qwen3_fp8_baseline.yaml"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "results/phase1"
 # The canonical token corpus every later phase checks against. Defaulting to a
 # directory under --output-dir let a fresh output directory create its own

@@ -146,7 +146,7 @@ Yes. Every output was compared with an FP32 reference:
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_attention_compare --output-dir minillm_l4/results/attention_compare_<date>
-.conda-env/bin/python minillm_l4/scripts/make_attention_charts.py minillm_l4/results/attention_compare_<date>/attention_compare.json minillm_l4/docs/assets/attention
+.conda-env/bin/python minillm_l4/benchmarks/charts/make_attention_charts.py minillm_l4/results/attention_compare_<date>/attention_compare.json minillm_l4/docs/assets/attention
 ```
 
 - **Setup:** one attention layer at Qwen3-4B shapes (32 query heads, 8 KV heads, head size 128, bf16), random inputs, no model loaded, the whole L4 free (22 GB). NVIDIA L4, PyTorch 2.13, Triton 3.7, 2026-11-01.

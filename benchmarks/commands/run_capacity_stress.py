@@ -24,12 +24,12 @@ from minillm_l4.benchmarks.runners.huggingface_baseline import (
     build_hf_workload,
     load_qwen_fp8,
 )
-from minillm_l4.configs.loader import load_yaml_config
+from minillm_l4.benchmarks.configs.loader import load_yaml_config
 
 from .run_concurrent_requests import PROJECT_ROOT, _project_path
 
 
-DEFAULT_CONFIG = PROJECT_ROOT / "configs/workloads/qwen3_fp8_stress.yaml"
+DEFAULT_CONFIG = PROJECT_ROOT / "benchmarks/configs/workloads/qwen3_fp8_stress.yaml"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "results/capacity_stress"
 DEFAULT_REFERENCE_DIR = PROJECT_ROOT / "results/phase1/references_baseline"
 

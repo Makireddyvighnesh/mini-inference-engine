@@ -18,7 +18,7 @@ from minillm_l4.benchmarks.runners.continuous_prefix import ContinuousPrefixPage
 from minillm_l4.benchmarks.runners.huggingface_baseline import (
     MODEL_ID, MODEL_REVISION, load_qwen_fp8,
 )
-from minillm_l4.configs.loader import load_yaml_config
+from minillm_l4.benchmarks.configs.loader import load_yaml_config
 from minillm_l4.engine.generation.manual import manual_greedy_generate
 
 
@@ -27,7 +27,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=ROOT / "configs/workloads/qwen3_fp8_prefix.yaml")
+    parser.add_argument("--config", type=Path, default=ROOT / "benchmarks/configs/workloads/qwen3_fp8_prefix.yaml")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "results/prefix_cache/continuous")
     parser.add_argument("--model-path", type=Path)
     parser.add_argument("--allow-download", action="store_true")

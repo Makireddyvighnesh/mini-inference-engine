@@ -40,7 +40,7 @@ Normal matrix:
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_capacity_stress \
-  --config minillm_l4/configs/workloads/qwen3_fp8_stress.yaml \
+  --config minillm_l4/benchmarks/configs/workloads/qwen3_fp8_stress.yaml \
   --scenario all \
   --output-dir minillm_l4/results/capacity_stress
 ```
@@ -49,7 +49,7 @@ Larger active-batch probe:
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_capacity_stress \
-  --config minillm_l4/configs/workloads/qwen3_fp8_capacity_limit_128.yaml \
+  --config minillm_l4/benchmarks/configs/workloads/qwen3_fp8_capacity_limit_128.yaml \
   --scenario concurrency \
   --output-dir minillm_l4/results/capacity_limit_128
 ```
@@ -58,7 +58,7 @@ Large prefill probe:
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_capacity_stress \
-  --config minillm_l4/configs/workloads/qwen3_fp8_capacity_limit_128.yaml \
+  --config minillm_l4/benchmarks/configs/workloads/qwen3_fp8_capacity_limit_128.yaml \
   --scenario input_budget \
   --output-dir minillm_l4/results/capacity_limit_input
 ```

@@ -131,6 +131,6 @@ Status: `[ ]` not started · `[~]` partial data exists · `[x]` done
 ## Discussed only (not measurable on one L4)
 
 - **Disaggregated prefill/decode:** why it helps, KV transfer cost, and how Q16 is the single-GPU alternative.
-- **Speculative decoding:** see `speculative_decoding_lab/`.
+- **Speculative decoding:** see `experiments/speculative_decoding_lab/`.
 - **Cache-aware routing across replicas:** needs multiple GPUs.
 - **Other design-only topics:** GPU selection (H100/H200/B200/L40S), MoE parallelism, autoscaling, multi-tenant fairness, safe rollout, and capacity planning for 1M DAU.

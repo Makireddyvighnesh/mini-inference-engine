@@ -8,7 +8,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any, Mapping
 
-from minillm_l4.configs.loader import load_yaml_config
+from minillm_l4.benchmarks.configs.loader import load_yaml_config
 from minillm_l4.benchmarks.core.harness import BenchmarkHarness, write_events_jsonl
 from minillm_l4.benchmarks.core.schemas import HarnessConfig
 from minillm_l4.benchmarks.core.workloads import save_workload
@@ -27,7 +27,7 @@ from minillm_l4.benchmarks.runners.manual_decode import (
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CONFIG = PROJECT_ROOT / "configs/workloads/qwen3_fp8_manual.yaml"
+DEFAULT_CONFIG = PROJECT_ROOT / "benchmarks/configs/workloads/qwen3_fp8_manual.yaml"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "results/manual_decode"
 DEFAULT_REFERENCE_DIR = PROJECT_ROOT / "results/phase1/references_baseline"
 

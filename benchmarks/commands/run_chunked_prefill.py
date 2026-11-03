@@ -21,14 +21,14 @@ from minillm_l4.benchmarks.core.workloads import save_workload
 from minillm_l4.benchmarks.runners.chunked_prefill import ChunkedPrefillPagedRunner
 from minillm_l4.benchmarks.runners.concurrent_requests import verify_concurrent_references
 from minillm_l4.benchmarks.runners.huggingface_baseline import MODEL_ID, MODEL_REVISION, load_qwen_fp8
-from minillm_l4.configs.loader import load_yaml_config
+from minillm_l4.benchmarks.configs.loader import load_yaml_config
 from .run_concurrent_requests import PROJECT_ROOT, _project_path, build_trace_workloads
 from .run_prefix_trace import _output_rows
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "configs/workloads/qwen3_fp8_chunked.yaml")
+    parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "benchmarks/configs/workloads/qwen3_fp8_chunked.yaml")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--markdown-output", type=Path)
     parser.add_argument("--reference-dir", type=Path, default=PROJECT_ROOT / "results/phase1/references_baseline")
@@ -92,7 +92,7 @@ def snapshot_sources(output_dir: Path, payload: dict[str, Any], reference_dir: P
     """Keep the actual runtime source and inputs, including uncommitted files."""
     destination = output_dir / "source_snapshot" / "minillm_l4"
     files = [PROJECT_ROOT / "__init__.py", PROJECT_ROOT / "requirements.lock"]
-    for directory in ["engine", "benchmarks", "configs"]:
+    for directory in ["engine", "benchmarks"]:
         files.extend(p for p in (PROJECT_ROOT / directory).rglob("*") if p.is_file() and p.suffix in {".py", ".yaml", ".json"})
     digests = {}
     for path in sorted(files):

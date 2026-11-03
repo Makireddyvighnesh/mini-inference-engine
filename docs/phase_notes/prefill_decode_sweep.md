@@ -3,7 +3,7 @@
 The requested prompt lengths are 128, 256, 512, 1024, 2048, 4096, and 8192.
 Output lengths are **128, 512, and 1048**, with 1048 preserved literally
 rather than changed to 1024. Batch sizes are **1, 2, 4, and 8**. The configuration is
-[`qwen3_fp8_phase_sweep.yaml`](../../configs/workloads/qwen3_fp8_phase_sweep.yaml).
+[`qwen3_fp8_phase_sweep.yaml`](../../benchmarks/configs/workloads/qwen3_fp8_phase_sweep.yaml).
 
 ## Timing boundaries
 

@@ -45,7 +45,7 @@ In practice the engine stays far below 16k. Its step-time targets keep passes at
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_prefill_pass_size --output-dir minillm_l4/results/prefill_pass_size_<date>
-.conda-env/bin/python minillm_l4/scripts/make_prefill_pass_charts.py minillm_l4/results/prefill_pass_size_<date>/prefill_pass_size.json minillm_l4/docs/assets/prefill_pass_size
+.conda-env/bin/python minillm_l4/benchmarks/charts/make_prefill_pass_charts.py minillm_l4/results/prefill_pass_size_<date>/prefill_pass_size.json minillm_l4/docs/assets/prefill_pass_size
 ```
 
 - Exactly one prefill pass per run, 128 to 65,536 tokens. Each run warms up once, then takes the median of 3. Qwen3-4B FP8 on one NVIDIA L4, 2026-10-26.

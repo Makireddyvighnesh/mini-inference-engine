@@ -41,7 +41,7 @@ runner, while preserving the same workload and result schema.
   - Deterministic CPU fixture runner for harness validation only.
 - `minillm_l4/benchmarks/commands/run_harness.py`
   - One-command Phase 0 CLI.
-- `minillm_l4/configs/workloads/minillm_l4_harness.yaml`
+- `minillm_l4/benchmarks/configs/workloads/minillm_l4_harness.yaml`
   - Pinned Phase 0 fixture configuration, seed 17, one warm-up, and three
     measured repetitions.
 - `minillm_l4/docs/metric_definitions.md`
@@ -64,7 +64,7 @@ runner, while preserving the same workload and result schema.
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_harness \
-  --config minillm_l4/configs/workloads/minillm_l4_harness.yaml \
+  --config minillm_l4/benchmarks/configs/workloads/minillm_l4_harness.yaml \
   --output-dir minillm_l4/results/phase0
 ```
 

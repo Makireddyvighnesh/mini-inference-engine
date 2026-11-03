@@ -84,7 +84,7 @@ Command:
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_kv_cache \
-  --config minillm_l4/configs/workloads/qwen3_fp8_kv_cache.yaml \
+  --config minillm_l4/benchmarks/configs/workloads/qwen3_fp8_kv_cache.yaml \
   --workload long \
   --modes contiguous recompute \
   --batch-sizes 1 \
@@ -172,11 +172,11 @@ and 512-token points, with one warm-up and three measured repetitions each
 
 ```bash
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_kv_cache \
-  --config minillm_l4/configs/workloads/qwen3_fp8_kv_cache.yaml \
+  --config minillm_l4/benchmarks/configs/workloads/qwen3_fp8_kv_cache.yaml \
   --workload all --modes contiguous \
   --output-dir minillm_l4/results/kv_cache_20260926
 .conda-env/bin/python -m minillm_l4.benchmarks.commands.run_kv_cache \
-  --config minillm_l4/configs/workloads/qwen3_fp8_kv_cache.yaml \
+  --config minillm_l4/benchmarks/configs/workloads/qwen3_fp8_kv_cache.yaml \
   --workload all --prompt-lengths 128 512 --modes recompute \
   --output-dir minillm_l4/results/kv_cache_20260926
 ```

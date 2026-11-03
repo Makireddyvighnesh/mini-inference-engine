@@ -23,7 +23,7 @@ from minillm_l4.benchmarks.runners.huggingface_baseline import (
     MODEL_REVISION,
     load_qwen_fp8,
 )
-from minillm_l4.configs.loader import load_yaml_config
+from minillm_l4.benchmarks.configs.loader import load_yaml_config
 
 from .run_concurrent_requests import (
     PROJECT_ROOT,
@@ -33,7 +33,7 @@ from .run_concurrent_requests import (
 )
 
 
-DEFAULT_CONFIG = PROJECT_ROOT / "configs/workloads/qwen3_fp8_continuous.yaml"
+DEFAULT_CONFIG = PROJECT_ROOT / "benchmarks/configs/workloads/qwen3_fp8_continuous.yaml"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "results/continuous_requests"
 DEFAULT_REFERENCE_DIR = PROJECT_ROOT / "results/phase1/references_baseline"
 

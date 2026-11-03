@@ -119,7 +119,7 @@ def test_benchmark_refuses_cpu(tmp_path, monkeypatch):
 
 
 def test_charts_render_both_themes_and_prefill_label(tmp_path):
-    from minillm_l4.scripts.make_cuda_graph_charts import render
+    from minillm_l4.benchmarks.charts.make_cuda_graph_charts import render
     data = {"sections": {
         "decode": [{"batch": n, "mode": mode, "prompt_tokens": 512, "tpot_p50_ms": 40 if mode == "eager" else 20}
                    for n in (1, 2, 4, 8, 16, 32) for mode in ("eager", "graph")],
