@@ -48,6 +48,7 @@ def build_mixed_metadata(
     decode_max_sequence_length: int | None = None,
     decode_block_tokens: int = 16,
     decode_sdpa_compat: bool = False,
+    decode_use_gqa_reuse: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, MixedBatchMetadata]:
     """Flatten rows (decode first) and describe them; pages must be reserved."""
 
@@ -112,6 +113,7 @@ def build_mixed_metadata(
         decode_max_sequence_length=decode_max_sequence_length,
         decode_block_tokens=decode_block_tokens,
         decode_sdpa_compat=decode_sdpa_compat,
+        decode_use_gqa_reuse=decode_use_gqa_reuse,
     )
     return (
         torch.tensor(token_ids, dtype=torch.long, device=device),

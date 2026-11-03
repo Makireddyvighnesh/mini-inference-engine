@@ -103,6 +103,7 @@ class DecodeGraph:
     logit_gaps: torch.Tensor | None
     capture_ms: float
     pool_memory_bytes: int
+    output_logits: torch.Tensor | None = None  # [bucket, vocab]; read after replay by requests that sample
 
 
 def graph_pool_memory_bytes(graph: torch.cuda.CUDAGraph) -> int:

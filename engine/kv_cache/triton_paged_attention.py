@@ -12,6 +12,7 @@ from __future__ import annotations
 import torch
 
 from .decode_metadata import validate_decode_metadata
+from .triton_tc_decode import tensor_core_decode_attention
 
 try:
     import triton
@@ -307,177 +308,6 @@ if triton is not None:
             + dim_offsets * output_stride_dim
         )
         tl.store(output_ptr + output_offsets, output, mask=dim_mask)
-
-
-    @triton.jit
-    def _paged_decode_gqa_split_kernel(
-        query_ptr,
-        key_ptr,
-        value_ptr,
-        block_table_ptr,
-        sequence_length_ptr,
-        query_position_ptr,
-        partial_max_ptr,
-        partial_sum_ptr,
-        partial_output_ptr,
-        scale,
-        split_span,
-        query_stride_batch: tl.constexpr,
-        query_stride_head: tl.constexpr,
-        query_stride_token: tl.constexpr,
-        query_stride_dim: tl.constexpr,
-        key_stride_block: tl.constexpr,
-        key_stride_head: tl.constexpr,
-        key_stride_token: tl.constexpr,
-        key_stride_dim: tl.constexpr,
-        value_stride_block: tl.constexpr,
-        value_stride_head: tl.constexpr,
-        value_stride_token: tl.constexpr,
-        value_stride_dim: tl.constexpr,
-        table_stride_batch: tl.constexpr,
-        table_stride_block: tl.constexpr,
-        length_stride_batch: tl.constexpr,
-        position_stride_batch: tl.constexpr,
-        partial_max_stride_batch: tl.constexpr,
-        partial_max_stride_head: tl.constexpr,
-        partial_max_stride_split: tl.constexpr,
-        partial_sum_stride_batch: tl.constexpr,
-        partial_sum_stride_head: tl.constexpr,
-        partial_sum_stride_split: tl.constexpr,
-        partial_output_stride_batch: tl.constexpr,
-        partial_output_stride_head: tl.constexpr,
-        partial_output_stride_split: tl.constexpr,
-        partial_output_stride_dim: tl.constexpr,
-        NUM_KV_HEADS: tl.constexpr,
-        GROUP_SIZE: tl.constexpr,
-        SPLIT_COUNT: tl.constexpr,
-        BLOCK_SIZE: tl.constexpr,
-        HEAD_DIM: tl.constexpr,
-        BLOCK_DIM: tl.constexpr,
-        BLOCK_TOKENS: tl.constexpr,
-        HAS_QUERY_POSITIONS: tl.constexpr,
-    ):
-        """Compute one split-KV partial while sharing K/V across GQA heads."""
-
-        program_id = tl.program_id(0)
-        split_index = program_id % SPLIT_COUNT
-        kv_program = program_id // SPLIT_COUNT
-        batch_index = kv_program // NUM_KV_HEADS
-        kv_head = kv_program % NUM_KV_HEADS
-
-        group_offsets = tl.arange(0, GROUP_SIZE)
-        query_heads = kv_head * GROUP_SIZE + group_offsets
-        dim_offsets = tl.arange(0, BLOCK_DIM)
-        dim_mask = dim_offsets < HEAD_DIM
-        query_offsets = (
-            batch_index * query_stride_batch
-            + query_heads[:, None] * query_stride_head
-            + dim_offsets[None, :] * query_stride_dim
-        )
-        query = tl.load(
-            query_ptr + query_offsets,
-            mask=dim_mask[None, :],
-            other=0.0,
-        )
-
-        sequence_length = tl.load(sequence_length_ptr + batch_index * length_stride_batch)
-        if HAS_QUERY_POSITIONS:
-            query_position = tl.load(query_position_ptr + batch_index * position_stride_batch)
-            sequence_length = tl.minimum(sequence_length, query_position + 1)
-        split_start = split_index * split_span
-        split_end = tl.minimum(sequence_length, split_start + split_span)
-        tokens_in_split = tl.maximum(split_end - split_start, 0)
-        tile_count = tl.cdiv(tokens_in_split, BLOCK_TOKENS)
-        token_offsets = tl.arange(0, BLOCK_TOKENS)
-        running_max = tl.full((GROUP_SIZE,), -float("inf"), tl.float32)
-        running_sum = tl.zeros((GROUP_SIZE,), dtype=tl.float32)
-        accumulator = tl.zeros((GROUP_SIZE, BLOCK_DIM), dtype=tl.float32)
-
-        for tile_index in tl.range(0, tile_count):
-            logical_tokens = split_start + tile_index * BLOCK_TOKENS + token_offsets
-            token_mask = logical_tokens < split_end
-            logical_blocks = logical_tokens // BLOCK_SIZE
-            offsets_in_block = logical_tokens % BLOCK_SIZE
-            physical_blocks = tl.load(
-                block_table_ptr
-                + batch_index * table_stride_batch
-                + logical_blocks * table_stride_block,
-                mask=token_mask,
-                other=0,
-            )
-
-            key_offsets = (
-                physical_blocks[:, None] * key_stride_block
-                + kv_head * key_stride_head
-                + offsets_in_block[:, None] * key_stride_token
-                + dim_offsets[None, :] * key_stride_dim
-            )
-            keys = tl.load(
-                key_ptr + key_offsets,
-                mask=token_mask[:, None] & dim_mask[None, :],
-                other=0.0,
-            )
-            # Multiply in FP32: BF16 products lose precision when key
-            # magnitudes reach the hundreds, as Qwen3 layer-0 keys do.
-            scores = tl.sum(
-                query[:, None, :].to(tl.float32) * keys[None, :, :].to(tl.float32),
-                axis=2,
-            ) * scale
-            scores = tl.where(token_mask[None, :], scores, -float("inf"))
-
-            block_max = tl.max(scores, axis=1)
-            new_max = tl.maximum(running_max, block_max)
-            previous_weight = tl.exp(running_max - new_max)
-            probabilities = tl.exp(scores - new_max[:, None])
-            probabilities = tl.where(token_mask[None, :], probabilities, 0.0)
-
-            value_offsets = (
-                physical_blocks[:, None] * value_stride_block
-                + kv_head * value_stride_head
-                + offsets_in_block[:, None] * value_stride_token
-                + dim_offsets[None, :] * value_stride_dim
-            )
-            values = tl.load(
-                value_ptr + value_offsets,
-                mask=token_mask[:, None] & dim_mask[None, :],
-                other=0.0,
-            )
-            accumulator = (
-                accumulator * previous_weight[:, None]
-                + tl.sum(
-                    probabilities[:, :, None] * values[None, :, :],
-                    axis=1,
-                )
-            )
-            running_sum = (
-                running_sum * previous_weight + tl.sum(probabilities, axis=1)
-            )
-            running_max = new_max
-
-        partial_max_offsets = (
-            batch_index * partial_max_stride_batch
-            + query_heads * partial_max_stride_head
-            + split_index * partial_max_stride_split
-        )
-        partial_sum_offsets = (
-            batch_index * partial_sum_stride_batch
-            + query_heads * partial_sum_stride_head
-            + split_index * partial_sum_stride_split
-        )
-        partial_output_offsets = (
-            batch_index * partial_output_stride_batch
-            + query_heads[:, None] * partial_output_stride_head
-            + split_index * partial_output_stride_split
-            + dim_offsets[None, :] * partial_output_stride_dim
-        )
-        denominator = tl.where(running_sum > 0.0, running_sum, 1.0)
-        tl.store(partial_max_ptr + partial_max_offsets, running_max)
-        tl.store(partial_sum_ptr + partial_sum_offsets, running_sum)
-        tl.store(
-            partial_output_ptr + partial_output_offsets,
-            accumulator / denominator[:, None],
-            mask=dim_mask[None, :],
-        )
 
 
     @triton.jit
@@ -784,6 +614,29 @@ def select_decode_split_count(
     return 8
 
 
+SPLIT_KV_BLOCK_TOKENS = 64  # 16-token tiles are 2-3x slower on the L4; 64 is the largest non-compat tile
+
+
+def select_split_kv_decode(max_sequence_length: int, batch_size: int) -> int:
+    """Split count for opt-in split-KV decode, or 1 to keep the exact standard kernel.
+
+    Split-KV only helps when few (request, head) programs would otherwise run
+    on the L4's 58 SMs. Measured in real CUDA Graph decode steps
+    (run_split_kv_decode, profiled engine steps): batch 1 at 4,096 tokens cuts
+    KV attention from 5.6 to 3.3 ms per step (step -10%), batch 2 by 1.1 ms
+    (-4%); from batch 4 up it is no faster (batch 16 is 8% slower), and below
+    1,024 tokens there is little to split. Isolated kernel timings look better
+    at batch 4-16 only because one layer's KV stays hot in L2 there.
+    """
+
+    length, batch = int(max_sequence_length), int(batch_size)
+    if batch <= 1 and length >= 1024:
+        return 8
+    if batch <= 2 and length >= 2048:
+        return 4
+    return 1
+
+
 def select_decode_block_tokens(max_sequence_length: int) -> int:
     """Select the profiled token-reduction tile for NVIDIA L4 decode."""
 
@@ -930,6 +783,16 @@ def triton_paged_decode_attention(
         )
 
     output = torch.empty_like(query)
+    if use_grouped_kernel and not sdpa_compat:
+        tensor_core_decode_attention(
+            query, key_blocks, value_blocks, block_tables, sequence_lengths, output,
+            position_buffer=position_buffer, has_query_positions=query_start_positions is not None,
+            scale=scale, split_count=split_count,
+            # With one split the span only has to cover every sequence.
+            split_span=(max_sequence_length + split_count - 1) // split_count if split_count > 1 else 2**30,
+            tile_tokens=block_tokens,
+        )
+        return output.transpose(1, 2)
     if split_count == 1:
         block_dim = triton.next_power_of_2(head_dim)
         # Storage page size and compute tile size are separate concerns.  A fixed
@@ -1033,17 +896,8 @@ def triton_paged_decode_attention(
         dtype=torch.float32,
         device=query.device,
     )
-    split_grid = (
-        batch_size
-        * (num_kv_heads if use_grouped_kernel else num_heads)
-        * split_count,
-    )
-    split_kernel = (
-        _paged_decode_gqa_split_kernel
-        if use_grouped_kernel
-        else _paged_decode_split_kernel
-    )
-    split_kernel[split_grid](
+    split_grid = (batch_size * num_heads * split_count,)
+    _paged_decode_split_kernel[split_grid](
         query,
         key_blocks,
         value_blocks,
@@ -1081,17 +935,8 @@ def triton_paged_decode_attention(
         partial_output.stride(1),
         partial_output.stride(2),
         partial_output.stride(3),
-        **(
-            {
-                "NUM_KV_HEADS": num_kv_heads,
-                "GROUP_SIZE": group_size,
-            }
-            if use_grouped_kernel
-            else {
-                "NUM_HEADS": num_heads,
-                "NUM_KV_HEADS": num_kv_heads,
-            }
-        ),
+        NUM_HEADS=num_heads,
+        NUM_KV_HEADS=num_kv_heads,
         SPLIT_COUNT=split_count,
         BLOCK_SIZE=block_size,
         HEAD_DIM=head_dim,
@@ -1133,6 +978,8 @@ __all__ = [
     "can_use_triton_paged_decode",
     "select_decode_block_tokens",
     "select_decode_split_count",
+    "select_split_kv_decode",
+    "SPLIT_KV_BLOCK_TOKENS",
     "triton_is_available",
     "triton_paged_decode_attention",
 ]

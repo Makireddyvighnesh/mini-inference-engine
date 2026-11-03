@@ -270,7 +270,7 @@ class PagedQwen3Attention(nn.Module):
                 decode_split_count=metadata.decode_split_count,
                 decode_max_sequence_length=metadata.decode_max_sequence_length,
                 decode_block_tokens=metadata.decode_block_tokens,
-                decode_use_gqa_reuse=False,
+                decode_use_gqa_reuse=metadata.decode_use_gqa_reuse,
                 decode_sdpa_compat=metadata.decode_sdpa_compat,
             )
             output.index_copy_(0, rows, decode_output.reshape(metadata.decode_count, -1))

@@ -19,10 +19,13 @@ from .triton_packed_attention import (
     can_use_triton_packed_prefill,
     triton_packed_prefill_attention,
 )
+from .triton_tc_decode import select_tensor_core_decode
 from .triton_paged_attention import (
     can_use_triton_paged_decode,
     select_decode_block_tokens,
     select_decode_split_count,
+    select_split_kv_decode,
+    SPLIT_KV_BLOCK_TOKENS,
     triton_is_available,
     triton_paged_decode_attention,
 )
@@ -49,7 +52,10 @@ __all__ = [
     "triton_packed_prefill_attention",
     "can_use_triton_paged_decode",
     "select_decode_block_tokens",
+    "select_tensor_core_decode",
     "select_decode_split_count",
+    "select_split_kv_decode",
+    "SPLIT_KV_BLOCK_TOKENS",
     "triton_is_available",
     "triton_paged_decode_attention",
 ]

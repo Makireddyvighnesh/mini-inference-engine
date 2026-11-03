@@ -64,6 +64,7 @@ class MixedBatchMetadata:
     decode_max_sequence_length: int | None = None
     decode_block_tokens: int = 16
     decode_sdpa_compat: bool = False
+    decode_use_gqa_reuse: bool = False
 
     def __post_init__(self) -> None:
         if self.total_tokens < 1:

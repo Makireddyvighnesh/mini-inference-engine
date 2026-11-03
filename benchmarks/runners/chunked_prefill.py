@@ -15,6 +15,9 @@ from minillm_l4.engine.kv_cache import (
     PagedKvOutOfMemoryError,
     select_decode_block_tokens,
     select_decode_split_count,
+    select_split_kv_decode,
+    select_tensor_core_decode,
+    SPLIT_KV_BLOCK_TOKENS,
     triton_is_available,
 )
 from minillm_l4.engine.kv_cache.packed import PackedSequenceMetadata
@@ -79,6 +82,8 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
                  graph_mixed_decode: bool = False,
                  graph_mixed_decode_order: str = "decode_first",
                  max_model_len: int | None = None,
+                 decode_split_kv: bool = False,
+                 decode_tensor_core: bool = False,
                  **kwargs: Any) -> None:
         if prefill_chunk_size is not None and (
             isinstance(prefill_chunk_size, bool)
@@ -99,6 +104,14 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
         if graph_mixed_decode_order not in {"decode_first", "prefill_first"}:
             raise ValueError("graph_mixed_decode_order must be decode_first or prefill_first")
         self.cuda_graphs = cuda_graphs
+        # Opt-in split-KV (FlashDecoding) decode: split only where it measured faster (small batch, long
+        # context); every other step keeps the exact SDPA-compatible kernel. Split steps are not bitwise
+        # equal to SDPA.
+        self.decode_split_kv = bool(decode_split_kv)
+        # Opt-in tensor-core decode attention: faster at small batches, not bitwise equal to SDPA.
+        self.decode_tensor_core = bool(decode_tensor_core)
+        if self.decode_split_kv and self.decode_tensor_core:
+            raise ValueError("decode_split_kv and decode_tensor_core are alternatives; choose one")
         self.graph_mixed_decode = graph_mixed_decode
         self.graph_mixed_decode_order = graph_mixed_decode_order
         kwargs.setdefault("decode_sdpa_compat", True)
@@ -116,8 +129,6 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
                 self._graph_disabled_reasons.append("prefix reuse is enabled")
             if kwargs.get("decode_backend", "auto") == "torch" or not triton_is_available():
                 self._graph_disabled_reasons.append("CUDA graphs require Triton decode")
-            if not kwargs["decode_sdpa_compat"]:
-                self._graph_disabled_reasons.append("graph decode requires SDPA-compatible decode to keep the reduction policy fixed")
             if not 1 <= kwargs["block_size"] <= 128:
                 self._graph_disabled_reasons.append("Triton decode requires block_size in 1..128")
             rope = getattr(model.config, "rope_parameters", None) or {}
@@ -159,6 +170,20 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
         self._queued = 0
         self._reset_graph_counters()
 
+    def _decode_kernel(self, max_length: int, batch: int) -> tuple[int, int, bool, bool]:
+        """(split_count, block_tokens, sdpa_compat, use_gqa_reuse) for a decode attention call."""
+
+        if self.decode_tensor_core:
+            return (*select_tensor_core_decode(max_length, batch), False, True)
+        if self.decode_split_kv:
+            split = select_split_kv_decode(max_length, batch)
+            if split > 1:
+                return split, SPLIT_KV_BLOCK_TOKENS, False, False
+            return 1, 128, True, False
+        if self.decode_sdpa_compat:
+            return 1, 128, True, False
+        return select_decode_split_count(max_length, batch_size=batch), select_decode_block_tokens(max_length), False, False
+
     def _reset_graph_counters(self) -> None:
         self._graph_replays = self._eager_decode_steps = 0
         self._graph_fallbacks = dict.fromkeys(self._graph_disabled_reasons, 0)
@@ -180,7 +205,7 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
         for reason in reasons:
             self._graph_fallbacks[reason] = self._graph_fallbacks.get(reason, 0) + 1
 
-    def _graph_decode_call(self, buffers: DecodeGraphBuffers) -> tuple[torch.Tensor, torch.Tensor | None]:
+    def _graph_decode_call(self, buffers: DecodeGraphBuffers) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
         output = self.model(
             input_ids=buffers.input_ids,
             # HF mask construction may inspect device positions. Paged attention
@@ -193,15 +218,17 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
             paged_block_tables=buffers.block_tables, paged_sequence_lengths=buffers.sequence_lengths,
             paged_attention_backend="triton", paged_decode_graph=True,
             paged_decode_max_sequence_length=self._graph_max_sequence_length,
-            paged_decode_split_count=1, paged_decode_block_tokens=128,
-            paged_decode_use_gqa_reuse=False, paged_decode_sdpa_compat=True,
+            # The split choice is fixed per captured graph (bucket size, workload max length).
+            **dict(zip(("paged_decode_split_count", "paged_decode_block_tokens", "paged_decode_sdpa_compat",
+                        "paged_decode_use_gqa_reuse"),
+                       self._decode_kernel(self._graph_max_sequence_length, int(buffers.input_ids.shape[0])))),
         )
         logits = output.logits[:, -1, :]
         gaps = None
         if self.record_logit_gaps:
             top_two = logits.float().topk(2, dim=-1).values
             gaps = top_two[:, 0] - top_two[:, 1]
-        return logits.argmax(dim=-1, keepdim=True), gaps
+        return logits.argmax(dim=-1, keepdim=True), gaps, logits
 
     def _capture_decode_graph(self, bucket: int) -> DecodeGraph:
         """Lazy capture, including warmup and one scratch-only replay.
@@ -224,11 +251,11 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
         torch.cuda.synchronize(self.device)
         graph = torch.cuda.CUDAGraph()
         with torch.inference_mode(), torch.cuda.graph(graph):
-            tokens, gaps = self._graph_decode_call(buffers)
+            tokens, gaps, logits = self._graph_decode_call(buffers)
         graph.replay()
         torch.cuda.synchronize(self.device)
         captured = DecodeGraph(graph, buffers, tokens, gaps, (perf_counter() - started) * 1000,
-                               graph_pool_memory_bytes(graph))
+                               graph_pool_memory_bytes(graph), logits)
         self._graphs[bucket] = captured
         self._graph_captures_this_run.append(bucket)
         return captured
@@ -254,7 +281,11 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
             self._graph_replays += 1
             # Clone real outputs: graph-owned output storage is overwritten on
             # replay; eager fallback must retain a stable next_token per row.
-            next_tokens = captured.output_tokens[:len(active)].clone().detach()
+            if any(self._sampler(state) for state in active):
+                # Sampling runs after replay, on the graph's logits; the graph itself never changes.
+                next_tokens = self._select_tokens(captured.output_logits[:len(active)], active).detach()
+            else:
+                next_tokens = captured.output_tokens[:len(active)].clone().detach()
             values = next_tokens[:, 0].tolist()  # one real-row D2H copy
             gaps = captured.logit_gaps[:len(active)].tolist() if captured.logit_gaps is not None else None
         now = max(state.recorder.now_ns() for state in active)
@@ -360,11 +391,9 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
             input_ids, positions, metadata = build_mixed_metadata(
                 rows, self.cache, device=self.device,
                 decode_attention_backend=self.decode_backend,
-                decode_split_count=1 if self.decode_sdpa_compat else select_decode_split_count(
-                    max_length, batch_size=max(len(forward_active), 1)),
+                **dict(zip(("decode_split_count", "decode_block_tokens", "decode_sdpa_compat", "decode_use_gqa_reuse"),
+                           self._decode_kernel(max_length, max(len(forward_active), 1)))),
                 decode_max_sequence_length=max_length,
-                decode_block_tokens=128 if self.decode_sdpa_compat else select_decode_block_tokens(max_length),
-                decode_sdpa_compat=self.decode_sdpa_compat,
             )
             output = qwen3_mixed_forward(
                 self.model, input_ids, positions, metadata, paged_kv_cache=self.cache,
@@ -372,8 +401,8 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
             )
             parts = []
             if output.decode_logits is not None:
-                parts.append(output.decode_logits.argmax(dim=-1, keepdim=True))
-            parts += [output.prefill_logits[s.request.request_id].argmax(dim=-1, keepdim=True) for s in completing]
+                parts.append(self._select_tokens(output.decode_logits, forward_active))
+            parts += [self._select_tokens(output.prefill_logits[s.request.request_id].view(1, -1), [s]) for s in completing]
             next_tokens = torch.cat(parts).detach() if parts else None
             values = next_tokens[:, 0].tolist() if next_tokens is not None else []
         if split_decode and self.graph_mixed_decode_order == "prefill_first":
@@ -447,7 +476,7 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
                 appended_token_counts=(chunk.end_token - chunk.start_token,),
             )
             if chunk.complete:
-                state.next_token = chunk.logits.argmax(dim=-1, keepdim=True).detach()
+                state.next_token = self._select_tokens(chunk.logits.view(1, -1), [state]).detach()
                 token = int(state.next_token.item())
                 if self.enable_prefix:
                     self.prefixes.publish(owner, state.request.prompt_token_ids)
@@ -498,7 +527,7 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
                 attention_backend=self.packed_attention_backend,
                 row_logits=True,
             )
-            next_tokens = output.logits.argmax(dim=-1, keepdim=True).detach()
+            next_tokens = self._select_tokens(output.logits, states).detach()
             tokens = next_tokens[:, 0].tolist()
         ended = states[0].recorder.now_ns()
         records = []
@@ -807,6 +836,8 @@ class ChunkedPrefillPagedRunner(ContinuousPrefixPagedRunner):
             "request_kv_num_blocks": self._request_num_blocks,
             "graph_max_sequence_length": self._graph_max_sequence_length,
             "decode_sdpa_compat": self.decode_sdpa_compat,
+            "decode_split_kv": self.decode_split_kv,
+            "decode_tensor_core": self.decode_tensor_core,
             "hits": hits, "misses": misses, "hit_rate": hits / (hits + misses) if hits + misses else 0.0,
             "reused_tokens": stats["reused_tokens"] - start_stats["reused_tokens"],
             "computed_prefill_tokens": sum(record["computed_tokens"] for record in chunks),

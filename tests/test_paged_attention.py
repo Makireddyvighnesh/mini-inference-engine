@@ -389,3 +389,35 @@ def test_triton_decode_is_at_least_as_accurate_as_torch_with_large_keys(split_co
     reference_error = (reference.double() - exact).abs().max().item()
     triton_error = (triton_output.double() - exact).abs().max().item()
     assert triton_error <= reference_error + 1e-3
+
+
+def test_select_split_kv_decode_splits_only_small_batch_long_context():
+    from minillm_l4.engine.kv_cache import select_split_kv_decode
+
+    assert select_split_kv_decode(4096, 1) == 8
+    assert select_split_kv_decode(1024, 1) == 8
+    assert select_split_kv_decode(1023, 1) == 1
+    assert select_split_kv_decode(2048, 2) == 4
+    assert select_split_kv_decode(1024, 2) == 1
+    assert select_split_kv_decode(8192, 4) == 1
+    assert select_split_kv_decode(8192, 32) == 1
+
+
+def test_select_tensor_core_decode_splits_only_small_batches():
+    from minillm_l4.engine.kv_cache import select_tensor_core_decode
+
+    assert select_tensor_core_decode(2048, 1) == (4, 64)
+    assert select_tensor_core_decode(512, 2) == (4, 64)
+    assert select_tensor_core_decode(2048, 4) == (1, 64)
+    assert select_tensor_core_decode(2048, 32) == (1, 64)
+    assert select_tensor_core_decode(100, 1) == (1, 64)  # Too short for every split to fill a tile.
+    with pytest.raises(ValueError):
+        select_tensor_core_decode(2048, 0)
+
+
+def test_runner_rejects_two_decode_alternatives_together():
+    from minillm_l4.benchmarks.runners.chunked_prefill import ChunkedPrefillPagedRunner
+
+    with pytest.raises(ValueError, match="alternatives"):
+        ChunkedPrefillPagedRunner(object(), block_size=16, num_blocks=4, max_batch_size=1, device="cpu",
+                                  decode_split_kv=True, decode_tensor_core=True, prefill_chunk_size=None)

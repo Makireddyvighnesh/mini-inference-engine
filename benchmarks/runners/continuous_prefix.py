@@ -16,6 +16,7 @@ from minillm_l4.engine.kv_cache import (
     select_decode_split_count,
 )
 from minillm_l4.engine.request import RequestLifecycle, RequestState
+from minillm_l4.engine.sampling import RequestSampler, SamplingParams, select_tokens
 from minillm_l4.engine.scheduler import ContinuousBatchScheduler, ScheduledRequest
 
 from .continuous_requests import _wait_until_ms
@@ -33,6 +34,8 @@ class _LiveRequest:
     reused_tokens: int = 0
     decode_calls: int = 0
     decode_top2_logit_gaps: list[float] = field(default_factory=list)
+    sampler: RequestSampler | None = None
+    sampler_ready: bool = False
 
 
 class ContinuousPrefixPagedRunner(PrefixCachedPagedRunner):
@@ -150,7 +153,7 @@ class ContinuousPrefixPagedRunner(PrefixCachedPagedRunner):
                     previous_token_counts=(reused,),
                     appended_token_counts=(request.prompt_tokens - reused,),
                 )
-            state.next_token = output.logits[:, -1, :].argmax(dim=-1, keepdim=True).detach()
+            state.next_token = self._select_tokens(output.logits[:, -1, :], [state]).detach()
             token = int(state.next_token.item())  # synchronizes before timestamping
             if self.enable_prefix:
                 self.prefixes.publish(owner, request.prompt_token_ids)
@@ -207,7 +210,7 @@ class ContinuousPrefixPagedRunner(PrefixCachedPagedRunner):
                 paged_decode_use_gqa_reuse=False,
                 paged_decode_sdpa_compat=self.decode_sdpa_compat,
             )
-            next_tokens = output.logits[:, -1, :].argmax(dim=-1, keepdim=True).detach()
+            next_tokens = self._select_tokens(output.logits[:, -1, :], active).detach()
             if self.record_logit_gaps:
                 top_two = output.logits[:, -1, :].float().topk(2, dim=-1).values
                 gaps = (top_two[:, 0] - top_two[:, 1]).tolist()
@@ -225,6 +228,28 @@ class ContinuousPrefixPagedRunner(PrefixCachedPagedRunner):
                 state.decode_top2_logit_gaps.append(float(gaps[row]))
             state.recorder.mark_token_ready(index, token_id=int(token), timestamp_ns=now)
             state.recorder.mark_token_sent(index, token_id=int(token), timestamp_ns=now)
+
+    @staticmethod
+    def _sampler(state: _LiveRequest) -> RequestSampler | None:
+        """Created once per run from ``request.metadata["sampling"]``; None means plain greedy."""
+
+        if not state.sampler_ready:
+            metadata = state.request.metadata
+            if "sampling" in metadata:
+                state.sampler = RequestSampler(SamplingParams.from_mapping(metadata["sampling"]),
+                                               record_stats=bool(metadata.get("sampling_stats")))
+            state.sampler_ready = True
+        return state.sampler
+
+    def _select_tokens(self, logits: torch.Tensor, states: Sequence[_LiveRequest]) -> torch.Tensor:
+        samplers = [self._sampler(state) for state in states]
+        if not any(samplers):
+            return logits.argmax(dim=-1, keepdim=True)
+        # The history is built only where a repetition penalty will read it.
+        histories = [(*s.request.prompt_token_ids, *s.generated)
+                     if sampler is not None and sampler.params.repetition_penalty != 1.0 else ()
+                     for s, sampler in zip(states, samplers, strict=True)]
+        return select_tokens(logits, samplers, histories)
 
     def _complete(self, state: _LiveRequest, outcomes: dict[str, RequestOutcome]) -> None:
         owner = state.request.request_id
@@ -245,6 +270,7 @@ class ContinuousPrefixPagedRunner(PrefixCachedPagedRunner):
                 ),
                 "lifecycle": list(state.lifecycle.history),
                 "resources_released": True,
+                **({"sampling_stats": state.sampler.stats} if state.sampler and state.sampler.record_stats else {}),
             },
         )
 
