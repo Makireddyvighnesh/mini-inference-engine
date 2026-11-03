@@ -155,7 +155,7 @@ def build_workloads(tok) -> list[dict[str, Any]]:
 
 # ----------------------------------------------------------------------------- MiniLLM
 
-def run_minillm(args) -> None:
+def run_minillm(args, workloads: list[dict[str, Any]] | None = None) -> None:
     import gc
 
     import torch
@@ -172,7 +172,8 @@ def run_minillm(args) -> None:
     if not install_fused_kernels(model):
         raise RuntimeError("fused kernels unavailable")
     install_merged_projections(model)
-    workloads = build_workloads(bundle.tokenizer)
+    if workloads is None:
+        workloads = build_workloads(bundle.tokenizer)
     if args.sections:
         workloads = [w for w in workloads if w["section"] in args.sections]
     (args.output_dir / "workloads.json").write_text(json.dumps(workloads) + "\n")
