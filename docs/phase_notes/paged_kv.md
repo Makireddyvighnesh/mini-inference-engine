@@ -415,6 +415,9 @@ range, batch 8 uses one split while smaller tested batches use eight; contexts
 above 4,096 use eight splits. The graph records the selected tile and split
 count in every result artifact.
 
+Update 2026-11-03: this result was about that kernel's elementwise FP32 arithmetic, not
+grouping. A grouped kernel on tensor cores beats FlashInfer; see `kernel_track.md`.
+
 The GQA-reuse hypothesis was also implemented and tested. It computes all four
 Qwen query heads sharing one KV head in one Triton program, but the larger live
 state reduced occupancy. At 3,072 tokens and batch 8, it increased TPOT from

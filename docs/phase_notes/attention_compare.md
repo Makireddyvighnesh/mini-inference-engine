@@ -154,5 +154,5 @@ Yes. Every output was compared with an FP32 reference:
 - **Extra memory:** peak GPU memory during the call minus memory in use before it (inputs excluded). In the charts, an X marks out of memory, drawn at the would-be value (4× the previous size).
 - **Methods:**
   - The memory-efficient SDPA kernel has no grouped-KV support, so it got K/V already copied to 32 heads (copy not timed).
-  - Our decode kernel uses the engine's settings (SDPA-compatible mode, one KV split). Its optional "GQA reuse" variant was 10–25× slower in a side test and is not used by the engine.
+  - Our decode kernel uses the engine's settings (SDPA-compatible mode, one KV split). Its optional "GQA reuse" variant was 10–25× slower in a side test and is not used by the engine. (That variant used elementwise FP32 math; a tensor-core version is faster than FlashInfer, see `kernel_track.md`.)
 - **Kernel tests:** `tests/test_triton_flash_prefill.py` checks the tiled kernel against FP32 for single, packed and mixed-length prompts, chunks over a cached prefix, and shuffled pages.
