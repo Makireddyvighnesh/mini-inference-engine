@@ -7,103 +7,26 @@ Detailed commands for every benchmark runner. The project overview and headline 
 ```text
 minillm_l4/
 ├── README.md
-├── requirements.lock
-├── engine/
-│   ├── model_loading.py            # pinned native-FP8 model loading
-│   ├── request.py                  # request lifecycle state machine
-│   ├── scheduler.py                # deterministic FIFO batch queue
-│   ├── generation/
-│       ├── __init__.py
-│       ├── huggingface.py          # trusted model.generate backend
-│       ├── manual.py               # explicit prefill/decode backend
-│       └── recompute.py            # no-cache correctness reference
-│   └── kv_cache/
-│       ├── __init__.py
-│       ├── contiguous.py             # owned contiguous KV lifecycle
-│       ├── packed.py                 # flat-token request metadata
-│       ├── paged.py                  # fixed blocks, tables, and cache storage
-│       ├── paged_attention.py        # paged and packed attention dispatch
-│       ├── qwen3_paged.py             # Qwen3 direct-attention adapter
-│       ├── triton_packed_attention.py # packed prefill kernel
-│       ├── triton_packed_kv.py        # packed K/V scatter kernel
-│       ├── triton_paged_attention.py # fused one-token decode kernel
-│       ├── triton_paged_kv.py         # dynamic decode K/V writer
-│       └── ...
-│   └── model_runner/
-│       └── qwen3_packed.py            # flat-token Qwen3 prefill runner
+├── engine/                # the engine; never imports benchmarks/
+│   ├── serving/           # scheduler, batching policies, prefix cache, CUDA Graph decode
+│   ├── kv_cache/          # paged KV cache and attention kernels
+│   ├── kernels/           # FP8 matmul, fused kernels, merged projections
+│   ├── model_runner/      # flat-batch forwards for packed and mixed steps
+│   ├── generation/        # simple generation loops and chunked prefill sessions
+│   ├── events.py          # requests and request events
+│   └── step_planner.py    # adaptive chunk sizing
 ├── benchmarks/
-│   ├── core/
-│   │   ├── harness.py              # shared execution and metric orchestration
-│   │   ├── schemas.py              # request, workload, and result types
-│   │   ├── workloads.py            # deterministic fixture workload builders
-│   │   ├── metrics.py              # request metrics and summaries
-│   │   ├── timing.py               # wall/CUDA timing helpers
-│   │   ├── hardware.py             # environment, VRAM, and GPU telemetry
-│   │   └── tracing.py              # per-component execution spans
-│   ├── runners/
-│   │   ├── simulated.py            # deterministic CPU fixture runner
-│   │   ├── huggingface_baseline.py # Qwen loader and HF baseline runner
-│   │   ├── manual_decode.py        # manual backend benchmark runner
-│   │   ├── kv_cache.py             # cache/recompute comparison runner
-│   │   ├── concurrent_requests.py   # staggered static-batch trace runner
-│   │   ├── continuous_requests.py   # iteration-level continuous runner
-│   │   ├── paged_kv.py              # gather and direct paged runners
-│   │   ├── packed_paged.py          # no-padding packed prefill runner
-│   │   └── paged_cuda_graph.py      # reusable fixed-shape graph runner
-│   ├── commands/
-│       ├── run_harness.py          # harness command-line entry point
-│       ├── run_hf_baseline.py      # Hugging Face baseline entry point
-│       ├── run_manual_decode.py    # manual decode entry point
-│       ├── run_kv_cache.py          # cache/recompute comparison entry point
-│       ├── run_concurrent_requests.py # concurrent static-batch entry point
-│       ├── run_continuous_requests.py # continuous-batching entry point
-│       └── run_paged_kv.py            # contiguous versus paged sweep
-│   └── plots/
-│       ├── prefill_decode.py        # context-length metric chart
-│       └── concurrency_stress.py    # batch-size stress report
-├── configs/
-│   ├── __init__.py
-│   ├── loader.py                   # shared YAML loader and validation
-│   └── workloads/
-│       ├── minillm_l4_harness.yaml
-│       ├── qwen3_fp8_baseline.yaml
-│       ├── qwen3_fp8_manual.yaml
-│       ├── qwen3_fp8_kv_cache.yaml
-│       ├── qwen3_fp8_concurrent.yaml
-│       ├── qwen3_fp8_continuous.yaml
-│       └── qwen3_fp8_paged.yaml
-├── data/
-│   └── synthetic/
-│       └── workloads_v1.jsonl      # deterministic prompt seeds
-├── docs/
-│   ├── metric_definitions.md
-│   └── phase_notes/
-│       ├── benchmark_harness.md
-│       ├── hf_baseline.md
-│       ├── manual_decode.md
-│       ├── kv_cache.md
-│       ├── concurrent_requests.md
-│       ├── continuous_batching.md
-│       └── paged_kv.md
-├── results/
-│   ├── phase0/                  # harness fixture results
-│   ├── phase1/                  # canonical Qwen baseline results
-│   ├── manual_decode/           # manual decoder results
-│   ├── real_inference/          # small HF inference smoke run
-│   ├── baseline_smoke/          # small smoke-run artifacts
-│   └── figures/                 # generated PNG/CSV benchmark charts
-└── tests/
-    ├── test_benchmark_harness.py
-    ├── test_configs.py
-    ├── test_hf_baseline.py
-    ├── test_manual_decode.py
-    ├── test_kv_cache.py
-    ├── test_concurrent_requests.py
-    ├── test_continuous_requests.py
-    ├── test_paged_kv_cache.py
-    ├── test_paged_runner.py
-    ├── test_prefill_decode_plot.py
-    └── test_concurrency_stress_plot.py
+│   ├── commands/          # one run_*.py per benchmark
+│   ├── core/              # harness, metrics, workloads
+│   ├── runners/           # older per-phase runners and the HF baseline
+│   ├── configs/           # workload YAML files
+│   ├── data/              # synthetic prompts
+│   └── charts/            # chart scripts
+├── scripts/               # correctness gates and tools
+├── tests/
+├── docs/                  # benchmarks, study notes, older results in archive/
+├── experiments/           # separate work, not part of the engine
+└── results/               # local benchmark output, not in git
 ```
 
 The deterministic synthetic workload is versioned under

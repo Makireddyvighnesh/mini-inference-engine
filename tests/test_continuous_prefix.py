@@ -7,7 +7,7 @@ from transformers import Qwen3Config, Qwen3ForCausalLM
 
 from minillm_l4.benchmarks.core.harness import BenchmarkHarness
 from minillm_l4.benchmarks.core.schemas import HarnessConfig, RequestSpec, WorkloadSpec
-from minillm_l4.benchmarks.runners.continuous_prefix import ContinuousPrefixPagedRunner
+from minillm_l4.engine.serving.continuous_prefix import ContinuousPrefixPagedRunner
 from minillm_l4.benchmarks.commands.run_prefix_trace import build_shared_prefix_workload
 from minillm_l4.benchmarks.configs.loader import load_yaml_config
 from minillm_l4.engine.generation.manual import manual_greedy_generate

@@ -14,7 +14,7 @@ from ..core.harness import RequestEventRecorder
 from ..core.metrics import summarize
 from ..core.schemas import RequestOutcome, RequestSpec
 from .concurrent_requests import _padded_inputs
-from .continuous_prefix import ContinuousPrefixPagedRunner, _LiveRequest
+from minillm_l4.engine.serving.continuous_prefix import ContinuousPrefixPagedRunner, _LiveRequest
 from .continuous_requests import _wait_until_ms
 
 

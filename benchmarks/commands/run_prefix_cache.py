@@ -19,7 +19,7 @@ from minillm_l4.benchmarks.runners.huggingface_baseline import (
     build_hf_workload,
     load_qwen_fp8,
 )
-from minillm_l4.benchmarks.runners.prefix_cache import PrefixCachedPagedRunner
+from minillm_l4.engine.serving.prefix_cache import PrefixCachedPagedRunner
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]

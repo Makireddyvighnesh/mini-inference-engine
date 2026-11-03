@@ -15,13 +15,9 @@ from .metrics import (
     summarize,
     summarize_request_metrics,
 )
-from .schemas import (
-    EventRecord,
-    HarnessConfig,
-    RequestOutcome,
-    RequestSpec,
-    WorkloadSpec,
-)
+from minillm_l4.engine.events import EventRecord, RequestEventRecorder, RequestOutcome, RequestSpec
+
+from .schemas import HarnessConfig, WorkloadSpec
 from .timing import measure_timer_overhead
 
 
@@ -31,98 +27,6 @@ BatchRunner = Callable[
     Sequence[RequestOutcome | Sequence[int] | None],
 ]
 TraceRunner = BatchRunner
-
-
-class RequestEventRecorder:
-    """Record canonical request events on a run-relative monotonic clock."""
-
-    def __init__(self, request_id: str, *, run_started_ns: int) -> None:
-        if not request_id.strip():
-            raise ValueError("request_id must not be empty")
-        self.request_id = request_id
-        self.run_started_ns = run_started_ns
-        self._events: list[EventRecord] = []
-
-    @property
-    def events(self) -> tuple[EventRecord, ...]:
-        return tuple(self._events)
-
-    @property
-    def last_timestamp_ns(self) -> int:
-        return self._events[-1].timestamp_ns if self._events else 0
-
-    def now_ns(self) -> int:
-        return max(0, time.perf_counter_ns() - self.run_started_ns)
-
-    def record(
-        self,
-        event: str,
-        *,
-        timestamp_ns: int | None = None,
-        token_index: int | None = None,
-        metadata: dict[str, Any] | None = None,
-    ) -> EventRecord:
-        relative_ns = self.now_ns() if timestamp_ns is None else int(timestamp_ns)
-        if relative_ns < 0:
-            raise ValueError("event timestamp cannot be before the run start")
-        if self._events and relative_ns < self.last_timestamp_ns:
-            raise ValueError("request events must be recorded in timestamp order")
-        event_record = EventRecord(
-            request_id=self.request_id,
-            event=event,
-            timestamp_ns=relative_ns,
-            sequence=len(self._events),
-            token_index=token_index,
-            metadata=metadata or {},
-        )
-        self._events.append(event_record)
-        return event_record
-
-    def mark_token_ready(
-        self,
-        token_index: int,
-        *,
-        token_id: int | None = None,
-        timestamp_ns: int | None = None,
-    ) -> None:
-        metadata = {} if token_id is None else {"token_id": int(token_id)}
-        event_timestamp = self.now_ns() if timestamp_ns is None else int(timestamp_ns)
-        self.record(
-            "token_ready",
-            timestamp_ns=event_timestamp,
-            token_index=token_index,
-            metadata=metadata,
-        )
-        if token_index == 0:
-            self.record(
-                "first_token_ready",
-                timestamp_ns=event_timestamp,
-                token_index=token_index,
-                metadata=metadata,
-            )
-
-    def mark_token_sent(
-        self,
-        token_index: int,
-        *,
-        token_id: int | None = None,
-        timestamp_ns: int | None = None,
-    ) -> None:
-        metadata = {} if token_id is None else {"token_id": int(token_id)}
-        event_timestamp = self.now_ns() if timestamp_ns is None else int(timestamp_ns)
-        self.record(
-            "token_sent",
-            timestamp_ns=event_timestamp,
-            token_index=token_index,
-            metadata=metadata,
-        )
-        if token_index == 0:
-            self.record(
-                "first_token_sent",
-                timestamp_ns=event_timestamp,
-                token_index=token_index,
-                metadata=metadata,
-            )
 
 
 @dataclass(frozen=True)

@@ -80,6 +80,17 @@ Run from the folder that contains `minillm_l4/`:
     --output-dir minillm_l4/results/showcase_$(date +%Y%m%d)
 ```
 
+## Repo layout
+
+| Folder | What's in it |
+|---|---|
+| `engine/` | The engine. `engine/serving/` holds the scheduler |
+| `benchmarks/` | Benchmark commands, configs, data and charts |
+| `scripts/` | Correctness checks and tools |
+| `tests/` | Tests |
+| `docs/` | Benchmarks and study notes |
+| `experiments/` | Separate work, not part of the engine |
+
 ## Learn more
 
 - [All benchmarks and charts](docs/benchmarks.md)

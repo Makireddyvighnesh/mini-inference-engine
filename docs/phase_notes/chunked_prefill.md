@@ -207,7 +207,7 @@ Full analysis and fresh replay evidence:
 
 ### Changes
 
-- **Admission** (`benchmarks/runners/chunked_prefill.py`): every arrived
+- **Admission** (`engine/serving/chunked_prefill.py`): every arrived
   request is admitted while a slot and KV pages for its full length are free;
   requests queue only on exhausted pages. The whole-prompt budget deferral is
   removed. The sweep's `--admission resource` makes batch size offered load and

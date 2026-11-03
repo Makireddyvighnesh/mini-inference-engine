@@ -64,7 +64,7 @@ def pages(requests, block=16) -> int:
 
 
 def paged(model, requests, **options):
-    from minillm_l4.benchmarks.runners.chunked_prefill import ChunkedPrefillPagedRunner
+    from minillm_l4.engine.serving.chunked_prefill import ChunkedPrefillPagedRunner
 
     return ChunkedPrefillPagedRunner(
         model, block_size=16, num_blocks=pages(requests), max_batch_size=len(requests), device="cuda",

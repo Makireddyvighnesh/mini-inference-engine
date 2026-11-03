@@ -9,7 +9,7 @@ from transformers import Qwen3Config, Qwen3ForCausalLM
 
 from minillm_l4.benchmarks.core.harness import RequestEventRecorder
 from minillm_l4.benchmarks.core.schemas import RequestSpec
-from minillm_l4.benchmarks.runners.prefix_cache import PrefixCachedPagedRunner
+from minillm_l4.engine.serving.prefix_cache import PrefixCachedPagedRunner
 from minillm_l4.engine.generation.manual import manual_greedy_generate
 from minillm_l4.engine.kv_cache import (
     PagedKvAllocator,

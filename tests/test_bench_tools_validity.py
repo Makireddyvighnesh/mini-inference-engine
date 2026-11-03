@@ -41,8 +41,12 @@ def test_metric_tools_import_without_engine_or_runners():
     script = """
 import importlib.abc
 import sys
+# engine.events and the engine package's own imports (request, scheduler) are standard-library only.
+LIGHT = ('minillm_l4.engine', 'minillm_l4.engine.events', 'minillm_l4.engine.request', 'minillm_l4.engine.scheduler')
 class NoEngine(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
+        if fullname in LIGHT:
+            return None
         if fullname.startswith(('minillm_l4.engine', 'minillm_l4.benchmarks.runners')):
             raise AssertionError('unexpected engine import: ' + fullname)
 sys.meta_path.insert(0, NoEngine())
@@ -278,7 +282,7 @@ def test_minillm_comparison_saves_all_cases_before_exit(tmp_path, monkeypatch, c
     stub_module(monkeypatch, "minillm_l4.benchmarks.runners.huggingface_baseline",
                 MODEL_ID=run_vllm_compare.MODEL_ID, MODEL_REVISION=run_vllm_compare.MODEL_REVISION,
                 load_qwen_fp8=run_showcase.load_qwen_fp8)
-    stub_module(monkeypatch, "minillm_l4.benchmarks.runners.chunked_prefill",
+    stub_module(monkeypatch, "minillm_l4.engine.serving.chunked_prefill",
                 ChunkedPrefillPagedRunner=lambda model, **options: run_showcase.paged(model, (), **options))
     stub_module(monkeypatch, "minillm_l4.engine.kernels.fused", install_fused_kernels=lambda model: True)
     stub_module(monkeypatch, "minillm_l4.engine.kernels.merged_projections", install_merged_projections=lambda model: 0)

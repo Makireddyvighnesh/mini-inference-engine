@@ -23,7 +23,7 @@ from minillm_l4.benchmarks.core.harness import BenchmarkHarness, write_events_js
 from minillm_l4.benchmarks.core.schemas import HarnessConfig, RequestSpec, WorkloadSpec
 from minillm_l4.benchmarks.core.synthetic import SyntheticSample, exact_token_ids
 from minillm_l4.benchmarks.core.workloads import save_workload
-from minillm_l4.benchmarks.runners.chunked_prefill import ChunkedPrefillPagedRunner
+from minillm_l4.engine.serving.chunked_prefill import ChunkedPrefillPagedRunner
 from minillm_l4.benchmarks.runners.huggingface_baseline import MODEL_ID, MODEL_REVISION, load_qwen_fp8
 from minillm_l4.benchmarks.runners.manual_decode import ManualGreedyBatchRunner
 from minillm_l4.benchmarks.runners.phase_sweep import MeteredRunner, StaticPagedBatchRunner, StaticPagedTraceRunner

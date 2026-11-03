@@ -162,7 +162,7 @@ def run_minillm(args, workloads: list[dict[str, Any]] | None = None) -> None:
 
     from minillm_l4.benchmarks.core.harness import BenchmarkHarness
     from minillm_l4.benchmarks.core.schemas import HarnessConfig, RequestSpec, WorkloadSpec
-    from minillm_l4.benchmarks.runners.chunked_prefill import ChunkedPrefillPagedRunner
+    from minillm_l4.engine.serving.chunked_prefill import ChunkedPrefillPagedRunner
     from minillm_l4.benchmarks.runners.huggingface_baseline import MODEL_ID, MODEL_REVISION, load_qwen_fp8
     from minillm_l4.engine.kernels.fused import install_fused_kernels
     from minillm_l4.engine.kernels.merged_projections import install_merged_projections

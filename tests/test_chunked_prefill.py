@@ -10,7 +10,7 @@ from transformers.integrations.sdpa_attention import sdpa_attention_forward
 
 from minillm_l4.benchmarks.core.harness import BenchmarkHarness
 from minillm_l4.benchmarks.core.schemas import HarnessConfig, RequestSpec, WorkloadSpec
-from minillm_l4.benchmarks.runners.chunked_prefill import ChunkedPrefillPagedRunner
+from minillm_l4.engine.serving.chunked_prefill import ChunkedPrefillPagedRunner
 from minillm_l4.engine.generation.chunked_prefill import (
     ALIGNED_PREFILL_ATTENTION,
     ChunkedPrefillSession,
@@ -258,7 +258,7 @@ def test_eos_stops_after_completed_prompt_not_intermediate_chunk():
 
 
 def test_sdpa_compatible_decode_uses_its_required_tile_and_split_policy(monkeypatch):
-    from minillm_l4.benchmarks.runners import continuous_prefix
+    from minillm_l4.engine.serving import continuous_prefix
 
     monkeypatch.setattr(continuous_prefix, "select_decode_split_count", lambda *args, **kwargs: 8)
     monkeypatch.setattr(continuous_prefix, "select_decode_block_tokens", lambda *args: 64)

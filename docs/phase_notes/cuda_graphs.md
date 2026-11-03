@@ -228,8 +228,8 @@ occurs; it should show comparable prefill timing honestly.
 
 | File | Purpose / eager-mode impact |
 | --- | --- |
-| `benchmarks/runners/chunked_prefill.py` | Bucket capture/replay, mixed split choices, fallbacks, counters/memory, cleanup. Default eager decode delegates to its original parent; unsplit mixed model math/order remain unchanged. |
-| `benchmarks/runners/decode_graph.py` | CPU-testable bucket validation/selection and static packing; independent scratch rows; graph pool accounting. Used only by graph execution. |
+| `engine/serving/chunked_prefill.py` | Bucket capture/replay, mixed split choices, fallbacks, counters/memory, cleanup. Default eager decode delegates to its original parent; unsplit mixed model math/order remain unchanged. |
+| `engine/serving/decode_graph.py` | CPU-testable bucket validation/selection and static packing; independent scratch rows; graph pool accounting. Used only by graph execution. |
 | **`engine/kv_cache/qwen3_paged.py`** | **Engine change:** opt-in `paged_decode_graph` flag removes graph-only allocator-ID/reservation lookups and requires capture-safe writer/attention contracts. Default false leaves eager validation, ownership checks, writers, and kernel math unchanged. |
 | `scripts/check_policy_equivalence.py` | Required graph variants, both split orders, complete-output and actual-replay checks. |
 | `benchmarks/commands/run_cuda_graphs.py` | Matched one-session workload matrix, raw/aggregate JSON, telemetry, runner cleanup. |

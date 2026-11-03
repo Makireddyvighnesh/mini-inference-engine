@@ -16,7 +16,7 @@ import minillm_l4
 from minillm_l4.benchmarks.commands.run_prefill_decode_sweep import gpu_occupants
 from minillm_l4.benchmarks.core.harness import RequestEventRecorder
 from minillm_l4.benchmarks.core.schemas import RequestSpec
-from minillm_l4.benchmarks.runners.chunked_prefill import ChunkedPrefillPagedRunner
+from minillm_l4.engine.serving.chunked_prefill import ChunkedPrefillPagedRunner
 from minillm_l4.benchmarks.runners.huggingface_baseline import load_qwen_fp8
 from minillm_l4.engine.generation.huggingface import transformers_greedy_generate
 

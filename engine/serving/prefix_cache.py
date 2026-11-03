@@ -7,8 +7,7 @@ from typing import Any
 
 import torch
 
-from ..core.harness import RequestEventRecorder
-from ..core.schemas import RequestOutcome, RequestSpec
+from minillm_l4.engine.events import RequestEventRecorder, RequestOutcome, RequestSpec
 from minillm_l4.engine.kv_cache import (
     PagedKvAllocator,
     PagedKvCache,
@@ -18,7 +17,7 @@ from minillm_l4.engine.kv_cache import (
 )
 from minillm_l4.engine.kv_cache.qwen3_paged import install_paged_qwen3_attention
 
-from .paged_kv import _cache_layers, _first_model_device, _paged_activation_dtype
+from .helpers import _cache_layers, _first_model_device, _paged_activation_dtype
 
 
 class PrefixCachedPagedRunner:

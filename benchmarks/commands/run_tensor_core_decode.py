@@ -61,7 +61,7 @@ def run_block(model, requests, mode: str, repetitions: int) -> tuple[list[float]
 
     from minillm_l4.benchmarks.commands.run_showcase import pages
     from minillm_l4.benchmarks.core.harness import RequestEventRecorder
-    from minillm_l4.benchmarks.runners.chunked_prefill import ChunkedPrefillPagedRunner
+    from minillm_l4.engine.serving.chunked_prefill import ChunkedPrefillPagedRunner
 
     import time
 

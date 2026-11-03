@@ -133,7 +133,7 @@ def engine_runs(model, tok, batch, context, new_tokens, compat, repetitions):
     requests = [RequestSpec(f"b{batch}-c{context}-r{i}", prompt(tok, context, f"splitkv-r{i}"), new_tokens)
                 for i in range(batch)]
     from minillm_l4.benchmarks.commands.run_showcase import pages
-    from minillm_l4.benchmarks.runners.chunked_prefill import ChunkedPrefillPagedRunner
+    from minillm_l4.engine.serving.chunked_prefill import ChunkedPrefillPagedRunner
 
     runner = ChunkedPrefillPagedRunner(
         model, block_size=16, num_blocks=pages(requests), max_batch_size=len(requests), device="cuda",
@@ -235,7 +235,7 @@ def main(argv=None) -> int:
 
 
 def _bucket(batch):
-    from minillm_l4.benchmarks.runners.decode_graph import DEFAULT_GRAPH_BATCH_SIZES, select_graph_bucket
+    from minillm_l4.engine.serving.decode_graph import DEFAULT_GRAPH_BATCH_SIZES, select_graph_bucket
 
     return select_graph_bucket(batch, DEFAULT_GRAPH_BATCH_SIZES) or batch
 

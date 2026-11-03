@@ -25,7 +25,7 @@ import torch  # noqa: E402
 from minillm_l4.benchmarks.core.harness import RequestEventRecorder  # noqa: E402
 from minillm_l4.benchmarks.core.schemas import RequestSpec  # noqa: E402
 from minillm_l4.benchmarks.core.synthetic import SyntheticSample, exact_token_ids  # noqa: E402
-from minillm_l4.benchmarks.runners.chunked_prefill import ChunkedPrefillPagedRunner  # noqa: E402
+from minillm_l4.engine.serving.chunked_prefill import ChunkedPrefillPagedRunner  # noqa: E402
 from minillm_l4.benchmarks.runners.huggingface_baseline import load_qwen_fp8  # noqa: E402
 from minillm_l4.engine.kernels.fused import install_fused_kernels, uninstall_fused_kernels  # noqa: E402
 from minillm_l4.engine.kernels.merged_projections import (  # noqa: E402

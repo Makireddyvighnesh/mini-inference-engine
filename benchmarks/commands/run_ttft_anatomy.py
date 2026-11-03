@@ -118,7 +118,7 @@ def host_costs(tokenizer, prompts: dict[int, tuple[int, ...]]) -> list[dict]:
 @torch.inference_mode()
 def main(argv=None) -> int:
     args = parse_args(argv)
-    from minillm_l4.benchmarks.runners.chunked_prefill import ChunkedPrefillPagedRunner
+    from minillm_l4.engine.serving.chunked_prefill import ChunkedPrefillPagedRunner
     from minillm_l4.engine.kernels.fused import install_fused_kernels
     from minillm_l4.engine.kernels.merged_projections import install_merged_projections
 

@@ -8,8 +8,7 @@ from typing import Any, Sequence
 
 import torch
 
-from ..core.harness import RequestEventRecorder
-from ..core.schemas import RequestOutcome, RequestSpec
+from minillm_l4.engine.events import RequestEventRecorder, RequestOutcome, RequestSpec
 from minillm_l4.engine.kv_cache import (
     PagedKvOutOfMemoryError,
     select_decode_block_tokens,
@@ -19,8 +18,7 @@ from minillm_l4.engine.request import RequestLifecycle, RequestState
 from minillm_l4.engine.sampling import RequestSampler, SamplingParams, select_tokens
 from minillm_l4.engine.scheduler import ContinuousBatchScheduler, ScheduledRequest
 
-from .continuous_requests import _wait_until_ms
-from .paged_kv import _cache_layers
+from .helpers import _cache_layers, _wait_until_ms
 from .prefix_cache import PrefixCachedPagedRunner
 
 

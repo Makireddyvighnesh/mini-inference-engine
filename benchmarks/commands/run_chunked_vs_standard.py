@@ -115,7 +115,7 @@ def mixed_trace(tok, count, rate, seed):
 
 
 def make_runner(model, requests, options, max_blocks=None):
-    from minillm_l4.benchmarks.runners.chunked_prefill import ChunkedPrefillPagedRunner
+    from minillm_l4.engine.serving.chunked_prefill import ChunkedPrefillPagedRunner
 
     blocks = sum(math.ceil((r.prompt_tokens + r.max_new_tokens) / BLOCK) for r in requests) + len(requests)
     if max_blocks is not None:

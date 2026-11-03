@@ -416,7 +416,7 @@ def test_select_tensor_core_decode_splits_only_small_batches():
 
 
 def test_runner_rejects_two_decode_alternatives_together():
-    from minillm_l4.benchmarks.runners.chunked_prefill import ChunkedPrefillPagedRunner
+    from minillm_l4.engine.serving.chunked_prefill import ChunkedPrefillPagedRunner
 
     with pytest.raises(ValueError, match="alternatives"):
         ChunkedPrefillPagedRunner(object(), block_size=16, num_blocks=4, max_batch_size=1, device="cpu",

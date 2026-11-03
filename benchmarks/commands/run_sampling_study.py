@@ -285,7 +285,7 @@ def summarize(samples: list[dict]) -> dict:
 # ---- running -------------------------------------------------------------------------------------------------
 
 def make_runner(model, requests, rows, **options):
-    from minillm_l4.benchmarks.runners.chunked_prefill import ChunkedPrefillPagedRunner
+    from minillm_l4.engine.serving.chunked_prefill import ChunkedPrefillPagedRunner
 
     longest = max(r.prompt_tokens + r.max_new_tokens for r in requests)
     blocks = rows * (math.ceil(longest / 16) + 1)

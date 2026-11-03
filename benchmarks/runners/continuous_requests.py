@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import json
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import torch
 
+from minillm_l4.engine.serving.helpers import _wait_until_ms
 from ..core.harness import BenchmarkResult, RequestEventRecorder
 from ..core.schemas import RequestOutcome, RequestSpec
 from .concurrent_requests import _padded_inputs
@@ -23,12 +23,6 @@ def _select_next_token(output: Any) -> torch.Tensor:
     if not isinstance(logits, torch.Tensor) or logits.ndim != 3:
         raise TypeError("model output must contain logits with shape [batch, sequence, vocab]")
     return logits[:, -1, :].argmax(dim=-1, keepdim=True)
-
-
-def _wait_until_ms(recorder: RequestEventRecorder, target_ms: float) -> None:
-    while recorder.now_ns() / 1_000_000.0 < target_ms:
-        remaining_ms = target_ms - recorder.now_ns() / 1_000_000.0
-        time.sleep(min(remaining_ms / 1000.0, 0.01))
 
 
 def _cache_layers(cache: Any) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:

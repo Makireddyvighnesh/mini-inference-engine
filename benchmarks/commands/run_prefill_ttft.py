@@ -44,7 +44,7 @@ import torch
 from minillm_l4.benchmarks.core.harness import BenchmarkHarness
 from minillm_l4.benchmarks.core.schemas import HarnessConfig, RequestSpec, WorkloadSpec
 from minillm_l4.benchmarks.core.synthetic import SyntheticSample, exact_token_ids
-from minillm_l4.benchmarks.runners.chunked_prefill import ChunkedPrefillPagedRunner
+from minillm_l4.engine.serving.chunked_prefill import ChunkedPrefillPagedRunner
 from minillm_l4.benchmarks.runners.huggingface_baseline import MODEL_ID, MODEL_REVISION, load_qwen_fp8
 
 LENGTHS = (128, 256, 512, 1024, 2048, 4096, 8192)

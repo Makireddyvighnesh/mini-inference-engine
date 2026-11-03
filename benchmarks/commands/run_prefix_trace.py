@@ -14,7 +14,7 @@ import torch
 
 from minillm_l4.benchmarks.core.harness import BenchmarkHarness, write_events_jsonl, write_result
 from minillm_l4.benchmarks.core.schemas import HarnessConfig, RequestSpec, WorkloadSpec
-from minillm_l4.benchmarks.runners.continuous_prefix import ContinuousPrefixPagedRunner
+from minillm_l4.engine.serving.continuous_prefix import ContinuousPrefixPagedRunner
 from minillm_l4.benchmarks.runners.huggingface_baseline import (
     MODEL_ID, MODEL_REVISION, load_qwen_fp8,
 )

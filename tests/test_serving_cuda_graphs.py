@@ -9,9 +9,9 @@ from transformers import Qwen3Config, Qwen3ForCausalLM
 
 from minillm_l4.benchmarks.core.harness import BenchmarkHarness
 from minillm_l4.benchmarks.core.schemas import HarnessConfig, RequestSpec, WorkloadSpec
-from minillm_l4.benchmarks.runners.chunked_prefill import ChunkedPrefillPagedRunner
-from minillm_l4.benchmarks.runners.continuous_prefix import ContinuousPrefixPagedRunner
-from minillm_l4.benchmarks.runners.decode_graph import (
+from minillm_l4.engine.serving.chunked_prefill import ChunkedPrefillPagedRunner
+from minillm_l4.engine.serving.continuous_prefix import ContinuousPrefixPagedRunner
+from minillm_l4.engine.serving.decode_graph import (
     DecodeGraph, DecodeGraphBuffers, graph_pool_memory_bytes, select_graph_bucket,
 )
 from minillm_l4.engine.step_planner import AdaptiveChunkPlanner
