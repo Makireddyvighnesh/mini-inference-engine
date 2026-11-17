@@ -58,11 +58,14 @@ results, a source snapshot, and a Markdown report under `docs/archive/`.
 See the [chunked-prefill note](phase_notes/chunked_prefill.md) for scheduling
 behavior, timing boundaries, correctness gates, and validation limits.
 
-Install the pinned Python dependencies in your CUDA-enabled environment:
+Install the pinned Python dependencies in your CUDA-enabled environment, then the package itself (see [Setup](../README.md#setup)):
 
 ```bash
 python -m pip install -r minillm_l4/requirements.lock
+python -m pip install -e minillm_l4 --no-deps
 ```
+
+The commands below run from the folder that contains `minillm_l4/`. After the editable install you can also run them from inside the repository: drop the `minillm_l4/` prefix from paths, and use `python` from your environment in place of `.conda-env/bin/python`.
 
 Run the harness fixture:
 

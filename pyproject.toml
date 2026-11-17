@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minillm-l4"
+version = "0.1.0"
+description = "A small LLM inference engine for Qwen3-4B FP8 on one NVIDIA L4, built one technique at a time."
+readme = "README.md"
+requires-python = ">=3.10"
+# Exact versions live in requirements.lock; install that first (see README "Setup").
+dependencies = []
+
+[tool.setuptools]
+# The repository root is the `minillm_l4` package, so the code imports
+# `minillm_l4.engine...` whatever the cloned folder is called.
+package-dir = { "minillm_l4" = "." }
+packages = [
+    "minillm_l4",
+    "minillm_l4.engine",
+    "minillm_l4.engine.generation",
+    "minillm_l4.engine.kernels",
+    "minillm_l4.engine.kv_cache",
+    "minillm_l4.engine.model_runner",
+    "minillm_l4.engine.serving",
+    "minillm_l4.benchmarks",
+    "minillm_l4.benchmarks.charts",
+    "minillm_l4.benchmarks.commands",
+    "minillm_l4.benchmarks.configs",
+    "minillm_l4.benchmarks.core",
+    "minillm_l4.benchmarks.runners",
+]
