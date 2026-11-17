@@ -8,7 +8,7 @@ MiniLLM-L4: an LLM inference engine for `Qwen/Qwen3-4B-Instruct-2507-FP8` (pinne
 
 ## Commands
 
-This package imports itself as `minillm_l4`, so run Python from the **parent** directory (`/home/ubuntu/STT/LLMPerfLab`) with the workspace conda env:
+This package imports itself as `minillm_l4`. Either `pip install -e . --no-deps` once (then run from the repo root with any folder name; see README "Setup"), or run Python from the **parent** directory of a folder named `minillm_l4` (on the old L4 box, `/home/ubuntu/STT/LLMPerfLab` with the workspace conda env):
 
 ```bash
 .conda-env/bin/python -m pytest -q minillm_l4/tests                       # CPU suite (~18 s)

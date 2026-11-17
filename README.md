@@ -62,22 +62,36 @@ Opt-in kernels round slightly differently from the exact path, so they stay off 
 - Each engine stage was compared token for token with HF `generate()` on the validation workloads.
 - On long batched outputs, batch shape alone can flip a near-tied token. HF `generate()` does this too.
 
+## Setup
+
+The code imports itself as the package `minillm_l4`, so install the repository once in editable mode. After that it works whatever the cloned folder is called.
+
+```bash
+git clone https://github.com/Makireddyvighnesh/mini-inference-engine.git
+cd mini-inference-engine
+python -m venv .venv && source .venv/bin/activate   # Python 3.10 or newer
+pip install -r requirements.lock                     # pinned torch, triton, transformers
+pip install -e . --no-deps                           # makes `import minillm_l4` work
+```
+
+Tests run on CPU; GPU and Triton tests skip themselves. The kernels and benchmarks need an NVIDIA L4 or another SM89 GPU.
+
 ## Try it
 
-Run from the folder that contains `minillm_l4/`:
+Run from the repository folder:
 
 ```bash
 # Tests
-.conda-env/bin/python -m pytest -q minillm_l4/tests
+python -m pytest -q tests
 
 # Watch tokens stream, with live TTFT and time per token
-.conda-env/bin/python minillm_l4/scripts/stream_generate.py \
+python scripts/stream_generate.py \
     --prompt-length 128 6144 --max-new-tokens 64 --batch-size 6 \
     --arrival-interval-ms 400 --adaptive
 
 # Run the main benchmarks (about 30 minutes)
-.conda-env/bin/python -m minillm_l4.benchmarks.commands.run_showcase \
-    --output-dir minillm_l4/results/showcase_$(date +%Y%m%d)
+python -m minillm_l4.benchmarks.commands.run_showcase \
+    --output-dir results/showcase_$(date +%Y%m%d)
 ```
 
 ## Repo layout
